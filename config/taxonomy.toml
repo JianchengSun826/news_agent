@@ -1,0 +1,2 @@
+topics = ["AI", "AI Agent", "AI Coding", "Semiconductors", "Cloud", "Developer Tools", "Robotics", "Autonomous Vehicles", "Cybersecurity"]
+event_types = ["launch", "update", "research", "funding", "acquisition", "security-patch", "shipment", "policy"]

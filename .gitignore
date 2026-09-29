@@ -1,0 +1,10 @@
+.venv/
+.DS_Store
+__pycache__/
+.pytest_cache/
+*.pyc
+data/*.db
+output/*/
+!output/.gitkeep
+demo-workspace/
+dist/

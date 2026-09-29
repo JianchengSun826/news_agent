@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tech-newsroom"
+version = "0.1.0"
+description = "Local human-in-the-loop technology newsroom workflow"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.12,<3",
+  "typer>=0.21,<1",
+]
+
+[project.scripts]
+newsroom = "newsroom.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/newsroom"]

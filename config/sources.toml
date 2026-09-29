@@ -1,0 +1,15 @@
+[[sources]]
+source_id = "openai-official"
+source_name = "OpenAI"
+domain = "openai.com"
+source_type = "PRIMARY"
+reliability_level = "HIGH"
+usage_policy = "Use for official announcements and attribute company claims."
+
+[[sources]]
+source_id = "reuters"
+source_name = "Reuters"
+domain = "reuters.com"
+source_type = "WIRE"
+reliability_level = "HIGH"
+usage_policy = "Use for independent reporting; do not copy article text."

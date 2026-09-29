@@ -1,0 +1,6 @@
+timezone = "America/New_York"
+weekly_article_target = 10
+per_session_target = 4
+language = "zh-CN"
+article_min_chars = 600
+article_max_chars = 1000
