@@ -16,7 +16,7 @@ Demo 使用 `demo-workspace/` 中的独立数据库，创建 5 个候选，完�
 
 ## Workflow
 
-候选经过事件级去重后，编辑人工执行 SELECTED gate。系统生成 research prompt，人工将研究结果保存为 Markdown；随后依次录入稿件、事实核验和图片来源。人工 review 与 APPROVED gate 通过后，系统生成本地发布包。发布仍由人工在外部完成，再用 CLI 记录 URL 和时间。
+候选经过事件级去重后，编辑人工执行 SELECTED gate。系统生成 research prompt，人工将研究结果保存为 Markdown；随后依次录入稿件、事实核验、实际图片文件和图片来源。人工 review 与 APPROVED gate 通过后，系统生成包含文章与图片的本地发布包。发布仍由人工在外部完成，再用 CLI 记录 URL 和时间。
 
 详细命令和状态规则见 [工作流](docs/WORKFLOW.md)，数据字段见 [数据模型](docs/DATA_MODEL.md)，Phase 边界见 [路线图](docs/ROADMAP.md)。
 

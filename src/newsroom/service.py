@@ -250,7 +250,7 @@ class Newsroom:
         path = self._copy_artifact(article_id, source, "articles", "fact-check.md")
         self._advance_article(article_id, "DRAFTED", "FACT_CHECKED", "editor", "manual fact check registered", {"fact_check_path": path})
 
-    def register_image(self, article_id: str, *, image_type: str, source_url: str | None = None, creator: str | None = None, license: str | None = None, license_url: str | None = None, attribution_text: str | None = None, ai_provider: str | None = None, ai_model: str | None = None, prompt_path: str | None = None, notes: str = "") -> str:
+    def register_image(self, article_id: str, *, image_type: str, image_file: Path | None = None, source_url: str | None = None, creator: str | None = None, license: str | None = None, license_url: str | None = None, attribution_text: str | None = None, ai_provider: str | None = None, ai_model: str | None = None, prompt_path: str | None = None, notes: str = "") -> str:
         article = self.get_article(article_id)
         if article["status"] != "FACT_CHECKED":
             raise WorkflowError("image registration requires FACT_CHECKED")
@@ -258,10 +258,14 @@ class Newsroom:
             image = ImageInput(image_type=image_type, source_url=source_url, creator=creator, license=license, license_url=license_url, attribution_text=attribution_text, ai_provider=ai_provider, ai_model=ai_model, prompt_path=prompt_path, notes=notes).model_dump(mode="json")
         except ValidationError as error:
             raise WorkflowError("image requires a clear license or AI provenance") from error
+        if image_file is None:
+            raise WorkflowError("image file is required")
+        image_file = Path(image_file)
+        image_path = self._copy_artifact(article_id, image_file, "images", f"hero{image_file.suffix.lower()}")
         ai_valid = image_type == "AI_GENERATED"
         image_id = new_id("img")
         with self.db.connect() as connection:
-            connection.execute("INSERT INTO images(image_id,article_id,image_type,source_url,creator,license,license_url,attribution_text,ai_provider,ai_model,prompt_path,generated_at,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (image_id,article_id,image["image_type"],image["source_url"],image["creator"],image["license"],image["license_url"],image["attribution_text"],image["ai_provider"],image["ai_model"],image["prompt_path"],utc_now() if ai_valid else None,image["notes"]))
+            connection.execute("INSERT INTO images(image_id,article_id,image_type,source_url,creator,license,license_url,attribution_text,ai_provider,ai_model,prompt_path,image_path,generated_at,downloaded_at,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (image_id,article_id,image["image_type"],image["source_url"],image["creator"],image["license"],image["license_url"],image["attribution_text"],image["ai_provider"],image["ai_model"],image["prompt_path"],image_path,utc_now() if ai_valid else None,None if ai_valid else utc_now(),image["notes"]))
             connection.execute("UPDATE articles SET image_id=?,status='IMAGE_READY',updated_at=? WHERE article_id=?", (image_id,utc_now(),article_id))
             self._transition(connection, "article", article_id, "FACT_CHECKED", "IMAGE_READY", "editor", "image rights and provenance recorded")
         return image_id
@@ -279,12 +283,18 @@ class Newsroom:
         article = self.get_article(article_id)
         if article["status"] != "APPROVED":
             raise WorkflowError("publication package requires APPROVED")
+        image = self.db.one("SELECT * FROM images WHERE image_id=?", (article["image_id"],))
+        if not image or not image["image_path"]:
+            raise WorkflowError("publication package requires a registered image file")
+        image_source = self.root / image["image_path"]
+        if not image_source.is_file():
+            raise WorkflowError(f"registered image file not found: {image_source}")
         target = self.root / "output" / article_id
         target.mkdir(parents=True, exist_ok=False)
         shutil.copyfile(self.root / article["draft_path"], target / "article.md")
         shutil.copyfile(self.root / article["research_brief_path"], target / "research-brief.md")
         shutil.copyfile(self.root / article["fact_check_path"], target / "fact-check.md")
-        image = self.db.one("SELECT * FROM images WHERE image_id=?", (article["image_id"],))
+        shutil.copyfile(image_source, target / image_source.name)
         (target / "metadata.json").write_text(json.dumps(article, ensure_ascii=False, indent=2), encoding="utf-8")
         (target / "image-license.json").write_text(json.dumps(image, ensure_ascii=False, indent=2), encoding="utf-8")
         (target / "sources.md").write_text("# Sources\n\n## Primary\n\n- " + article["primary_source"] + "\n\n## Secondary\n\n" + "\n".join(f"- {url}" for url in article["secondary_sources"]) + "\n", encoding="utf-8")

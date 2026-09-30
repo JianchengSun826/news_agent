@@ -1,12 +1,12 @@
 # Data Model
 
-SQLite schema version 1 由 `newsroom init` 幂等创建。
+SQLite schema version 2 由 `newsroom init` 幂等创建。再次运行 `init` 会把 version 1 数据库迁移到 version 2。
 
 写入 SQLite 前，候选与图片 metadata 通过 Pydantic v2 模型校验日期、URL、必填文本、priority 范围和图片 provenance。SQLite 保留 canonical representation，Pydantic 模型不替代数据库约束与 audit trail。
 
 ## candidates
 
-保存 `candidate_id`、status、discovered/event timestamps、title、core_fact、company/product/topic/subtopic、event_type、JSON keywords、primary/secondary source URLs、discovery channel、priority、duplicate_status、matching_event_id、event_id、selected、rejection reason、notes 和 audit timestamps。`core_fact` 是无营销语言的一句话事实。
+保存 `candidate_id`、status、discovered/event timestamps、title、core_fact、company/product/topic/subtopic、event_type、JSON keywords、primary/secondary source URLs、discovery channel、priority、duplicate_status、matching_event_id、event_id、selected、rejection reason、notes 和 audit timestamps。`core_fact` 是无营销语言的一句话事实。`primary_source` 必填；`secondary_sources` 是 JSON 数组，primary-only 候选使用空数组 `[]`。
 
 Duplicate status 仅允许 `NEW`、`FOLLOW_UP`、`RELATED`、`POSSIBLE_DUPLICATE`、`DUPLICATE`。人工覆盖必须记录 actor 和 reason。
 
@@ -20,7 +20,7 @@ Duplicate status 仅允许 `NEW`、`FOLLOW_UP`、`RELATED`、`POSSIBLE_DUPLICATE
 
 ## images
 
-保存 image type、source/creator/license/attribution 或 AI provider/model/prompt path、生成/下载时间和 notes。AI 图片需要 provider、model 与 prompt；其他图片需要 URL、creator、license 与 license URL。
+保存 image type、项目内 `image_path`、source/creator/license/attribution 或 AI provider/model/prompt path、生成/下载时间和 notes。实际文件保存在 `images/ARTICLE_ID/hero.EXT`。AI 图片需要文件、provider、model 与 prompt；其他图片需要文件、URL、creator、license 与 license URL。
 
 ## state_transitions
 

@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS images (
   ai_provider TEXT,
   ai_model TEXT,
   prompt_path TEXT,
+  image_path TEXT,
   generated_at TEXT,
   downloaded_at TEXT,
   notes TEXT NOT NULL DEFAULT ''
@@ -123,6 +124,13 @@ class Database:
             connection.executescript(SCHEMA)
             connection.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (1, ?)",
+                (applied_at,),
+            )
+            image_columns = {row["name"] for row in connection.execute("PRAGMA table_info(images)")}
+            if "image_path" not in image_columns:
+                connection.execute("ALTER TABLE images ADD COLUMN image_path TEXT")
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (2, ?)",
                 (applied_at,),
             )
 

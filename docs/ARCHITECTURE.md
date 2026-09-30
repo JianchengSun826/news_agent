@@ -12,4 +12,4 @@ Phase 1 没有 provider SDK、网络抓取、scheduler、Web frontend、embeddin
 
 ## Reliability and security
 
-状态更新和 audit insert 在同一 SQLite transaction 中完成。所有 SQL 使用参数绑定。CLI 拒绝无效 URL、跳步、未解决重复项、无图片权利记录和缺少人工 review 的审批。系统只保存 URL、metadata 和人工笔记，不绕过 paywall，不长期保存第三方全文。
+状态更新和 audit insert 在同一 SQLite transaction 中完成。所有 SQL 使用参数绑定。CLI 拒绝无效 URL、跳步、未解决重复项、缺少实际图片文件、无图片权利记录和缺少人工 review 的审批。系统保存已登记的图片文件、URL、metadata 和人工笔记，不绕过 paywall，不长期保存第三方全文。

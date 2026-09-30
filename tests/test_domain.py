@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -75,11 +76,15 @@ def test_duplicate_heuristic_uses_event_attributes():
     assert result.matching_event_id == existing["event_id"]
 
 
-def test_source_urls_are_required(newsroom: Newsroom):
+def test_invalid_primary_source_is_rejected(newsroom: Newsroom):
     with pytest.raises(ValueError, match="primary_source"):
         add_candidate(newsroom, primary_source="not-a-url")
-    with pytest.raises(ValueError, match="secondary_sources"):
-        add_candidate(newsroom, secondary_sources=[])
+
+
+def test_primary_only_candidate_is_accepted(newsroom: Newsroom):
+    candidate = add_candidate(newsroom, secondary_sources=[])
+
+    assert candidate["secondary_sources"] == []
 
 
 def prepare_fact_checked_article(room: Newsroom, tmp_path: Path) -> str:
@@ -106,16 +111,32 @@ def test_image_without_rights_cannot_become_ready(newsroom: Newsroom, tmp_path: 
         newsroom.register_image(article_id, image_type="OTHER", source_url="https://example.com/image.jpg")
 
 
+def test_image_file_is_required_to_become_ready(newsroom: Newsroom, tmp_path: Path):
+    article_id = prepare_fact_checked_article(newsroom, tmp_path)
+
+    with pytest.raises(WorkflowError, match="image file is required"):
+        newsroom.register_image(article_id, image_type="AI_GENERATED", ai_provider="Gemini", ai_model="manual-subscription", prompt_path="prompts/image_concept.md")
+
+    assert newsroom.get_article(article_id)["status"] == "FACT_CHECKED"
+
+
 def test_approval_guard_and_publication_package(newsroom: Newsroom, tmp_path: Path):
     article_id = prepare_fact_checked_article(newsroom, tmp_path)
     with pytest.raises(WorkflowError, match="IMAGE_READY"):
         newsroom.approve(article_id, "editor", "ready")
-    newsroom.register_image(article_id, image_type="AI_GENERATED", ai_provider="Gemini", ai_model="manual-subscription", prompt_path="prompts/image_concept.md")
+    prepared_image = tmp_path / "prepared-image.png"
+    prepared_image.write_bytes(b"fake-png-image-data")
+    image_id = newsroom.register_image(article_id, image_file=prepared_image, image_type="AI_GENERATED", ai_provider="Gemini", ai_model="manual-subscription", prompt_path="prompts/image_concept.md")
+    stored_image = newsroom.root / "images" / article_id / "hero.png"
+    assert stored_image.read_bytes() == b"fake-png-image-data"
+    assert newsroom.db.one("SELECT image_path FROM images WHERE image_id=?", (image_id,))["image_path"] == f"images/{article_id}/hero.png"
     newsroom.complete_review(article_id, "editor", "sources, title, facts, and rights checked")
     newsroom.approve(article_id, "editor", "approved for local publication package")
     package = newsroom.create_publication_package(article_id)
     assert (package / "article.md").exists()
+    assert (package / "hero.png").read_bytes() == b"fake-png-image-data"
     assert json.loads((package / "metadata.json").read_text())["status"] == "APPROVED"
+    assert json.loads((package / "image-license.json").read_text())["image_path"] == f"images/{article_id}/hero.png"
     assert "[x] approved for publication" in (package / "publication-checklist.md").read_text()
     with pytest.raises(FileExistsError):
         newsroom.create_publication_package(article_id)
@@ -124,6 +145,23 @@ def test_approval_guard_and_publication_package(newsroom: Newsroom, tmp_path: Pa
 def test_database_schema_contains_audit_and_registry(newsroom: Newsroom):
     tables = Database(newsroom.db_path).table_names()
     assert {"candidates", "articles", "sources", "images", "state_transitions"} <= tables
+
+
+def test_init_migrates_v1_images_table_to_store_image_path(tmp_path: Path):
+    db_path = tmp_path / "data" / "newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+        connection.execute("INSERT INTO schema_version VALUES (1, '2026-09-29T00:00:00+00:00')")
+        connection.execute("CREATE TABLE images (image_id TEXT PRIMARY KEY)")
+
+    Database(db_path).initialize("2026-09-30T00:00:00+00:00")
+
+    with sqlite3.connect(db_path) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(images)")}
+        versions = [row[0] for row in connection.execute("SELECT version FROM schema_version ORDER BY version")]
+    assert "image_path" in columns
+    assert versions == [1, 2]
 
 
 def test_init_seeds_source_registry(newsroom: Newsroom):

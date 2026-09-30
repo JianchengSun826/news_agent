@@ -54,7 +54,7 @@ for index in "${selected_indexes[@]}"; do
   run prompt create "$article_id" --purpose fact_check >/dev/null
   run fact-check register "$article_id" --file "$repo_root/examples/fact-check.md" >/dev/null
   run prompt create "$article_id" --purpose image >/dev/null
-  run image register "$article_id" --type AI_GENERATED --ai-provider Gemini --ai-model manual-subscription --prompt-path "output/prompts/$article_id-image.md" >/dev/null
+  run image register "$article_id" --file "$repo_root/examples/hero.svg" --type AI_GENERATED --ai-provider Gemini --ai-model manual-subscription --prompt-path "output/prompts/$article_id-image.md" >/dev/null
   run review "$article_id" --actor demo-editor --reason "Checked title, dates, sources, claims, duplicate result, and image provenance" >/dev/null
   run approve "$article_id" --actor demo-editor --reason "Approved synthetic demo package" >/dev/null
   run publish-package "$article_id" >/dev/null

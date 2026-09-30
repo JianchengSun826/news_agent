@@ -23,7 +23,7 @@ class CandidateInput(BaseModel):
     event_type: str = Field(min_length=1)
     keywords: list[str] = Field(min_length=1)
     primary_source: HttpUrl
-    secondary_sources: list[HttpUrl] = Field(min_length=1)
+    secondary_sources: list[HttpUrl] = Field(default_factory=list)
     discovered_from: str = Field(min_length=1)
     priority: int = Field(ge=1, le=5)
     notes: str = ""

@@ -75,13 +75,13 @@ def candidate_add(
     subtopic: Annotated[str, typer.Option()],
     event_type: Annotated[str, typer.Option("--event-type")],
     primary_source: Annotated[str, typer.Option("--primary-source")],
-    secondary_source: Annotated[list[str], typer.Option("--secondary-source")],
+    secondary_source: Annotated[list[str] | None, typer.Option("--secondary-source")] = None,
     keyword: Annotated[list[str] | None, typer.Option("--keyword")] = None,
     discovered_from: Annotated[str, typer.Option("--discovered-from")] = "manual",
     priority: Annotated[int, typer.Option(min=1, max=5)] = 3,
 ) -> None:
     """Add a manually discovered candidate."""
-    result = _run(lambda: _room(ctx).add_candidate(candidate_title=candidate_title, core_fact=core_fact, event_date=event_date, company=company, product=product, topic=topic, subtopic=subtopic, event_type=event_type, keywords=keyword or [company, product], primary_source=primary_source, secondary_sources=secondary_source, discovered_from=discovered_from, priority=priority))
+    result = _run(lambda: _room(ctx).add_candidate(candidate_title=candidate_title, core_fact=core_fact, event_date=event_date, company=company, product=product, topic=topic, subtopic=subtopic, event_type=event_type, keywords=keyword or [company, product], primary_source=primary_source, secondary_sources=secondary_source or [], discovered_from=discovered_from, priority=priority))
     _json(result)
 
 
@@ -169,8 +169,8 @@ def fact_check_register(ctx: typer.Context, article_id: Annotated[str, typer.Arg
 
 
 @image_app.command("register")
-def image_register(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], image_type: Annotated[str, typer.Option("--type")], source_url: Annotated[str | None, typer.Option()] = None, creator: Annotated[str | None, typer.Option()] = None, license_name: Annotated[str | None, typer.Option("--license")] = None, license_url: Annotated[str | None, typer.Option()] = None, attribution: Annotated[str | None, typer.Option()] = None, ai_provider: Annotated[str | None, typer.Option()] = None, ai_model: Annotated[str | None, typer.Option()] = None, prompt_path: Annotated[str | None, typer.Option()] = None) -> None:
-    image_id = _run(lambda: _room(ctx).register_image(article_id, image_type=image_type, source_url=source_url, creator=creator, license=license_name, license_url=license_url, attribution_text=attribution, ai_provider=ai_provider, ai_model=ai_model, prompt_path=prompt_path))
+def image_register(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], image_type: Annotated[str, typer.Option("--type")], file: Annotated[Path, typer.Option(exists=True, dir_okay=False)], source_url: Annotated[str | None, typer.Option()] = None, creator: Annotated[str | None, typer.Option()] = None, license_name: Annotated[str | None, typer.Option("--license")] = None, license_url: Annotated[str | None, typer.Option()] = None, attribution: Annotated[str | None, typer.Option()] = None, ai_provider: Annotated[str | None, typer.Option()] = None, ai_model: Annotated[str | None, typer.Option()] = None, prompt_path: Annotated[str | None, typer.Option()] = None) -> None:
+    image_id = _run(lambda: _room(ctx).register_image(article_id, image_type=image_type, image_file=file, source_url=source_url, creator=creator, license=license_name, license_url=license_url, attribution_text=attribution, ai_provider=ai_provider, ai_model=ai_model, prompt_path=prompt_path))
     _json({"image_id": image_id})
 
 
