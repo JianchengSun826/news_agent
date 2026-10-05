@@ -2,7 +2,9 @@
 
 Process every input item. Use the supplied sources as the starting point, verify claims against accessible original sources, and do not invent facts, quotations, dates, URLs, or image rights.
 
-For each item, produce a detailed Research Brief and a complete Chinese Markdown news article. The article must use Markdown headings and paragraphs, contain no internal citation placeholders such as `[cite: 1]`, distinguish verified facts from company claims, and add no unsupported facts. Use a unique lowercase ASCII slug with hyphens.
+For each item, produce a detailed Research Brief with these headings: Event, Core Fact, Why It Matters, Confirmed Facts, Company Claims, Independent Reporting, Important Numbers, Technical Background, Timeline, Primary Sources, Secondary Sources, Conflicting Information, Unknown / Unconfirmed, Potential Errors To Avoid, and Suggested Angle. Label evidence as FACT, COMPANY_CLAIM, MEDIA_REPORT, ANALYSIS, RUMOR, or ESTIMATE where useful, and keep direct source URLs in the brief.
+
+Then write a professional Chinese Markdown news article of roughly 600–1000 Chinese characters. Cover what happened, important details, why it matters, necessary background, and what to watch; end with a Sources list. The article must use Markdown headings and paragraphs, contain no internal citation placeholders such as `[cite: 1]`, distinguish verified facts from company claims, avoid hype, and add no unsupported facts. Use a unique lowercase ASCII slug with hyphens.
 
 Search for zero to three relevant image candidates. Include an image only when its original landing page and original rights page establish `PUBLIC_DOMAIN`, `OPEN_LICENSE`, `OFFICIAL_PRESS_LICENSE`, or `OWNED`. Exclude search thumbnails, ordinary editorial photos with unclear reuse rights, fair-use assumptions, and records without an original rights page. Do not generate or download images.
 
