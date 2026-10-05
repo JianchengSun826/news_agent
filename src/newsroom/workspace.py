@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -91,12 +92,16 @@ def _identifier(value: str) -> str:
 
 
 def _atomic_write(path: Path, text: str) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as handle:
+        with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, suffix=".tmp", delete=False) as handle:
             temporary = Path(handle.name)
-            handle.write(text)
+            handle.write(data)
         os.replace(temporary, path)
     finally:
         if temporary is not None:
@@ -143,6 +148,19 @@ class BatchWorkspace:
             destination.chmod(0o755)
         return paths.root
 
+    def store_source_csv(self, batch_id: str, raw: bytes, source_sha256: str) -> Path:
+        """Preserve the exact validated input only for its recorded batch hash."""
+        batch = self._batch(batch_id)
+        if source_sha256 != batch["source_sha256"] or hashlib.sha256(raw).hexdigest() != source_sha256:
+            raise WorkflowError("CSV source_sha256 does not match the batch source_sha256")
+        path = BatchWorkspacePaths(self.batch_root(batch_id)).input / "candidates.csv"
+        if path.exists():
+            if path.read_bytes() != raw:
+                raise WorkflowError("stored source CSV differs from the batch input")
+            return path
+        _atomic_write_bytes(path, raw)
+        return path
+
     def _relative(self, batch_root: Path, repository_path: str | None) -> str | None:
         if not repository_path:
             return None
@@ -174,6 +192,10 @@ class BatchWorkspace:
             item["approval_state"] = item["article_status"] if item["article_status"] in {"REVIEWED", "APPROVED", "PUBLISHED"} else "PENDING"
             package = BatchWorkspacePaths(self.batch_root(owner)).publish / article_id if owner and article_id else None
             item["package_path"] = Path(os.path.relpath(package, root)).as_posix() if package and package.is_dir() else None
+            if article_id and owner == batch_id:
+                _atomic_write(self.article_root(owner, article_id) / "image-candidates.json", json.dumps(
+                    self.room.list_image_candidates(article_id), ensure_ascii=False, indent=2
+                ) + "\n")
         pending = [request for request in requests if request["status"] == "PENDING"]
         active = [item for item in items if item["item_status"] not in {"EXCLUDED", "REUSED_COMPLETE"}]
         if any(item["item_status"] == "WAITING_DUPLICATE" for item in active):

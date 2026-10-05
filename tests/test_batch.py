@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from newsroom.batch import BatchWorkflow
 from newsroom.service import Newsroom, WorkflowError
+from newsroom.workspace import BatchWorkspace
 
 
 CSV_FIELDS = [
@@ -90,10 +91,8 @@ def test_prepare_auto_selects_new_and_pauses_non_new(newsroom: Newsroom, tmp_pat
 
     assert status["counts"]["READY_FOR_CONTENT"] == 2
     assert status["counts"]["WAITING_DUPLICATE"] == 1
-    request = json.loads(Path(result["content_request_path"]).read_text(encoding="utf-8"))
-    assert len(request["items"]) == 2
-    assert "research_brief_md" in request["instructions"]
-    assert "rights_url" in request["instructions"]
+    assert result["content_request_path"] is None
+    assert newsroom.db.all("SELECT * FROM batch_requests") == []
 
 
 def test_prepare_reuses_old_candidate_and_completed_article(newsroom: Newsroom, tmp_path: Path):
@@ -138,6 +137,46 @@ def test_prepare_same_file_is_idempotent(newsroom: Newsroom, tmp_path: Path):
 
     assert first["batch_id"] == second["batch_id"]
     assert newsroom.db.one("SELECT COUNT(*) AS count FROM batches")["count"] == 1
+
+
+def test_prepare_copies_csv_and_writes_human_named_content_request(newsroom: Newsroom, tmp_path: Path):
+    source = write_batch_csv(tmp_path / "reviewed.csv", [candidate_row()])
+
+    result = BatchWorkflow(newsroom).prepare(source)
+
+    root = tmp_path / "workspace" / "batches" / result["batch_id"]
+    assert Path(result["content_request_path"]) == root / "claude" / "requests" / "content-request.json"
+    assert (root / "input" / "candidates.csv").read_bytes() == source.read_bytes()
+    state = json.loads((root / "batch-state.json").read_text())
+    assert state["status"] == result["status"]
+    assert state["requests"][0]["request_path"] == "claude/requests/content-request.json"
+
+
+def test_prepare_batch_article_has_no_legacy_research_template(newsroom: Newsroom, tmp_path: Path):
+    result = BatchWorkflow(newsroom).prepare(write_batch_csv(tmp_path / "reviewed.csv", [candidate_row()]))
+    article_id = result["items"][0]["article_id"]
+
+    assert newsroom.get_article(article_id)["research_brief_path"] is None
+    assert not list((tmp_path / "research").rglob("*.md"))
+
+
+def test_source_csv_copy_rejects_hash_mismatch_before_copy(newsroom: Newsroom, tmp_path: Path, monkeypatch):
+    source = write_batch_csv(tmp_path / "reviewed.csv", [candidate_row()])
+    ensure_layout = BatchWorkspace.ensure_layout
+
+    def change_recorded_hash(workspace, batch_id):
+        root = ensure_layout(workspace, batch_id)
+        with newsroom.db.connect() as connection:
+            connection.execute("UPDATE batches SET source_sha256='different-hash' WHERE batch_id=?", (batch_id,))
+        return root
+
+    monkeypatch.setattr(BatchWorkspace, "ensure_layout", change_recorded_hash)
+
+    with pytest.raises(WorkflowError, match="source_sha256"):
+        BatchWorkflow(newsroom).prepare(source)
+
+    assert not list((tmp_path / "workspace").rglob("candidates.csv"))
+    assert newsroom.db.one("SELECT COUNT(*) AS count FROM candidates")["count"] == 0
 
 
 def test_byte_different_csv_reuses_candidates_but_creates_new_batch(newsroom: Newsroom, tmp_path: Path):
@@ -235,6 +274,94 @@ def test_resolve_includes_possible_duplicate_after_explicit_override(
     assert item["item_status"] == "READY_FOR_CONTENT"
     assert item["article_id"]
     assert newsroom.get_article(item["article_id"])["owning_batch_id"] == result["batch_id"]
+
+
+def test_resolve_preserves_superseded_content_request_bytes(newsroom: Newsroom, tmp_path: Path):
+    workflow = BatchWorkflow(newsroom)
+    prepared = workflow.prepare(write_batch_csv(tmp_path / "duplicates.csv", duplicate_rows()))
+    path = tmp_path / "workspace/batches" / prepared["batch_id"] / "claude/requests/content-request.json"
+    request_id = "req-legacy123456"
+    path.write_bytes(json.dumps({"batch_id": prepared["batch_id"], "request_id": request_id}, indent=2).replace("\n", "\r\n").encode())
+    with newsroom.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO batch_requests(request_id,batch_id,request_type,revision_number,request_path,expected_result_filename,status,created_at) VALUES (?,?,'CONTENT',1,?,?,'PENDING','2026-10-05')",
+            (request_id, prepared["batch_id"], str(path.relative_to(tmp_path)), f"{prepared['batch_id']}-content-result.json"),
+        )
+        connection.execute("UPDATE batches SET content_request_id=? WHERE batch_id=?", (request_id, prepared["batch_id"]))
+    original = path.read_bytes()
+    waiting = next(item for item in prepared["items"] if item["item_status"] == "WAITING_DUPLICATE")
+    newsroom.override_duplicate(waiting["candidate_id"], "FOLLOW_UP", "independent follow-up", "editor")
+
+    resolved = workflow.resolve(prepared["batch_id"], waiting["candidate_id"], "include", "editor", "follow-up confirmed")
+
+    old = newsroom.db.one("SELECT * FROM batch_requests WHERE request_id=?", (request_id,))
+    assert old["status"] == "SUPERSEDED"
+    assert (tmp_path / old["request_path"]).read_bytes() == original
+    assert Path(resolved["content_request_path"]) == path
+    assert json.loads(path.read_bytes())["request_id"] != request_id
+
+
+@pytest.mark.parametrize("decision", ["include", "exclude"])
+def test_resolve_final_duplicate_creates_complete_content_request(newsroom: Newsroom, tmp_path: Path, decision: str):
+    workflow = BatchWorkflow(newsroom)
+    prepared = workflow.prepare(write_batch_csv(tmp_path / "duplicates.csv", duplicate_rows()))
+    waiting = next(item for item in prepared["items"] if item["item_status"] == "WAITING_DUPLICATE")
+    if decision == "include":
+        newsroom.override_duplicate(waiting["candidate_id"], "FOLLOW_UP", "independent follow-up", "editor")
+
+    resolved = workflow.resolve(prepared["batch_id"], waiting["candidate_id"], decision, "editor", "duplicate reviewed")
+
+    request = json.loads(Path(resolved["content_request_path"]).read_text())
+    expected = {item["article_id"] for item in resolved["items"] if item["item_status"] == "READY_FOR_CONTENT"}
+    assert {item["article_id"] for item in request["items"]} == expected
+    assert len(request["items"]) == (3 if decision == "include" else 2)
+    assert "research_brief_md" in request["instructions"]
+    assert "rights_url" in request["instructions"]
+
+
+def test_resolve_earlier_duplicate_does_not_create_partial_request(newsroom: Newsroom, tmp_path: Path):
+    rows = duplicate_rows() + [candidate_row(candidate_title="Another Tool launch report", primary_source="https://third.example/tool")]
+    workflow = BatchWorkflow(newsroom)
+    prepared = workflow.prepare(write_batch_csv(tmp_path / "duplicates.csv", rows))
+    waiting = [item for item in prepared["items"] if item["item_status"] == "WAITING_DUPLICATE"]
+    assert len(waiting) == 2
+
+    resolved = workflow.resolve(prepared["batch_id"], waiting[0]["candidate_id"], "exclude", "editor", "duplicate reviewed")
+
+    assert resolved["content_request_path"] is None
+    assert newsroom.db.all("SELECT * FROM batch_requests") == []
+
+
+@pytest.mark.parametrize("decision", ["include", "exclude"])
+def test_resolve_rejects_legacy_completed_partial_batch_without_mutation(newsroom: Newsroom, tmp_path: Path, decision: str):
+    workflow = BatchWorkflow(newsroom)
+    prepared = workflow.prepare(write_batch_csv(tmp_path / "duplicates.csv", duplicate_rows()))
+    waiting = next(item for item in prepared["items"] if item["item_status"] == "WAITING_DUPLICATE")
+    newsroom.override_duplicate(waiting["candidate_id"], "FOLLOW_UP", "independent follow-up", "editor")
+    with newsroom.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO batch_requests(request_id,batch_id,request_type,revision_number,request_path,expected_result_filename,status,created_at) VALUES ('req-legacy123456',?,'CONTENT',1,'legacy-request.json','legacy-result.json','COMPLETED','2026-10-05')", (prepared["batch_id"],)
+        )
+    before = {table: newsroom.db.all(f"SELECT * FROM {table}") for table in ("candidates", "articles", "batches", "batch_items", "batch_requests", "state_transitions")}
+    paths = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    with pytest.raises(WorkflowError, match="content.*completed"):
+        workflow.resolve(prepared["batch_id"], waiting["candidate_id"], decision, "editor", "duplicate reviewed")
+
+    assert {table: newsroom.db.all(f"SELECT * FROM {table}") for table in before} == before
+    assert {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == paths
+
+
+def test_pending_revision_request_is_preserved_when_repeated(content_batch: SimpleNamespace, tmp_path: Path):
+    result = write_fact_check_result(content_batch, tmp_path / "failed.json", ["FAIL", "PASS"])
+    content_batch.workflow.import_fact_checks(content_batch.batch_id, result)
+    request = content_batch.workflow.create_revision_request(content_batch.batch_id)
+    before = request.read_bytes()
+
+    with pytest.raises(WorkflowError, match="already pending"):
+        content_batch.workflow.create_revision_request(content_batch.batch_id)
+
+    assert request.read_bytes() == before
 
 
 @pytest.fixture
@@ -350,6 +477,26 @@ def test_one_missing_article_rolls_back_entire_content_import(
     )
 
 
+def test_content_import_stages_result_bytes_before_archive(prepared_batch: SimpleNamespace, tmp_path: Path, monkeypatch):
+    result = write_content_result(prepared_batch, tmp_path / "content-result.json")
+    write_bytes = Path.write_bytes
+
+    def fail_result_write(path, data):
+        if path.name == "content-result.json":
+            write_bytes(path, data[:20])
+            raise OSError("result write failed")
+        return write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", fail_result_write)
+    with pytest.raises(OSError, match="result write failed"):
+        prepared_batch.workflow.import_content(prepared_batch.batch_id, result)
+
+    root = tmp_path / "workspace/batches" / prepared_batch.batch_id
+    assert not (root / "claude/archive/content-result.json").exists()
+    assert not list(root.glob(".staging-*"))
+    assert all(prepared_batch.room.get_article(article_id)["status"] == "SELECTED" for article_id in prepared_batch.article_ids)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -378,6 +525,57 @@ def test_reimporting_identical_content_result_is_idempotent(
     second = prepared_batch.workflow.import_content(prepared_batch.batch_id, path)
 
     assert first["request_id"] == second["request_id"]
+    assert first == second
+    assert prepared_batch.room.db.one("SELECT COUNT(*) AS count FROM image_candidates")["count"] == 2
+
+
+def test_content_and_fact_check_import_use_article_workspace(prepared_batch: SimpleNamespace, tmp_path: Path):
+    content = write_content_result(prepared_batch, tmp_path / "content.json")
+    imported = prepared_batch.workflow.import_content(prepared_batch.batch_id, content)
+    prefix = f"workspace/batches/{prepared_batch.batch_id}"
+    article_id = prepared_batch.article_ids[0]
+    article = prepared_batch.room.get_article(article_id)
+    assert article["research_brief_path"] == f"{prefix}/articles/{article_id}/research-brief-v1.md"
+    assert article["draft_path"] == f"{prefix}/articles/{article_id}/article-v1.md"
+    assert Path(imported["fact_check_request_path"]) == tmp_path / prefix / "claude/requests/fact-check-request-v1.json"
+    archived = tmp_path / prefix / "claude/archive/content-result.json"
+    assert archived.read_bytes() == content.read_bytes()
+    images = json.loads((tmp_path / prefix / "articles" / article_id / "image-candidates.json").read_text())
+    assert images == prepared_batch.room.list_image_candidates(article_id)
+    request = prepared_batch.room.db.one("SELECT * FROM batch_requests WHERE request_id=?", (imported["request_id"],))
+    assert request["result_path"] == f"{prefix}/claude/archive/content-result.json"
+    prepared_batch.fact_request = json.loads(Path(imported["fact_check_request_path"]).read_text())
+    checked = write_fact_check_result(prepared_batch, tmp_path / "checked.json", ["PASS", "FAIL"])
+    prepared_batch.workflow.import_fact_checks(prepared_batch.batch_id, checked)
+    assert prepared_batch.room.get_article(article_id)["fact_check_path"] == f"{prefix}/articles/{article_id}/fact-check-v1.md"
+    assert (tmp_path / prefix / "claude/archive/fact-check-result-v1.json").read_bytes() == checked.read_bytes()
+    state = json.loads((tmp_path / prefix / "batch-state.json").read_text())
+    assert state["status"] == "NEEDS_REVISION"
+    assert not list((tmp_path / prefix).glob(".staging-*"))
+
+
+def test_content_import_rejects_another_batch_inbox_result_without_mutation(
+    prepared_batch: SimpleNamespace, tmp_path: Path
+):
+    other = prepared_batch.workflow.prepare(write_batch_csv(tmp_path / "other.csv", [candidate_row(
+        candidate_title="Separate launches Device", core_fact="Separate launched Device.",
+        company="Separate", product="Device", primary_source="https://separate.example/device",
+    )]))
+    request = json.loads(Path(other["content_request_path"]).read_text())
+    foreign = SimpleNamespace(batch_id=other["batch_id"], request=request)
+    inbox = tmp_path / "workspace/batches" / prepared_batch.batch_id / "claude/inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    result = write_content_result(foreign, inbox / "foreign-content.json")
+    before_articles = prepared_batch.room.db.all("SELECT * FROM articles ORDER BY article_id")
+    before_requests = prepared_batch.room.db.all("SELECT * FROM batch_requests ORDER BY request_id")
+    before_paths = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    with pytest.raises(WorkflowError, match="batch_id"):
+        prepared_batch.workflow.import_content(prepared_batch.batch_id, result)
+
+    assert prepared_batch.room.db.all("SELECT * FROM articles ORDER BY article_id") == before_articles
+    assert prepared_batch.room.db.all("SELECT * FROM batch_requests ORDER BY request_id") == before_requests
+    assert {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before_paths
 
 
 @pytest.fixture
@@ -482,12 +680,29 @@ def revised_batch(content_batch: SimpleNamespace, tmp_path: Path) -> SimpleNames
 
 def test_revision_preserves_v1_and_writes_v2(revised_batch: SimpleNamespace):
     article_id = revised_batch.article_ids[0]
-    article_dir = revised_batch.room.root / "articles" / article_id
+    article_dir = revised_batch.room.root / "workspace/batches" / revised_batch.batch_id / "articles" / article_id
 
     assert (article_dir / "article-v1.md").exists()
     assert (article_dir / "article-v2.md").exists()
     assert revised_batch.room.get_article(article_id)["revision_number"] == 2
     assert revised_batch.room.get_article(article_id)["status"] == "DRAFTED"
+
+
+def test_revision_canonical_path_preserves_request_result_versions(revised_batch: SimpleNamespace):
+    root = revised_batch.room.root / "workspace/batches" / revised_batch.batch_id
+    for relative in (
+        "claude/requests/content-request.json",
+        "claude/requests/fact-check-request-v1.json",
+        "claude/requests/revision-request-v2.json",
+        "claude/requests/fact-check-request-v2.json",
+        "claude/archive/content-result.json",
+        "claude/archive/fact-check-result-v1.json",
+        "claude/archive/revision-result-v2.json",
+    ):
+        assert (root / relative).is_file()
+    state = json.loads((root / "batch-state.json").read_text())
+    assert state["status"] == "WAITING_FACT_CHECK"
+    assert sorted(request["revision_number"] for request in state["requests"]) == [1, 1, 2, 2]
 
 
 def test_second_round_rejects_first_round_fact_check_result(

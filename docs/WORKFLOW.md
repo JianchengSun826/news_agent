@@ -68,7 +68,7 @@ uv run newsroom batch resolve BATCH_ID CANDIDATE_ID \
   --decision include --actor editor --reason "已完成重复项覆盖"
 ```
 
-每次 include 都会生成新的不可变 content request；以最新 `batch status` 返回的路径为准。
+所有 `WAITING_DUPLICATE` 都完成 include 或 exclude 后，才会生成包含整批已选文章的 content request；此前 `content_request_path` 为空。以最新 `batch status` 返回的路径为准。旧批次若已导入部分内容却仍有未解决重复项，CLI 会在任何修改前拒绝继续 resolve；需人工恢复旧批次或在新批次导入内容前先完成重复项审核。
 
 ## 4. 第一个 Claude 窗口：整批研究、写作和图片搜索
 

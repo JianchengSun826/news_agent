@@ -23,6 +23,7 @@ from .batch_models import (
 )
 from .models import CandidateInput, new_id, utc_now
 from .service import Newsroom, WorkflowError
+from .workspace import BatchWorkspace, BatchWorkspacePaths, _atomic_write, _atomic_write_bytes
 
 
 REQUIRED_CSV_FIELDS = {
@@ -45,6 +46,7 @@ REQUIRED_CSV_FIELDS = {
 class BatchWorkflow:
     def __init__(self, room: Newsroom):
         self.room = room
+        self.workspace = BatchWorkspace(room)
 
     def prepare(self, csv_path: Path) -> dict[str, Any]:
         source = Path(csv_path)
@@ -69,6 +71,9 @@ class BatchWorkflow:
                 "VALUES (?,?,?,?,?,?)",
                 (batch_id, source.name, source_sha256, "PREPARING", now, now),
             )
+
+        self.workspace.ensure_layout(batch_id)
+        self.workspace.store_source_csv(batch_id, raw, source_sha256)
 
         for values, fingerprint in zip(rows, fingerprints, strict=True):
             candidate = self.room.find_candidate_by_fingerprint(fingerprint)
@@ -100,6 +105,7 @@ class BatchWorkflow:
 
         request_path = self._write_content_request(batch_id)
         self._refresh_batch_status(batch_id)
+        self.workspace.refresh(batch_id)
         summary = self._summary(batch_id)
         summary["content_request_path"] = str(request_path) if request_path else None
         return summary
@@ -124,13 +130,6 @@ class BatchWorkflow:
         )
         if not request_row:
             raise WorkflowError(f"content request not found: {request_id}")
-        if request_row["status"] == "COMPLETED":
-            if request_row["result_sha256"] != result_sha256:
-                raise WorkflowError("content request already completed with a different result")
-            return self._content_import_summary(batch_id, request_id)
-        if request_row["status"] != "PENDING":
-            raise WorkflowError(f"content request is not open: {request_row['status']}")
-
         self._validate_result_identity(
             payload.batch_id,
             payload.request_id,
@@ -138,6 +137,12 @@ class BatchWorkflow:
             batch_id,
             request_row,
         )
+        if request_row["status"] == "COMPLETED":
+            if request_row["result_sha256"] != result_sha256:
+                raise WorkflowError("content request already completed with a different result")
+            return self._content_import_summary(batch_id, request_id)
+        if request_row["status"] != "PENDING":
+            raise WorkflowError(f"content request is not open: {request_row['status']}")
         request_document = json.loads(
             (self.room.root / request_row["request_path"]).read_text(encoding="utf-8")
         )
@@ -146,8 +151,8 @@ class BatchWorkflow:
         self._validate_membership(expected_ids, actual_ids)
         self._validate_slugs(payload)
 
-        batch_dir = self.room.root / "output" / "batches" / batch_id
-        staging = batch_dir / f".staging-{request_id}"
+        paths = BatchWorkspacePaths(self.workspace.batch_root(batch_id))
+        staging = paths.root / f".staging-{request_id}"
         if staging.exists():
             shutil.rmtree(staging)
         staging.mkdir(parents=True)
@@ -161,13 +166,15 @@ class BatchWorkflow:
                 item.article_md.rstrip() + "\n", encoding="utf-8"
             )
 
-        stored_result = batch_dir / f"{request_id}-content-result.json"
+        stored_result = paths.archive / "content-result.json"
         created_paths: list[Path] = []
         fact_check_path: Path | None = None
         try:
             if stored_result.exists():
                 raise WorkflowError(f"stored content result already exists: {stored_result}")
-            shutil.copyfile(source, stored_result)
+            staged_result = staging / stored_result.name
+            staged_result.write_bytes(raw)
+            os.replace(staged_result, stored_result)
             created_paths.append(stored_result)
             with self.room.db.connect() as connection:
                 for item in payload.items:
@@ -179,15 +186,11 @@ class BatchWorkflow:
                         raise WorkflowError(
                             f"content import requires SELECTED article {item.article_id}; current status is {current}"
                         )
-                    research_path = (
-                        self.room.root
-                        / "research"
-                        / item.article_id
-                        / "research-brief-v1.md"
+                    article_dir = self.workspace.article_root(
+                        article["owning_batch_id"] or batch_id, item.article_id
                     )
-                    article_path = (
-                        self.room.root / "articles" / item.article_id / "article-v1.md"
-                    )
+                    research_path = article_dir / "research-brief-v1.md"
+                    article_path = article_dir / "article-v1.md"
                     research_path.parent.mkdir(parents=True, exist_ok=True)
                     article_path.parent.mkdir(parents=True, exist_ok=True)
                     if research_path.exists() or article_path.exists():
@@ -288,6 +291,7 @@ class BatchWorkflow:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
+        self.workspace.refresh(batch_id)
         return {
             "batch_id": batch_id,
             "request_id": request_id,
@@ -332,8 +336,8 @@ class BatchWorkflow:
         actual_ids = {item.article_id for item in payload.items}
         self._validate_membership(expected_ids, actual_ids)
 
-        batch_dir = self.room.root / "output" / "batches" / batch_id
-        staging = batch_dir / f".staging-{request_id}"
+        paths = BatchWorkspacePaths(self.workspace.batch_root(batch_id))
+        staging = paths.root / f".staging-{request_id}"
         if staging.exists():
             shutil.rmtree(staging)
         staging.mkdir(parents=True)
@@ -344,12 +348,14 @@ class BatchWorkflow:
             (staging / f"{item.article_id}-fact-check.md").write_text(
                 item.report_md.rstrip() + "\n", encoding="utf-8"
             )
-        stored_result = batch_dir / f"{request_id}-fact-check-result.json"
+        stored_result = paths.archive / f"fact-check-result-v{request_row['revision_number']}.json"
         created_paths: list[Path] = []
         try:
             if stored_result.exists():
                 raise WorkflowError(f"stored fact-check result already exists: {stored_result}")
-            shutil.copyfile(source, stored_result)
+            staged_result = staging / stored_result.name
+            staged_result.write_bytes(raw)
+            os.replace(staged_result, stored_result)
             created_paths.append(stored_result)
             with self.room.db.connect() as connection:
                 for item in payload.items:
@@ -366,12 +372,9 @@ class BatchWorkflow:
                         raise WorkflowError(
                             f"revision mismatch for {item.article_id}: expected {revision_number}"
                         )
-                    report_path = (
-                        self.room.root
-                        / "articles"
-                        / item.article_id
-                        / f"fact-check-v{revision_number}.md"
-                    )
+                    report_path = self.workspace.article_root(
+                        article["owning_batch_id"] or batch_id, item.article_id
+                    ) / f"fact-check-v{revision_number}.md"
                     report_path.parent.mkdir(parents=True, exist_ok=True)
                     if report_path.exists():
                         raise WorkflowError(
@@ -435,6 +438,7 @@ class BatchWorkflow:
             raise
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+        self.workspace.refresh(batch_id)
         return self._fact_check_import_summary(batch_id, request_id)
 
     def create_revision_request(self, batch_id: str) -> Path:
@@ -492,12 +496,11 @@ class BatchWorkflow:
             instructions=instructions,
             items=items,
         )
-        batch_dir = self.room.root / "output" / "batches" / batch_id
-        path = batch_dir / f"{request_id}-revision-request-v{target_revision}.json"
-        path.write_text(
-            json.dumps(request.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        paths = BatchWorkspacePaths(self.workspace.batch_root(batch_id))
+        path = paths.requests / f"revision-request-v{target_revision}.json"
+        if path.exists():
+            raise WorkflowError(f"revision request already pending or stored: {path}")
+        _atomic_write(path, json.dumps(request.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n")
         now = utc_now()
         try:
             with self.room.db.connect() as connection:
@@ -529,6 +532,7 @@ class BatchWorkflow:
         except Exception:
             path.unlink(missing_ok=True)
             raise
+        self.workspace.refresh(batch_id)
         return path
 
     def import_revisions(self, batch_id: str, result_path: Path) -> dict[str, Any]:
@@ -567,8 +571,8 @@ class BatchWorkflow:
             item["article_id"]: item["revision_number"] for item in request_document["items"]
         }
 
-        batch_dir = self.room.root / "output" / "batches" / batch_id
-        staging = batch_dir / f".staging-{payload.request_id}"
+        paths = BatchWorkspacePaths(self.workspace.batch_root(batch_id))
+        staging = paths.root / f".staging-{payload.request_id}"
         if staging.exists():
             shutil.rmtree(staging)
         staging.mkdir(parents=True)
@@ -581,13 +585,15 @@ class BatchWorkflow:
             (item_dir / "article.md").write_text(
                 item.article_md.rstrip() + "\n", encoding="utf-8"
             )
-        stored_result = batch_dir / f"{payload.request_id}-revision-result.json"
+        stored_result = paths.archive / f"revision-result-v{request_row['revision_number']}.json"
         created_paths: list[Path] = []
         fact_check_path: Path | None = None
         try:
             if stored_result.exists():
                 raise WorkflowError(f"stored revision result already exists: {stored_result}")
-            shutil.copyfile(source, stored_result)
+            staged_result = staging / stored_result.name
+            staged_result.write_bytes(raw)
+            os.replace(staged_result, stored_result)
             created_paths.append(stored_result)
             with self.room.db.connect() as connection:
                 for item in payload.items:
@@ -602,18 +608,11 @@ class BatchWorkflow:
                     target_revision = target_revisions[item.article_id]
                     if target_revision != article["revision_number"] + 1:
                         raise WorkflowError(f"revision number mismatch for {item.article_id}")
-                    research_path = (
-                        self.room.root
-                        / "research"
-                        / item.article_id
-                        / f"research-brief-v{target_revision}.md"
+                    article_dir = self.workspace.article_root(
+                        article["owning_batch_id"] or batch_id, item.article_id
                     )
-                    article_path = (
-                        self.room.root
-                        / "articles"
-                        / item.article_id
-                        / f"article-v{target_revision}.md"
-                    )
+                    research_path = article_dir / f"research-brief-v{target_revision}.md"
+                    article_path = article_dir / f"article-v{target_revision}.md"
                     research_path.parent.mkdir(parents=True, exist_ok=True)
                     article_path.parent.mkdir(parents=True, exist_ok=True)
                     if research_path.exists() or article_path.exists():
@@ -681,6 +680,7 @@ class BatchWorkflow:
             raise
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+        self.workspace.refresh(batch_id)
         return {
             "batch_id": batch_id,
             "request_id": payload.request_id,
@@ -708,6 +708,14 @@ class BatchWorkflow:
             raise WorkflowError(f"batch item not found: {batch_id}/{candidate_id}")
         if item["item_status"] != "WAITING_DUPLICATE":
             raise WorkflowError("duplicate resolution requires WAITING_DUPLICATE")
+        if self.room.db.one(
+            "SELECT request_id FROM batch_requests WHERE batch_id=? "
+            "AND request_type='CONTENT' AND status='COMPLETED' LIMIT 1", (batch_id,)
+        ):
+            raise WorkflowError(
+                "batch content import already completed while duplicates remain unresolved; "
+                "resolve duplicates before content import in a new batch or recover the legacy batch manually"
+            )
 
         if decision == "exclude":
             self.room.reject_candidate(candidate_id, actor, reason)
@@ -730,9 +738,9 @@ class BatchWorkflow:
                 "WHERE batch_id=? AND candidate_id=?",
                 (article_id, item_status, utc_now(), batch_id, candidate_id),
             )
-        if decision == "include":
-            self._write_content_request(batch_id)
+        self._write_content_request(batch_id)
         self._refresh_batch_status(batch_id)
+        self.workspace.refresh(batch_id)
         return self._summary(batch_id)
 
     def _validated_rows(self, source: Path) -> list[dict[str, Any]]:
@@ -809,6 +817,11 @@ class BatchWorkflow:
         return "READY_FOR_CONTENT", classification
 
     def _write_content_request(self, batch_id: str) -> Path | None:
+        if self.room.db.one(
+            "SELECT candidate_id FROM batch_items WHERE batch_id=? "
+            "AND item_status='WAITING_DUPLICATE' LIMIT 1", (batch_id,)
+        ):
+            return None
         items = self.room.db.all(
             "SELECT bi.article_id,c.* FROM batch_items bi "
             "JOIN candidates c ON c.candidate_id=bi.candidate_id "
@@ -848,38 +861,49 @@ class BatchWorkflow:
                 for row in items
             ],
         )
-        batch_dir = self.room.root / "output" / "batches" / batch_id
-        batch_dir.mkdir(parents=True, exist_ok=True)
-        path = batch_dir / f"{request_id}-content-request.json"
-        path.write_text(
-            json.dumps(request.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        paths = BatchWorkspacePaths(self.workspace.batch_root(batch_id))
+        path = paths.requests / "content-request.json"
+        previous_bytes = path.read_bytes() if path.exists() else None
+        history_paths: list[Path] = []
         now = utc_now()
-        with self.room.db.connect() as connection:
-            connection.execute(
-                "UPDATE batch_requests SET status='SUPERSEDED' "
-                "WHERE batch_id=? AND request_type='CONTENT' AND status='PENDING'",
-                (batch_id,),
-            )
-            connection.execute(
-                "INSERT INTO batch_requests(request_id,batch_id,request_type,revision_number,"
-                "request_path,expected_result_filename,status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    request_id,
-                    batch_id,
-                    "CONTENT",
-                    1,
-                    str(path.relative_to(self.room.root)),
-                    output_file,
-                    "PENDING",
-                    now,
-                ),
-            )
-            connection.execute(
-                "UPDATE batches SET content_request_id=?,updated_at=? WHERE batch_id=?",
-                (request_id, now, batch_id),
-            )
+        try:
+            with self.room.db.connect() as connection:
+                superseded = connection.execute(
+                    "SELECT * FROM batch_requests WHERE batch_id=? "
+                    "AND request_type='CONTENT' AND status='PENDING'", (batch_id,)
+                ).fetchall()
+                for previous in superseded:
+                    previous_path = self.room.root / previous["request_path"]
+                    history = paths.requests / previous["request_id"] / "content-request.json"
+                    if history.exists():
+                        raise WorkflowError(f"content request history already exists: {history}")
+                    _atomic_write_bytes(history, previous_path.read_bytes())
+                    history_paths.append(history)
+                    connection.execute(
+                        "UPDATE batch_requests SET status='SUPERSEDED',request_path=? WHERE request_id=?",
+                        (str(history.relative_to(self.room.root)), previous["request_id"]),
+                    )
+                if previous_bytes is not None and not superseded:
+                    raise WorkflowError("content request already stored without an open request")
+                _atomic_write(path, json.dumps(request.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n")
+                connection.execute(
+                    "INSERT INTO batch_requests(request_id,batch_id,request_type,revision_number,"
+                    "request_path,expected_result_filename,status,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (request_id, batch_id, "CONTENT", 1, str(path.relative_to(self.room.root)), output_file, "PENDING", now),
+                )
+                connection.execute(
+                    "UPDATE batches SET content_request_id=?,updated_at=? WHERE batch_id=?",
+                    (request_id, now, batch_id),
+                )
+        except Exception:
+            if previous_bytes is None:
+                path.unlink(missing_ok=True)
+            elif path.read_bytes() != previous_bytes:
+                path.write_bytes(previous_bytes)
+            for history in history_paths:
+                history.unlink(missing_ok=True)
+                history.parent.rmdir()
+            raise
         return path
 
     def _write_fact_check_request(
@@ -921,12 +945,11 @@ class BatchWorkflow:
             instructions=instructions,
             items=items,
         )
-        batch_dir = self.room.root / "output" / "batches" / batch_id
-        path = batch_dir / f"{request_id}-fact-check-request-v{revision_number}.json"
-        path.write_text(
-            json.dumps(request.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        paths = BatchWorkspacePaths(self.workspace.batch_root(batch_id))
+        path = paths.requests / f"fact-check-request-v{revision_number}.json"
+        if path.exists():
+            raise WorkflowError(f"fact-check request version {revision_number} already exists")
+        _atomic_write(path, json.dumps(request.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n")
         now = utc_now()
         connection.execute(
             "INSERT INTO batch_requests(request_id,batch_id,request_type,revision_number,"

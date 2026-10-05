@@ -165,7 +165,9 @@ def test_cli_prepare_outputs_one_claude_request(tmp_path: Path):
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert Path(payload["content_request_path"]).exists()
+    batch_root = tmp_path / "workspace/batches" / payload["batch_id"]
+    assert Path(payload["content_request_path"]) == batch_root / "claude/requests/content-request.json"
+    assert (batch_root / "input/candidates.csv").read_bytes() == csv_path.read_bytes()
     assert payload["claude_instruction"] == (
         "严格执行文件中的 instructions，完成全部条目，并生成其中指定的 output_file。"
     )
