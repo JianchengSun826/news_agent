@@ -319,3 +319,125 @@ def test_reimporting_identical_content_result_is_idempotent(
     second = prepared_batch.workflow.import_content(prepared_batch.batch_id, path)
 
     assert first["request_id"] == second["request_id"]
+
+
+@pytest.fixture
+def content_batch(prepared_batch: SimpleNamespace, tmp_path: Path) -> SimpleNamespace:
+    content_result = write_content_result(prepared_batch, tmp_path / "content-result.json")
+    imported = prepared_batch.workflow.import_content(prepared_batch.batch_id, content_result)
+    fact_request_path = Path(imported["fact_check_request_path"])
+    fact_request = json.loads(fact_request_path.read_text(encoding="utf-8"))
+    prepared_batch.fact_request_path = fact_request_path
+    prepared_batch.fact_request = fact_request
+    prepared_batch.article_ids = [item["article_id"] for item in fact_request["items"]]
+    return prepared_batch
+
+
+def write_fact_check_result(
+    content: SimpleNamespace,
+    path: Path,
+    outcomes: list[str],
+    *,
+    request: dict | None = None,
+) -> Path:
+    request = request or content.fact_request
+    items = []
+    for item, outcome in zip(request["items"], outcomes, strict=True):
+        items.append(
+            {
+                "article_id": item["article_id"],
+                "outcome": outcome,
+                "report_md": "# Fact-check report\n\nAll material claims were checked against the listed sources.",
+                "blocking_issues": (
+                    [] if outcome == "PASS" else ["The launch date is not supported by the primary source."]
+                ),
+            }
+        )
+    payload = {
+        "schema_version": 1,
+        "batch_id": content.batch_id,
+        "request_id": request["request_id"],
+        "output_file": request["output_file"],
+        "items": items,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def test_fact_check_import_routes_pass_and_fail(content_batch: SimpleNamespace, tmp_path: Path):
+    path = write_fact_check_result(
+        content_batch, tmp_path / "fact-check-result.json", ["PASS", "FAIL"]
+    )
+
+    result = content_batch.workflow.import_fact_checks(content_batch.batch_id, path)
+
+    assert result["passed"] == 1
+    assert result["needs_revision"] == 1
+    assert content_batch.room.get_article(content_batch.article_ids[0])["status"] == "FACT_CHECKED"
+    assert content_batch.room.get_article(content_batch.article_ids[1])["status"] == "NEEDS_REVISION"
+
+
+@pytest.fixture
+def revised_batch(content_batch: SimpleNamespace, tmp_path: Path) -> SimpleNamespace:
+    first_request = content_batch.fact_request
+    failed = write_fact_check_result(
+        content_batch, tmp_path / "first-fact-check.json", ["FAIL", "PASS"]
+    )
+    content_batch.workflow.import_fact_checks(content_batch.batch_id, failed)
+    revision_request_path = content_batch.workflow.create_revision_request(content_batch.batch_id)
+    revision_request = json.loads(revision_request_path.read_text(encoding="utf-8"))
+    result_items = []
+    for item in revision_request["items"]:
+        result_items.append(
+            {
+                "article_id": item["article_id"],
+                "research_brief_md": "# Revised research brief\n\nThe date was rechecked against the primary source.",
+                "title_cn": "修订后的示例新闻标题",
+                "slug": "revised-example-news",
+                "article_md": "# 修订后的示例新闻标题\n\n这是修正日期后、基于来源重新撰写的完整文章内容。",
+            }
+        )
+    revision_result = {
+        "schema_version": 1,
+        "batch_id": content_batch.batch_id,
+        "request_id": revision_request["request_id"],
+        "output_file": revision_request["output_file"],
+        "items": result_items,
+    }
+    revision_result_path = tmp_path / "revision-result.json"
+    revision_result_path.write_text(
+        json.dumps(revision_result, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    imported = content_batch.workflow.import_revisions(
+        content_batch.batch_id, revision_result_path
+    )
+    content_batch.first_fact_request = first_request
+    content_batch.fact_request_path = Path(imported["fact_check_request_path"])
+    content_batch.fact_request = json.loads(
+        content_batch.fact_request_path.read_text(encoding="utf-8")
+    )
+    return content_batch
+
+
+def test_revision_preserves_v1_and_writes_v2(revised_batch: SimpleNamespace):
+    article_id = revised_batch.article_ids[0]
+    article_dir = revised_batch.room.root / "articles" / article_id
+
+    assert (article_dir / "article-v1.md").exists()
+    assert (article_dir / "article-v2.md").exists()
+    assert revised_batch.room.get_article(article_id)["revision_number"] == 2
+    assert revised_batch.room.get_article(article_id)["status"] == "DRAFTED"
+
+
+def test_second_round_rejects_first_round_fact_check_result(
+    revised_batch: SimpleNamespace, tmp_path: Path
+):
+    stale = write_fact_check_result(
+        revised_batch,
+        tmp_path / "stale-first-round.json",
+        ["PASS", "PASS"],
+        request=revised_batch.first_fact_request,
+    )
+
+    with pytest.raises(WorkflowError, match="request_id"):
+        revised_batch.workflow.import_fact_checks(revised_batch.batch_id, stale)
