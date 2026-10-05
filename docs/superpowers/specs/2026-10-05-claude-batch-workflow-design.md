@@ -4,7 +4,7 @@
 
 **Phase:** Phase 1.1 — Human-in-the-loop batch extension
 
-**Status:** Approved conversational design; pending written review
+**Status:** Approved
 
 ## Context
 
@@ -114,6 +114,8 @@ newsroom batch content-import BATCH_ID RESULT_JSON
 newsroom batch fact-check-import BATCH_ID RESULT_JSON
 newsroom batch revision-request BATCH_ID
 newsroom batch revision-import BATCH_ID RESULT_JSON
+newsroom image candidates ARTICLE_ID
+newsroom image register ARTICLE_ID --candidate IMAGE_CANDIDATE_ID --file IMAGE_FILE --rights-confirmed
 ```
 
 `batch status` reports item counts and lists items requiring duplicate decisions, Claude content, fact-checking, revision, image selection, or publication review.
@@ -140,11 +142,15 @@ Add nullable `candidate_fingerprint`. The fingerprint is a SHA-256 of canonical 
 | `source_filename` | Original CSV basename |
 | `source_sha256` | Hash used for idempotent prepare |
 | `status` | Current aggregate batch state |
-| `content_request_id` | Immutable first-window request ID |
-| `fact_check_request_id` | Immutable second-window request ID |
+| `content_request_id` | Latest content-window request ID |
+| `fact_check_request_id` | Latest fact-check-window request ID |
 | `created_at`, `updated_at` | UTC ISO-8601 timestamps |
 
 Preparing the same CSV hash returns the existing batch unless the user explicitly requests a new batch.
+
+### `batch_requests`
+
+Every Claude handoff has an immutable row containing `request_id`, `batch_id`, request type (`CONTENT`, `FACT_CHECK`, or `REVISION`), revision number, request path, expected result filename, imported result path and SHA-256, request status, and timestamps. The IDs on `batches` point to the latest request while this table preserves all earlier rounds.
 
 ### `batch_items`
 
@@ -173,9 +179,15 @@ Allowed rights bases are:
 
 Search-engine thumbnails, ordinary media article images, unclear copyright, unsupported fair-use claims, and records without an original rights page are invalid.
 
+`newsroom image candidates ARTICLE_ID` shows the stored options. After opening the original rights page and downloading the file, the user registers the chosen row with `--candidate` and the explicit `--rights-confirmed` flag. The CLI copies the candidate's rights metadata into the permanent image record, marks it selected, and rejects a candidate that belongs to a different article.
+
 ### Article changes
 
 Add `fact_check_outcome` and `revision_number`. The article state machine gains `NEEDS_REVISION`.
+
+### Permanent image changes
+
+Add nullable `image_candidate_id`, `rights_basis`, and `rights_statement` to `images`. Legacy AI-generated and manually licensed images remain valid. Images registered from a Claude candidate copy these fields and all license/attribution metadata into the permanent record so publication packages remain auditable even if the batch artifacts are later archived.
 
 ## State Transitions
 
@@ -249,7 +261,7 @@ The importer requires an exact match between requested and returned article IDs.
 
 CSV parsing and JSON validation finish before database writes. Content import uses one transaction for the entire batch so an invalid item cannot leave partial research or draft state. Fact-check JSON is validated as a whole, then all item outcomes are applied in one transaction; a `FAIL` outcome is valid data rather than an import error.
 
-The SHA-256 of every imported result is stored with the batch. Re-importing the same result returns the existing state. A different result for an already completed request is rejected and must use the revision workflow.
+The SHA-256 of every imported result is stored with its immutable `batch_requests` row. Re-importing the same result returns the existing state. A different result for an already completed request is rejected and must use the revision workflow.
 
 Filesystem artifacts are written to temporary files first and atomically renamed only after validation. Database changes and artifact promotion must be coordinated so failures leave neither misleading state nor partial canonical files.
 
