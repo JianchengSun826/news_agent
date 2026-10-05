@@ -161,7 +161,77 @@ def test_init_migrates_v1_images_table_to_store_image_path(tmp_path: Path):
         columns = {row[1] for row in connection.execute("PRAGMA table_info(images)")}
         versions = [row[0] for row in connection.execute("SELECT version FROM schema_version ORDER BY version")]
     assert "image_path" in columns
-    assert versions == [1, 2]
+    assert versions == [1, 2, 3]
+
+
+def build_v2_database(tmp_path: Path, *, duplicate_candidates: bool = False) -> Path:
+    db_path = tmp_path / "data" / "newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+            INSERT INTO schema_version VALUES (1, '2026-09-29T00:00:00+00:00');
+            INSERT INTO schema_version VALUES (2, '2026-09-30T00:00:00+00:00');
+            CREATE TABLE candidates (
+              candidate_id TEXT PRIMARY KEY,
+              event_date TEXT NOT NULL,
+              company TEXT NOT NULL,
+              product TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              core_fact TEXT NOT NULL,
+              primary_source TEXT NOT NULL
+            );
+            CREATE TABLE articles (article_id TEXT PRIMARY KEY);
+            CREATE TABLE images (image_id TEXT PRIMARY KEY, image_path TEXT);
+            """
+        )
+        rows = [
+            ("cand-one", "2026-10-05", "Example", "Tool", "launch", "Example launched Tool.", "https://example.com/tool"),
+        ]
+        if duplicate_candidates:
+            rows.append(("cand-two", *rows[0][1:]))
+        connection.executemany("INSERT INTO candidates VALUES (?,?,?,?,?,?,?)", rows)
+    return db_path
+
+
+def test_init_migrates_v2_to_v3_and_creates_backup(tmp_path: Path):
+    db_path = build_v2_database(tmp_path)
+
+    Database(db_path).initialize("2026-10-05T00:00:00+00:00")
+
+    with sqlite3.connect(db_path) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        candidate_columns = {row[1] for row in connection.execute("PRAGMA table_info(candidates)")}
+        article_columns = {row[1] for row in connection.execute("PRAGMA table_info(articles)")}
+        image_columns = {row[1] for row in connection.execute("PRAGMA table_info(images)")}
+        versions = [row[0] for row in connection.execute("SELECT version FROM schema_version ORDER BY version")]
+        fingerprint = connection.execute("SELECT candidate_fingerprint FROM candidates WHERE candidate_id='cand-one'").fetchone()[0]
+    assert {"batches", "batch_requests", "batch_items", "image_candidates"} <= tables
+    assert "candidate_fingerprint" in candidate_columns
+    assert {"fact_check_outcome", "revision_number"} <= article_columns
+    assert {"image_candidate_id", "rights_basis", "rights_statement"} <= image_columns
+    assert versions == [1, 2, 3]
+    assert fingerprint
+    assert len(list((tmp_path / "data" / "backups").glob("newsroom-v2-*.db"))) == 1
+
+
+def test_migration_reports_fingerprint_collisions_without_merging(tmp_path: Path):
+    db_path = build_v2_database(tmp_path, duplicate_candidates=True)
+
+    with pytest.raises(ValueError, match="candidate fingerprint collision"):
+        Database(db_path).initialize("2026-10-05T00:00:00+00:00")
+
+    assert len(list((tmp_path / "data" / "backups").glob("*.db"))) == 1
+
+
+def test_version_3_init_is_idempotent_and_does_not_create_extra_backup(tmp_path: Path):
+    room = Newsroom(tmp_path)
+
+    room.init()
+    room.init()
+
+    assert list((tmp_path / "data" / "backups").glob("*.db")) == []
 
 
 def test_init_seeds_source_registry(newsroom: Newsroom):

@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
+import shutil
+import re
 from pathlib import Path
 from typing import Any, Iterable
+
+from .batch_models import candidate_fingerprint
 
 
 SCHEMA = """
@@ -33,6 +37,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   event_id TEXT,
   selected INTEGER NOT NULL DEFAULT 0,
   rejection_reason TEXT,
+  candidate_fingerprint TEXT,
   notes TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -60,6 +65,8 @@ CREATE TABLE IF NOT EXISTS articles (
   draft_path TEXT,
   research_brief_path TEXT,
   fact_check_path TEXT,
+  fact_check_outcome TEXT,
+  revision_number INTEGER NOT NULL DEFAULT 1,
   image_id TEXT,
   notes TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
@@ -89,6 +96,9 @@ CREATE TABLE IF NOT EXISTS images (
   ai_model TEXT,
   prompt_path TEXT,
   image_path TEXT,
+  image_candidate_id TEXT,
+  rights_basis TEXT,
+  rights_statement TEXT,
   generated_at TEXT,
   downloaded_at TEXT,
   notes TEXT NOT NULL DEFAULT ''
@@ -103,8 +113,65 @@ CREATE TABLE IF NOT EXISTS state_transitions (
   reason TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS batches (
+  batch_id TEXT PRIMARY KEY,
+  source_filename TEXT NOT NULL,
+  source_sha256 TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL,
+  content_request_id TEXT,
+  fact_check_request_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS batch_requests (
+  request_id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+  request_type TEXT NOT NULL,
+  revision_number INTEGER NOT NULL,
+  request_path TEXT NOT NULL,
+  expected_result_filename TEXT NOT NULL,
+  result_path TEXT,
+  result_sha256 TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS batch_items (
+  batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+  candidate_id TEXT NOT NULL REFERENCES candidates(candidate_id),
+  article_id TEXT REFERENCES articles(article_id),
+  item_status TEXT NOT NULL,
+  duplicate_classification TEXT,
+  content_version INTEGER NOT NULL DEFAULT 1,
+  error_message TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(batch_id, candidate_id)
+);
+CREATE TABLE IF NOT EXISTS image_candidates (
+  image_candidate_id TEXT PRIMARY KEY,
+  batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+  article_id TEXT NOT NULL REFERENCES articles(article_id),
+  landing_page_url TEXT NOT NULL,
+  direct_image_url TEXT,
+  creator TEXT,
+  rights_basis TEXT NOT NULL,
+  license_name TEXT,
+  rights_url TEXT NOT NULL,
+  rights_statement TEXT NOT NULL,
+  attribution_required INTEGER NOT NULL,
+  attribution_text TEXT,
+  relevance TEXT NOT NULL,
+  review_status TEXT NOT NULL DEFAULT 'PROPOSED',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_candidates_event ON candidates(company, product, event_type, event_date);
 CREATE INDEX IF NOT EXISTS idx_transitions_entity ON state_transitions(entity_id, transition_id);
+CREATE INDEX IF NOT EXISTS idx_batch_items_status ON batch_items(batch_id, item_status);
+CREATE INDEX IF NOT EXISTS idx_batch_requests_batch ON batch_requests(batch_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_image_candidates_article ON image_candidates(article_id, review_status);
 """
 
 
@@ -118,8 +185,60 @@ class Database:
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    def _existing_version(self) -> int:
+        if not self.path.exists():
+            return 0
+        with sqlite3.connect(self.path) as connection:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+            ).fetchone()
+            if not table:
+                return 0
+            row = connection.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            return int(row[0] or 0)
+
+    def _backup_before_v3(self, version: int, applied_at: str) -> None:
+        backup_dir = self.path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = re.sub(r"[^0-9A-Za-z]+", "", applied_at)
+        shutil.copy2(self.path, backup_dir / f"newsroom-v{version}-{stamp}.db")
+
+    @staticmethod
+    def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+        return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+    @staticmethod
+    def _add_column(connection: sqlite3.Connection, table: str, definition: str) -> None:
+        name = definition.split()[0]
+        columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if name not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+    @staticmethod
+    def _backfill_candidate_fingerprints(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT candidate_id,event_date,company,product,event_type,core_fact,primary_source "
+            "FROM candidates ORDER BY candidate_id"
+        ).fetchall()
+        fingerprints: dict[str, str] = {}
+        for row in rows:
+            value = candidate_fingerprint(dict(row))
+            previous = fingerprints.get(value)
+            if previous and previous != row["candidate_id"]:
+                raise ValueError(
+                    f"candidate fingerprint collision: {previous} and {row['candidate_id']}"
+                )
+            fingerprints[value] = row["candidate_id"]
+            connection.execute(
+                "UPDATE candidates SET candidate_fingerprint=? WHERE candidate_id=?",
+                (value, row["candidate_id"]),
+            )
+
     def initialize(self, applied_at: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        existing_version = self._existing_version()
+        if existing_version in {1, 2}:
+            self._backup_before_v3(existing_version, applied_at)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             connection.execute(
@@ -131,6 +250,20 @@ class Database:
                 connection.execute("ALTER TABLE images ADD COLUMN image_path TEXT")
             connection.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (2, ?)",
+                (applied_at,),
+            )
+            self._add_column(connection, "candidates", "candidate_fingerprint TEXT")
+            self._add_column(connection, "articles", "fact_check_outcome TEXT")
+            self._add_column(connection, "articles", "revision_number INTEGER NOT NULL DEFAULT 1")
+            self._add_column(connection, "images", "image_candidate_id TEXT")
+            self._add_column(connection, "images", "rights_basis TEXT")
+            self._add_column(connection, "images", "rights_statement TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candidates_fingerprint ON candidates(candidate_fingerprint)"
+            )
+            self._backfill_candidate_fingerprints(connection)
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (3, ?)",
                 (applied_at,),
             )
 
