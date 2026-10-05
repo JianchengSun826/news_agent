@@ -291,7 +291,7 @@ class BatchWorkflow:
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
-        self.workspace.refresh(batch_id)
+        self._refresh_article_workspaces(batch_id, expected_ids)
         return {
             "batch_id": batch_id,
             "request_id": request_id,
@@ -438,7 +438,7 @@ class BatchWorkflow:
             raise
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-        self.workspace.refresh(batch_id)
+        self._refresh_article_workspaces(batch_id, expected_ids)
         return self._fact_check_import_summary(batch_id, request_id)
 
     def create_revision_request(self, batch_id: str) -> Path:
@@ -680,7 +680,7 @@ class BatchWorkflow:
             raise
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-        self.workspace.refresh(batch_id)
+        self._refresh_article_workspaces(batch_id, expected_ids)
         return {
             "batch_id": batch_id,
             "request_id": payload.request_id,
@@ -951,24 +951,28 @@ class BatchWorkflow:
             raise WorkflowError(f"fact-check request version {revision_number} already exists")
         _atomic_write(path, json.dumps(request.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n")
         now = utc_now()
-        connection.execute(
-            "INSERT INTO batch_requests(request_id,batch_id,request_type,revision_number,"
-            "request_path,expected_result_filename,status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (
-                request_id,
-                batch_id,
-                "FACT_CHECK",
-                revision_number,
-                str(path.relative_to(self.room.root)),
-                output_file,
-                "PENDING",
-                now,
-            ),
-        )
-        connection.execute(
-            "UPDATE batches SET fact_check_request_id=?,updated_at=? WHERE batch_id=?",
-            (request_id, now, batch_id),
-        )
+        try:
+            connection.execute(
+                "INSERT INTO batch_requests(request_id,batch_id,request_type,revision_number,"
+                "request_path,expected_result_filename,status,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    request_id,
+                    batch_id,
+                    "FACT_CHECK",
+                    revision_number,
+                    str(path.relative_to(self.room.root)),
+                    output_file,
+                    "PENDING",
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE batches SET fact_check_request_id=?,updated_at=? WHERE batch_id=?",
+                (request_id, now, batch_id),
+            )
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
         return path
 
     @staticmethod
@@ -1062,6 +1066,17 @@ class BatchWorkflow:
                 str(self.room.root / fact_request["request_path"]) if fact_request else None
             ),
         }
+
+    def _refresh_article_workspaces(self, batch_id: str, article_ids: set[str]) -> None:
+        """Refresh the importing batch and each immutable article owner once."""
+        placeholders = ",".join("?" for _ in article_ids)
+        owners = self.room.db.all(
+            f"SELECT DISTINCT owning_batch_id FROM articles WHERE article_id IN ({placeholders}) "
+            "AND owning_batch_id IS NOT NULL", tuple(sorted(article_ids))
+        )
+        affected_batches = {batch_id, *(row["owning_batch_id"] for row in owners)}
+        for affected_batch_id in sorted(affected_batches):
+            self.workspace.refresh(affected_batch_id)
 
     def _refresh_batch_status(self, batch_id: str) -> None:
         counts = Counter(

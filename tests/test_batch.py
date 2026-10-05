@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -552,6 +553,130 @@ def test_content_and_fact_check_import_use_article_workspace(prepared_batch: Sim
     state = json.loads((tmp_path / prefix / "batch-state.json").read_text())
     assert state["status"] == "NEEDS_REVISION"
     assert not list((tmp_path / prefix).glob(".staging-*"))
+
+
+def test_content_import_refreshes_reused_article_owner_workspace(prepared_batch: SimpleNamespace, tmp_path: Path):
+    source_rows = duplicate_rows()[::2]
+    reused = prepared_batch.workflow.prepare(write_batch_csv(tmp_path / "reuse.csv", source_rows, line_ending="\r\n"))
+    assert reused["batch_id"] != prepared_batch.batch_id
+    request = json.loads(Path(reused["content_request_path"]).read_text())
+    imported_batch = SimpleNamespace(batch_id=reused["batch_id"], request=request)
+    article_id = prepared_batch.article_ids[0]
+    owner_root = tmp_path / "workspace/batches" / prepared_batch.batch_id
+    reused_root = tmp_path / "workspace/batches" / reused["batch_id"]
+    candidates_path = owner_root / "articles" / article_id / "image-candidates.json"
+    assert json.loads(candidates_path.read_text()) == []
+    result = write_content_result(imported_batch, tmp_path / "reused-content.json")
+
+    imported = prepared_batch.workflow.import_content(reused["batch_id"], result)
+
+    assert json.loads(candidates_path.read_text()) == prepared_batch.room.list_image_candidates(article_id)
+    assert len(json.loads(candidates_path.read_text())) == 1
+    for root in (owner_root, reused_root):
+        state = json.loads((root / "batch-state.json").read_text())
+        item = next(item for item in state["items"] if item["article_id"] == article_id)
+        assert item["article_status"] == "DRAFTED"
+        assert item["image_state"] == "PROPOSED"
+        assert item["owning_batch_id"] == prepared_batch.batch_id
+        assert item["article_path"] in (root / "README.md").read_text()
+        assert (root / item["draft_path"]).exists()
+    assert not (reused_root / "articles" / article_id).exists()
+
+    imported_batch.fact_request = json.loads(Path(imported["fact_check_request_path"]).read_text())
+    checked = write_fact_check_result(imported_batch, tmp_path / "reused-fact-check.json", ["FAIL", "PASS"])
+    prepared_batch.workflow.import_fact_checks(reused["batch_id"], checked)
+    owner_state = json.loads((owner_root / "batch-state.json").read_text())
+    assert {item["article_status"] for item in owner_state["items"]} == {"FACT_CHECKED", "NEEDS_REVISION"}
+    revision_path = prepared_batch.workflow.create_revision_request(reused["batch_id"])
+    revision_request = json.loads(revision_path.read_text())
+    revision_result = write_revision_result(revision_request, tmp_path / "reused-revision.json")
+    prepared_batch.workflow.import_revisions(reused["batch_id"], revision_result)
+    revised_id = revision_request["items"][0]["article_id"]
+    for root in (owner_root, reused_root):
+        state = json.loads((root / "batch-state.json").read_text())
+        revised = next(item for item in state["items"] if item["article_id"] == revised_id)
+        assert revised["revision_number"] == 2
+        assert revised["article_status"] == "DRAFTED"
+        assert (root / revised["draft_path"]).exists()
+
+
+def write_revision_result(request: dict, path: Path) -> Path:
+    payload = {
+        "schema_version": 1,
+        "batch_id": request["batch_id"],
+        "request_id": request["request_id"],
+        "output_file": request["output_file"],
+        "items": [{
+            "article_id": item["article_id"],
+            "research_brief_md": item["research_brief_md"],
+            "title_cn": item["title_cn"],
+            "slug": item["slug"],
+            "article_md": item["article_md"],
+        } for item in request["items"]],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("import_stage", ["content", "revision"])
+@pytest.mark.parametrize("failure_step", ["insert", "update"])
+def test_fact_check_request_sql_failure_removes_new_file_and_allows_retry(
+    prepared_batch: SimpleNamespace, tmp_path: Path, failure_step: str, import_stage: str
+):
+    room = prepared_batch.room
+    content = write_content_result(prepared_batch, tmp_path / "content-for-retry.json")
+    import_result = prepared_batch.workflow.import_content
+    result_path = content
+    revision_number = 1
+    if import_stage == "revision":
+        content_imported = import_result(prepared_batch.batch_id, content)
+        prepared_batch.fact_request = json.loads(Path(content_imported["fact_check_request_path"]).read_text())
+        failed = write_fact_check_result(prepared_batch, tmp_path / "failed-for-retry.json", ["FAIL", "PASS"])
+        prepared_batch.workflow.import_fact_checks(prepared_batch.batch_id, failed)
+        request = prepared_batch.workflow.create_revision_request(prepared_batch.batch_id)
+        result_path = write_revision_result(json.loads(request.read_text()), tmp_path / "revision-for-retry.json")
+        import_result = prepared_batch.workflow.import_revisions
+        revision_number = 2
+    if failure_step == "insert":
+        trigger = "BEFORE INSERT ON batch_requests WHEN NEW.request_type='FACT_CHECK'"
+    else:
+        trigger = "BEFORE UPDATE OF fact_check_request_id ON batches"
+    with room.db.connect() as connection:
+        connection.execute(f"CREATE TRIGGER fail_fact_request {trigger} BEGIN SELECT RAISE(ABORT,'fact request SQL failed'); END")
+    tables = ("candidates", "articles", "batches", "batch_items", "batch_requests", "image_candidates", "state_transitions")
+    before = {table: room.db.all(f"SELECT * FROM {table}") for table in tables}
+    root = tmp_path / "workspace/batches" / prepared_batch.batch_id
+    before_files = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+    with pytest.raises(sqlite3.IntegrityError, match="fact request SQL failed"):
+        import_result(prepared_batch.batch_id, result_path)
+
+    assert not (root / f"claude/requests/fact-check-request-v{revision_number}.json").exists()
+    assert {table: room.db.all(f"SELECT * FROM {table}") for table in tables} == before
+    assert {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()} == before_files
+    assert not list(root.glob(".staging-*"))
+    with room.db.connect() as connection:
+        connection.execute("DROP TRIGGER fail_fact_request")
+
+    imported = import_result(prepared_batch.batch_id, result_path)
+
+    assert imported["imported" if import_stage == "content" else "revised"] == (2 if import_stage == "content" else 1)
+    assert (root / f"claude/requests/fact-check-request-v{revision_number}.json").exists()
+
+
+def test_content_import_preserves_preexisting_fact_check_request_file(prepared_batch: SimpleNamespace, tmp_path: Path):
+    room = prepared_batch.room
+    root = tmp_path / "workspace/batches" / prepared_batch.batch_id
+    existing = root / "claude/requests/fact-check-request-v1.json"
+    existing.write_bytes(b"existing immutable request")
+    before = room.db.all("SELECT * FROM articles ORDER BY article_id")
+    content = write_content_result(prepared_batch, tmp_path / "content-existing-request.json")
+
+    with pytest.raises(WorkflowError, match="fact-check request version 1 already exists"):
+        prepared_batch.workflow.import_content(prepared_batch.batch_id, content)
+
+    assert existing.read_bytes() == b"existing immutable request"
+    assert room.db.all("SELECT * FROM articles ORDER BY article_id") == before
 
 
 def test_content_import_rejects_another_batch_inbox_result_without_mutation(
