@@ -12,3 +12,5 @@ output/*/
 !output/.gitkeep
 demo-workspace/
 dist/
+
+workspace/
