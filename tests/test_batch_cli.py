@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
@@ -10,6 +11,45 @@ from newsroom.service import Newsroom
 
 
 runner = CliRunner()
+
+
+def write_candidate_csv(path: Path) -> Path:
+    fields = [
+        "candidate_title",
+        "core_fact",
+        "event_date",
+        "company",
+        "product",
+        "topic",
+        "subtopic",
+        "event_type",
+        "keywords",
+        "primary_source",
+        "secondary_sources",
+        "discovered_from",
+        "priority",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "candidate_title": "Example launches Tool",
+                "core_fact": "Example launched Tool on 2026-10-05.",
+                "event_date": "2026-10-05",
+                "company": "Example",
+                "product": "Tool",
+                "topic": "AI",
+                "subtopic": "Developer Tools",
+                "event_type": "launch",
+                "keywords": "example|tool",
+                "primary_source": "https://example.com/tool",
+                "secondary_sources": "",
+                "discovered_from": "test",
+                "priority": "4",
+            }
+        )
+    return path
 
 
 def batch_image_workspace(tmp_path: Path) -> tuple[Path, str, Path]:
@@ -99,3 +139,63 @@ def test_cli_lists_and_registers_image_candidate(tmp_path: Path):
     stored = Newsroom(root).db.one("SELECT * FROM images WHERE image_id=?", (image_id,))
     assert stored["image_candidate_id"] == candidate_id
     assert stored["rights_basis"] == "OPEN_LICENSE"
+
+
+def test_typer_exposes_batch_commands():
+    for command in (
+        "prepare",
+        "status",
+        "resolve",
+        "content-import",
+        "fact-check-import",
+        "revision-request",
+        "revision-import",
+    ):
+        result = runner.invoke(app, ["batch", command, "--help"])
+        assert result.exit_code == 0, result.output
+
+
+def test_cli_prepare_outputs_one_claude_request(tmp_path: Path):
+    csv_path = write_candidate_csv(tmp_path / "candidates.csv")
+    assert runner.invoke(app, ["--root", str(tmp_path), "init"]).exit_code == 0
+
+    result = runner.invoke(
+        app, ["--root", str(tmp_path), "batch", "prepare", str(csv_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert Path(payload["content_request_path"]).exists()
+    assert payload["claude_instruction"] == (
+        "严格执行文件中的 instructions，完成全部条目，并生成其中指定的 output_file。"
+    )
+
+
+def test_cli_batch_status_missing_batch_is_actionable(tmp_path: Path):
+    assert runner.invoke(app, ["--root", str(tmp_path), "init"]).exit_code == 0
+
+    result = runner.invoke(
+        app, ["--root", str(tmp_path), "batch", "status", "batch-missing"]
+    )
+
+    assert result.exit_code == 2
+    assert "batch not found: batch-missing" in result.output
+
+
+def test_cli_content_import_reports_validation_field(tmp_path: Path):
+    csv_path = write_candidate_csv(tmp_path / "candidates.csv")
+    runner.invoke(app, ["--root", str(tmp_path), "init"])
+    prepared = runner.invoke(
+        app, ["--root", str(tmp_path), "batch", "prepare", str(csv_path)]
+    )
+    batch_id = json.loads(prepared.output)["batch_id"]
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text("{}", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["--root", str(tmp_path), "batch", "content-import", batch_id, str(invalid)],
+    )
+
+    assert result.exit_code == 2
+    assert "batch_id\n  Field required" in result.output

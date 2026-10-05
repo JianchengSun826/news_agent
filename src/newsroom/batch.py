@@ -1065,6 +1065,23 @@ class BatchWorkflow:
             (batch_id,),
         )
         counts = dict(Counter(item["item_status"] for item in items))
+        actions = {
+            "waiting_duplicate_candidate_ids": [
+                item["candidate_id"]
+                for item in items
+                if item["item_status"] == "WAITING_DUPLICATE"
+            ],
+            "needs_revision_article_ids": [
+                item["article_id"]
+                for item in items
+                if item["item_status"] == "NEEDS_REVISION"
+            ],
+            "image_pending_article_ids": [
+                item["article_id"]
+                for item in items
+                if item["item_status"] == "FACT_CHECKED"
+            ],
+        }
         request = None
         if batch["content_request_id"]:
             request = self.room.db.one(
@@ -1077,6 +1094,7 @@ class BatchWorkflow:
             "source_filename": batch["source_filename"],
             "source_sha256": batch["source_sha256"],
             "counts": counts,
+            "action_required": actions,
             "content_request_path": (
                 str(self.room.root / request["request_path"]) if request else None
             ),

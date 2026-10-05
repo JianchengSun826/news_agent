@@ -7,6 +7,7 @@ from typing import Annotated, Callable, TypeVar
 import typer
 from pydantic import ValidationError
 
+from .batch import BatchWorkflow
 from .service import Newsroom, WorkflowError
 
 T = TypeVar("T")
@@ -20,6 +21,7 @@ image_app = typer.Typer(help="Register image rights and provenance", no_args_is_
 published_app = typer.Typer(help="Query published articles", no_args_is_help=True)
 prompt_app = typer.Typer(help="Create manual provider prompts", no_args_is_help=True)
 research_app = typer.Typer(help="Register manual research", no_args_is_help=True)
+batch_app = typer.Typer(help="Process a reviewed CSV with manual Claude batch handoffs", no_args_is_help=True)
 
 app.add_typer(candidate_app, name="candidate")
 app.add_typer(brief_app, name="brief")
@@ -29,6 +31,9 @@ app.add_typer(image_app, name="image")
 app.add_typer(published_app, name="published")
 app.add_typer(prompt_app, name="prompt")
 app.add_typer(research_app, name="research")
+app.add_typer(batch_app, name="batch")
+
+CLAUDE_INSTRUCTION = "严格执行文件中的 instructions，完成全部条目，并生成其中指定的 output_file。"
 
 
 @app.callback()
@@ -53,6 +58,10 @@ def _run(action: Callable[[], T]) -> T:
     except (WorkflowError, ValidationError, ValueError, FileExistsError) as error:
         typer.echo(f"error: {error}", err=True)
         raise typer.Exit(code=2) from error
+
+
+def _with_claude_instruction(payload: dict) -> dict:
+    return {**payload, "claude_instruction": CLAUDE_INSTRUCTION}
 
 
 @app.command("init")
@@ -83,6 +92,83 @@ def candidate_add(
     """Add a manually discovered candidate."""
     result = _run(lambda: _room(ctx).add_candidate(candidate_title=candidate_title, core_fact=core_fact, event_date=event_date, company=company, product=product, topic=topic, subtopic=subtopic, event_type=event_type, keywords=keyword or [company, product], primary_source=primary_source, secondary_sources=secondary_source or [], discovered_from=discovered_from, priority=priority))
     _json(result)
+
+
+@batch_app.command("prepare")
+def batch_prepare(
+    ctx: typer.Context,
+    csv_file: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Validate a reviewed CSV and create one Claude content request."""
+    result = _run(lambda: BatchWorkflow(_room(ctx)).prepare(csv_file))
+    _json(_with_claude_instruction(result))
+
+
+@batch_app.command("status")
+def batch_status(
+    ctx: typer.Context, batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")]
+) -> None:
+    """Show batch state and items requiring human action."""
+    _json(_run(lambda: BatchWorkflow(_room(ctx)).status(batch_id)))
+
+
+@batch_app.command("resolve")
+def batch_resolve(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    candidate_id: Annotated[str, typer.Argument(metavar="CANDIDATE_ID")],
+    decision: Annotated[str, typer.Option()],
+    actor: Annotated[str, typer.Option()],
+    reason: Annotated[str, typer.Option()],
+) -> None:
+    """Include or exclude one candidate awaiting a duplicate decision."""
+    result = _run(
+        lambda: BatchWorkflow(_room(ctx)).resolve(
+            batch_id, candidate_id, decision, actor, reason
+        )
+    )
+    _json(result)
+
+
+@batch_app.command("content-import")
+def batch_content_import(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    result_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Import the complete result from the first Claude conversation."""
+    result = _run(lambda: BatchWorkflow(_room(ctx)).import_content(batch_id, result_json))
+    _json(_with_claude_instruction(result))
+
+
+@batch_app.command("fact-check-import")
+def batch_fact_check_import(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    result_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Import the result from the independent Claude fact-check conversation."""
+    _json(_run(lambda: BatchWorkflow(_room(ctx)).import_fact_checks(batch_id, result_json)))
+
+
+@batch_app.command("revision-request")
+def batch_revision_request(
+    ctx: typer.Context, batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")]
+) -> None:
+    """Create one Claude request for all articles that failed fact-checking."""
+    path = _run(lambda: BatchWorkflow(_room(ctx)).create_revision_request(batch_id))
+    _json(_with_claude_instruction({"batch_id": batch_id, "revision_request_path": str(path)}))
+
+
+@batch_app.command("revision-import")
+def batch_revision_import(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    result_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Import all revisions and create the next independent fact-check request."""
+    result = _run(lambda: BatchWorkflow(_room(ctx)).import_revisions(batch_id, result_json))
+    _json(_with_claude_instruction(result))
 
 
 @candidate_app.command("list")
