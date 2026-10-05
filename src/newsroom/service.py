@@ -10,6 +10,7 @@ from typing import Any
 
 from .db import Database
 from .dedup import classify_candidate
+from .batch_models import candidate_fingerprint
 from .models import CandidateInput, ImageInput, make_event_id, new_id, require_url, utc_now
 
 
@@ -56,16 +57,26 @@ class Newsroom:
 
     def add_candidate(self, **values: Any) -> dict[str, Any]:
         values = CandidateInput.model_validate(values).model_dump(mode="json")
+        fingerprint = candidate_fingerprint(values)
         now, candidate_id = utc_now(), new_id("cand")
         with self.db.connect() as connection:
             connection.execute(
-                """INSERT INTO candidates(candidate_id,status,discovered_at,event_date,candidate_title,core_fact,company,product,topic,subtopic,event_type,keywords,primary_source,secondary_sources,discovered_from,priority,notes,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (candidate_id, "CANDIDATE", now, values["event_date"], values["candidate_title"], values["core_fact"], values["company"], values["product"], values["topic"], values["subtopic"], values["event_type"], json.dumps(values["keywords"], ensure_ascii=False), values["primary_source"], json.dumps(values["secondary_sources"], ensure_ascii=False), values["discovered_from"], values["priority"], values.get("notes", ""), now, now),
+                """INSERT INTO candidates(candidate_id,status,discovered_at,event_date,candidate_title,core_fact,company,product,topic,subtopic,event_type,keywords,primary_source,secondary_sources,discovered_from,priority,candidate_fingerprint,notes,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (candidate_id, "CANDIDATE", now, values["event_date"], values["candidate_title"], values["core_fact"], values["company"], values["product"], values["topic"], values["subtopic"], values["event_type"], json.dumps(values["keywords"], ensure_ascii=False), values["primary_source"], json.dumps(values["secondary_sources"], ensure_ascii=False), values["discovered_from"], values["priority"], fingerprint, values.get("notes", ""), now, now),
             )
             self._transition(connection, "candidate", candidate_id, None, "DISCOVERED", "system", "candidate discovered")
             self._transition(connection, "candidate", candidate_id, "DISCOVERED", "CANDIDATE", "system", "candidate recorded")
         return self.get_candidate(candidate_id)
+
+    def find_candidate_by_fingerprint(self, fingerprint: str) -> dict[str, Any] | None:
+        rows = self.db.all(
+            "SELECT candidate_id FROM candidates WHERE candidate_fingerprint=? ORDER BY candidate_id",
+            (fingerprint,),
+        )
+        if len(rows) > 1:
+            raise WorkflowError(f"candidate fingerprint is not unique: {fingerprint}")
+        return self.get_candidate(rows[0]["candidate_id"]) if rows else None
 
     def get_candidate(self, candidate_id: str) -> dict[str, Any]:
         row = self.db.one("SELECT * FROM candidates WHERE candidate_id=?", (candidate_id,))
