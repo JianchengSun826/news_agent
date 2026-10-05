@@ -224,3 +224,19 @@ class BatchImagePlan(StrictModel):
     def unique_items(self) -> Self:
         _reject_duplicate_article_ids(self.items)
         return self
+
+
+class PublicationResultItem(StrictModel):
+    article_id: str = Field(pattern=r"^art-[a-z0-9]+$")
+    article_url: HttpUrl
+
+
+class BatchPublicationResult(StrictModel):
+    schema_version: Literal[1] = SCHEMA_VERSION
+    batch_id: str = Field(pattern=r"^batch-[a-z0-9]+$")
+    items: list[PublicationResultItem]
+
+    @model_validator(mode="after")
+    def unique_items(self) -> Self:
+        _reject_duplicate_article_ids(self.items)
+        return self

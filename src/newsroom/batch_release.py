@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import re
@@ -11,7 +12,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .batch_models import BatchImagePlan
+from .batch_models import BatchImagePlan, BatchPublicationResult
 from .models import new_id, utc_now
 from .service import Newsroom, WorkflowError
 from .workspace import BatchWorkspace, _atomic_write
@@ -48,6 +49,138 @@ class BatchReleaseWorkflow:
         plan = self._read_image_plan(self.workspace.image_draft_path(batch_id))
         self._validate_membership(batch_id, plan, articles, complete=False)
         return plan
+
+    def review(self, batch_id: str, actor: str, reason: str) -> dict[str, Any]:
+        return self._advance_batch_articles(batch_id, "IMAGE_READY", "REVIEWED", actor, reason, "reviewed")
+
+    def approve(self, batch_id: str, actor: str, reason: str) -> dict[str, Any]:
+        return self._advance_batch_articles(batch_id, "REVIEWED", "APPROVED", actor, reason, "approved")
+
+    def _advance_batch_articles(self, batch_id: str, required: str, new: str, actor: str, reason: str, count_key: str) -> dict[str, Any]:
+        articles = self._active_articles(batch_id)
+        self._require_article_status(articles, required)
+        self._require_actor_reason(actor, reason)
+        with self.room.db.connect() as connection:
+            now = utc_now()
+            for article in articles:
+                connection.execute("UPDATE articles SET status=?,updated_at=? WHERE article_id=?", (new, now, article["article_id"]))
+                self.room._transition(connection, "article", article["article_id"], required, new, actor, reason)
+            connection.execute("UPDATE batches SET status=?,updated_at=? WHERE batch_id=?", (new, now, batch_id))
+        self._refresh_workspaces(batch_id, articles)
+        return {"batch_id": batch_id, count_key: len(articles)}
+
+    def build_packages(self, batch_id: str) -> Path:
+        """Stage and validate the whole batch; compensate filesystem on DB failure."""
+        articles = self._active_articles(batch_id)
+        self._require_article_status(articles, "APPROVED")
+        # Read deserialized canonical metadata, including list-valued sources.
+        articles = [self.room.get_article(article["article_id"]) for article in articles]
+        materials = [(article, *self.room._publication_materials(article)) for article in articles]
+        root = self.workspace.batch_root(batch_id)
+        publish = root / "publish"
+        if not root.resolve().is_relative_to(self.room.root) or publish.is_symlink():
+            raise WorkflowError("publish directory must remain within the newsroom and cannot be a symlink")
+        if publish.exists() and not publish.is_dir():
+            raise WorkflowError("publish path must be a directory")
+        staging: Path | None = None
+        previous: Path | None = None
+        previous_holder: Path | None = None
+        committed = False
+        try:
+            staging = Path(tempfile.mkdtemp(prefix=".staging-publish-", dir=root))
+            manifest_items = []
+            for article, image, sources in materials:
+                package = staging / article["article_id"]
+                package.mkdir()
+                self.room._write_publication_package(article, image, sources, package)
+                self._validate_staged_package(package, article, image, sources)
+                manifest_items.append({"article_id": article["article_id"], "revision_number": article["revision_number"], "package_path": article["article_id"]})
+            manifest = {"schema_version": 1, "batch_id": batch_id, "items": manifest_items}
+            manifest_path = staging / "batch-manifest.json"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:
+                raise WorkflowError("staged batch manifest is incomplete")
+            if publish.exists():
+                previous_holder = Path(tempfile.mkdtemp(prefix=".previous-publish-", dir=root))
+                previous = previous_holder / "publish"
+                # os.replace cannot replace a nonempty directory; first move the
+                # previous complete tree aside on the same filesystem.
+                os.replace(publish, previous)
+            os.replace(staging, publish)
+            with self.room.db.connect() as connection:
+                connection.execute("UPDATE batches SET status='PACKAGED',updated_at=? WHERE batch_id=?", (utc_now(), batch_id))
+            committed = True
+        except BaseException:
+            if not committed:
+                # Inspect the tree rather than a flag set after os.replace:
+                # a BaseException can arrive immediately after the rename.
+                if staging is not None and not staging.exists() and publish.exists():
+                    shutil.rmtree(publish)
+                if previous is not None and previous.exists():
+                    os.replace(previous, publish)
+            raise
+        finally:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging)
+            if previous_holder is not None and previous_holder.exists() and (committed or previous is None or not previous.exists()):
+                shutil.rmtree(previous_holder)
+        self._refresh_workspaces(batch_id, articles)
+        return publish
+
+    @staticmethod
+    def _validate_staged_package(package: Path, article: dict[str, Any], image: dict[str, Any], sources: dict[str, Path]) -> None:
+        for output, source in sources.items():
+            filename = "hero" + source.suffix.lower() if output == "hero" else output
+            path = package / filename
+            if not path.is_file() or path.read_bytes() != source.read_bytes():
+                raise WorkflowError(f"staged publication file is incomplete: {filename}")
+        for filename, metadata in (("metadata.json", article), ("image-license.json", image)):
+            path = package / filename
+            if not path.is_file() or json.loads(path.read_text(encoding="utf-8")) != metadata:
+                raise WorkflowError(f"staged publication metadata is incomplete: {filename}")
+        for filename in ("sources.md", "publication-checklist.md"):
+            path = package / filename
+            if not path.is_file() or not path.read_text(encoding="utf-8").strip():
+                raise WorkflowError(f"staged publication file is incomplete: {filename}")
+
+    def register_publications(self, batch_id: str, result_path: Path, actor: str) -> dict[str, Any]:
+        articles = self._active_articles(batch_id)
+        self._require_article_status(articles, "APPROVED")
+        reason = "human confirmed external publication"
+        self._require_actor_reason(actor, reason)
+        try:
+            result = BatchPublicationResult.model_validate_json(Path(result_path).read_bytes())
+        except (OSError, ValidationError) as error:
+            raise WorkflowError(f"invalid publication result: {error}") from error
+        self._validate_membership(batch_id, result, articles, complete=True)
+        with self.room.db.connect() as connection:
+            now = utc_now()
+            for item in result.items:
+                connection.execute(
+                    "UPDATE articles SET article_url=?,status='PUBLISHED',published_at=?,publish_date=?,updated_at=? WHERE article_id=?",
+                    (str(item.article_url), now, now[:10], now, item.article_id),
+                )
+                self.room._transition(connection, "article", item.article_id, "APPROVED", "PUBLISHED", actor, reason)
+            connection.execute("UPDATE batches SET status='PUBLISHED',updated_at=? WHERE batch_id=?", (now, batch_id))
+        self._refresh_workspaces(batch_id, articles)
+        return {"batch_id": batch_id, "published": len(result.items)}
+
+    @staticmethod
+    def _require_article_status(articles: list[dict[str, Any]], required: str) -> None:
+        if not articles or any(article["status"] != required for article in articles):
+            raise WorkflowError(f"batch action requires every active article to be {required}")
+
+    @staticmethod
+    def _require_actor_reason(actor: str, reason: str) -> None:
+        if not actor.strip():
+            raise WorkflowError("transition actor is required")
+        if not reason.strip():
+            raise WorkflowError("transition reason is required")
+
+    def _refresh_workspaces(self, batch_id: str, articles: list[dict[str, Any]]) -> None:
+        affected = {batch_id, *(article["owning_batch_id"] for article in articles if article["owning_batch_id"])}
+        for affected_batch_id in sorted(affected):
+            self.workspace.refresh(affected_batch_id)
 
     def apply_image_plan(self, batch_id: str, plan_path: Path) -> dict[str, Any]:
         """Validate and promote all local files before one SQLite transaction."""
@@ -134,9 +267,9 @@ class BatchReleaseWorkflow:
             raise WorkflowError(f"invalid image plan: {error}") from error
 
     @staticmethod
-    def _validate_membership(batch_id: str, plan: BatchImagePlan, articles: list[dict[str, Any]], *, complete: bool) -> None:
+    def _validate_membership(batch_id: str, plan: BatchImagePlan | BatchPublicationResult, articles: list[dict[str, Any]], *, complete: bool) -> None:
         if plan.batch_id != batch_id:
-            raise WorkflowError("image plan batch_id does not match batch")
+            raise WorkflowError("result batch_id does not match batch")
         expected = {article["article_id"] for article in articles}
         actual = {item.article_id for item in plan.items}
         if actual - expected:

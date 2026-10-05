@@ -144,6 +144,10 @@ CLI 不下载图片，也不替编辑判断版权。候选属于另一篇文章�
 
 ## 8. 审核、批准、发布包和发布登记
 
+整批发布闸门以 SQLite 中的有效条目为准：`EXCLUDED` 与 `REUSED_COMPLETE` 不阻塞操作、不改变文章状态，也不接收当前批次的发布包或要求发布 URL。整批审核要求全部有效文章为 `IMAGE_READY`；整批批准要求全部为 `REVIEWED`。先验证整批，再在一个事务内记录相同审核人及理由的文章状态转换。
+
+整批发布包要求全部有效文章为 `APPROVED`。系统先暂存并验证各篇当前版本的文章、研究简报、事实核验、图片、metadata、许可、来源及 checklist，以及 `batch-manifest.json`，再替换 `workspace/batches/BATCH_ID/publish/`。失败或中断会保留之前的发布目录并回滚数据库；成功后批次为 `PACKAGED`，文章仍为 `APPROVED`。人工上传后，以包含 `schema_version: 1`、正确 `batch_id` 和 `items`（每项为 `article_id`、HTTP(S) `article_url`）的 JSON 登记整批发布结果；文章集合必须恰好对应全部有效文章，缺失、额外或重复项均整批拒绝。成功登记在一个事务内更新文章 URL、时间、审计及 `PUBLISHED` 状态。
+
 ```bash
 uv run newsroom review ARTICLE_ID \
   --actor editor --reason "已检查文章、核验报告、图片与权利页面"

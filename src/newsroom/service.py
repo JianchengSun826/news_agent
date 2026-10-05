@@ -366,27 +366,50 @@ class Newsroom:
 
     def create_publication_package(self, article_id: str) -> Path:
         article = self.get_article(article_id)
+        image, sources = self._publication_materials(article)
+        target = self.root / "output" / article_id
+        target.mkdir(parents=True, exist_ok=False)
+        self._write_publication_package(article, image, sources, target)
+        return target
+
+    def _publication_materials(self, article: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Path]]:
+        """Validate the current canonical artifacts without creating output files."""
         if article["status"] != "APPROVED":
             raise WorkflowError("publication package requires APPROVED")
         image = self.db.one("SELECT * FROM images WHERE image_id=?", (article["image_id"],))
         if not image or not image["image_path"]:
             raise WorkflowError("publication package requires a registered image file")
-        image_source = self.root / image["image_path"]
-        if not image_source.is_file():
-            raise WorkflowError(f"registered image file not found: {image_source}")
-        target = self.root / "output" / article_id
-        target.mkdir(parents=True, exist_ok=False)
-        shutil.copyfile(self.root / article["draft_path"], target / "article.md")
-        shutil.copyfile(self.root / article["research_brief_path"], target / "research-brief.md")
-        shutil.copyfile(self.root / article["fact_check_path"], target / "fact-check.md")
-        shutil.copyfile(image_source, target / image_source.name)
+        if image["article_id"] != article["article_id"]:
+            raise WorkflowError("registered image belongs to a different article")
+        paths: dict[str, Path] = {}
+        for output, stored, label in (
+            ("article.md", article["draft_path"], "article"),
+            ("research-brief.md", article["research_brief_path"], "research brief"),
+            ("fact-check.md", article["fact_check_path"], "fact-check"),
+            ("hero", image["image_path"], "registered image"),
+        ):
+            relative = Path(stored) if stored else None
+            if relative is not None and (relative.is_absolute() or ".." in relative.parts):
+                raise WorkflowError(f"{label} path must be repository-relative and within the newsroom")
+            source = self.root / relative if relative is not None else None
+            if source is not None and not source.resolve().is_relative_to(self.root):
+                raise WorkflowError(f"{label} file must remain within the newsroom workspace")
+            if source is None or not source.is_file():
+                raise WorkflowError(f"{label} file not found: {source}")
+            paths[output] = source
+        return image, paths
+
+    def _write_publication_package(self, article: dict[str, Any], image: dict[str, Any], sources: dict[str, Path], target: Path) -> None:
+        """Write already validated materials into a caller-owned directory."""
+        for output, source in sources.items():
+            filename = "hero" + source.suffix.lower() if output == "hero" else output
+            shutil.copyfile(source, target / filename)
         (target / "metadata.json").write_text(json.dumps(article, ensure_ascii=False, indent=2), encoding="utf-8")
         (target / "image-license.json").write_text(json.dumps(image, ensure_ascii=False, indent=2), encoding="utf-8")
         (target / "sources.md").write_text("# Sources\n\n## Primary\n\n- " + article["primary_source"] + "\n\n## Secondary\n\n" + "\n".join(f"- {url}" for url in article["secondary_sources"]) + "\n", encoding="utf-8")
         (target / "image-brief.md").write_text("# Image Brief\n\nSee the registered prompt and image-license.json provenance.\n", encoding="utf-8")
         checks = ["title reviewed","event date checked","primary source present","independent source checked","numbers verified","company claims attributed","duplicate check passed","image rights recorded","final human review","approved for publication"]
         (target / "publication-checklist.md").write_text("# Publication Checklist\n\n" + "\n".join(f"- [x] {item}" for item in checks) + "\n", encoding="utf-8")
-        return target
 
     def publish(self, article_id: str, actor: str, article_url: str | None = None) -> None:
         if article_url:

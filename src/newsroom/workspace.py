@@ -194,6 +194,9 @@ class BatchWorkspace:
             item["image_state"] = "REGISTERED" if item["image_id"] else ("PROPOSED" if any(image["article_id"] == article_id for image in images) else "MISSING")
             item["approval_state"] = item["article_status"] if item["article_status"] in {"REVIEWED", "APPROVED", "PUBLISHED"} else "PENDING"
             package = BatchWorkspacePaths(self.batch_root(owner)).publish / article_id if owner and article_id else None
+            current_package = BatchWorkspacePaths(root).publish / article_id if article_id else None
+            if item["item_status"] not in {"EXCLUDED", "REUSED_COMPLETE"} and current_package and current_package.is_dir():
+                package = current_package
             item["package_path"] = Path(os.path.relpath(package, root)).as_posix() if package and package.is_dir() else None
             if article_id and owner == batch_id:
                 _atomic_write(self.article_root(owner, article_id) / "image-candidates.json", json.dumps(

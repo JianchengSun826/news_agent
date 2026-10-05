@@ -303,3 +303,351 @@ def test_image_plan_refreshes_current_and_owner_batch(prepared_batch, tmp_path):
         state = json.loads((root / "batch-state.json").read_text())
         assert all(item["image_state"] == "REGISTERED" for item in state["items"])
     assert not list((tmp_path / "workspace/batches" / reused["batch_id"] / "articles").rglob("hero.*"))
+
+
+@pytest.fixture
+def ready_batch(all_pass_batch, tmp_path):
+    workflow = BatchReleaseWorkflow(all_pass_batch.room)
+    workflow.apply_image_plan(all_pass_batch.batch_id, write_plan(tmp_path / "plan.json", image_plan(all_pass_batch, tmp_path)))
+    return all_pass_batch
+
+
+@pytest.fixture
+def approved_batch(ready_batch):
+    # Use the existing single-article gates so new package/publication tests
+    # fail on the feature under test rather than on fixture construction.
+    for article_id in ready_batch.article_ids:
+        ready_batch.room.complete_review(article_id, "editor", "checked")
+        ready_batch.room.approve(article_id, "editor", "approved")
+    return ready_batch
+
+
+@pytest.mark.parametrize("gate,required", [("review", "IMAGE_READY"), ("approve", "REVIEWED")])
+def test_batch_gate_validates_all_articles_before_transition(ready_batch, gate, required):
+    if gate == "approve":
+        ready_batch.room.complete_review(ready_batch.article_ids[0], "editor", "checked")
+    else:
+        with ready_batch.room.db.connect() as connection:
+            connection.execute("UPDATE articles SET status='FACT_CHECKED' WHERE article_id=?", (ready_batch.article_ids[1],))
+    before = snapshot(ready_batch)
+    with pytest.raises(WorkflowError, match=required):
+        getattr(BatchReleaseWorkflow(ready_batch.room), gate)(ready_batch.batch_id, "editor", "whole batch")
+    assert snapshot(ready_batch) == before
+
+
+@pytest.mark.parametrize("inactive", ["EXCLUDED", "REUSED_COMPLETE"])
+def test_review_and_approval_ignore_inactive_and_audit_all_active(ready_batch, tmp_path, inactive):
+    ignored = ready_batch.article_ids[1]
+    with ready_batch.room.db.connect() as connection:
+        connection.execute("UPDATE batch_items SET item_status=? WHERE article_id=?", (inactive, ignored))
+        connection.execute("UPDATE articles SET status='NEEDS_REVISION' WHERE article_id=?", (ignored,))
+    ignored_before = ready_batch.room.get_article(ignored)
+    ignored_audit = ready_batch.room.audit(ignored)
+    workflow = BatchReleaseWorkflow(ready_batch.room)
+    assert workflow.review(ready_batch.batch_id, "batch-editor", "checked all material")["reviewed"] == 1
+    assert workflow.approve(ready_batch.batch_id, "batch-editor", "approved batch")["approved"] == 1
+    active = ready_batch.article_ids[0]
+    assert ready_batch.room.get_article(active)["status"] == "APPROVED"
+    assert [(audit["actor"], audit["reason"], audit["to_status"]) for audit in ready_batch.room.audit(active)[-2:]] == [
+        ("batch-editor", "checked all material", "REVIEWED"),
+        ("batch-editor", "approved batch", "APPROVED"),
+    ]
+    assert ready_batch.room.get_article(ignored) == ignored_before
+    assert ready_batch.room.audit(ignored) == ignored_audit
+    state = json.loads((tmp_path / "workspace/batches" / ready_batch.batch_id / "batch-state.json").read_text())
+    assert state["next_action"] == "build-packages"
+
+
+@pytest.mark.parametrize("gate", ["review", "approve"])
+def test_batch_gate_database_failure_rolls_back_every_article(ready_batch, gate):
+    if gate == "approve":
+        for article_id in ready_batch.article_ids:
+            ready_batch.room.complete_review(article_id, "editor", "checked")
+    with ready_batch.room.db.connect() as connection:
+        connection.execute("CREATE TRIGGER reject_release BEFORE UPDATE ON articles "
+                           "WHEN NEW.article_id='" + ready_batch.article_ids[1] + "' "
+                           "BEGIN SELECT RAISE(ABORT,'release rejected'); END")
+    before = snapshot(ready_batch)
+    with pytest.raises(sqlite3.IntegrityError, match="release rejected"):
+        getattr(BatchReleaseWorkflow(ready_batch.room), gate)(ready_batch.batch_id, "editor", "checked batch")
+    assert snapshot(ready_batch) == before
+
+
+def test_review_and_approval_transition_every_active_article(ready_batch):
+    workflow = BatchReleaseWorkflow(ready_batch.room)
+    assert workflow.review(ready_batch.batch_id, "editor", "checked all material")["reviewed"] == 2
+    assert workflow.approve(ready_batch.batch_id, "editor", "approved batch")["approved"] == 2
+    assert all(ready_batch.room.get_article(article_id)["status"] == "APPROVED" for article_id in ready_batch.article_ids)
+
+
+def publish_root(batch):
+    return batch.room.root / "workspace/batches" / batch.batch_id / "publish"
+
+
+def test_package_failure_preserves_previous_publish_directory(approved_batch):
+    publish = publish_root(approved_batch)
+    (publish / "sentinel.txt").write_text("old", encoding="utf-8")
+    (approved_batch.room.root / approved_batch.room.get_article(approved_batch.article_ids[1])["draft_path"]).unlink()
+    before = snapshot(approved_batch)
+    with pytest.raises(WorkflowError, match="article file not found"):
+        BatchReleaseWorkflow(approved_batch.room).build_packages(approved_batch.batch_id)
+    assert (publish / "sentinel.txt").read_text() == "old"
+    assert snapshot(approved_batch) == before
+    assert not list(publish.parent.glob(".staging-publish-*"))
+
+
+@pytest.mark.parametrize("inactive", ["EXCLUDED", "REUSED_COMPLETE"])
+def test_packages_contain_current_material_for_exact_active_set(approved_batch, inactive):
+    ignored = approved_batch.article_ids[1]
+    with approved_batch.room.db.connect() as connection:
+        connection.execute("UPDATE batch_items SET item_status=? WHERE article_id=?", (inactive, ignored))
+        connection.execute("UPDATE articles SET status='NEEDS_REVISION' WHERE article_id=?", (ignored,))
+    ignored_before = approved_batch.room.get_article(ignored)
+    ignored_audit = approved_batch.room.audit(ignored)
+    workflow = BatchReleaseWorkflow(approved_batch.room)
+    target = workflow.build_packages(approved_batch.batch_id)
+    assert target == publish_root(approved_batch)
+    assert {path.name for path in target.iterdir()} == {approved_batch.article_ids[0], "batch-manifest.json"}
+    manifest = json.loads((target / "batch-manifest.json").read_text())
+    assert manifest["batch_id"] == approved_batch.batch_id
+    assert [item["article_id"] for item in manifest["items"]] == [approved_batch.article_ids[0]]
+    article = approved_batch.room.get_article(approved_batch.article_ids[0])
+    package = target / article["article_id"]
+    assert {"article.md", "research-brief.md", "fact-check.md", "hero.jpg", "metadata.json", "image-license.json", "sources.md", "publication-checklist.md"} <= {path.name for path in package.iterdir()}
+    for output, field in [("article.md", "draft_path"), ("research-brief.md", "research_brief_path"), ("fact-check.md", "fact_check_path")]:
+        assert (package / output).read_bytes() == (approved_batch.room.root / article[field]).read_bytes()
+    assert json.loads((package / "metadata.json").read_text())["revision_number"] == article["revision_number"]
+    assert json.loads((package / "image-license.json").read_text())["image_id"] == article["image_id"]
+    assert "[x] approved for publication" in (package / "publication-checklist.md").read_text()
+    assert article["status"] == "APPROVED"
+    assert approved_batch.room.db.one("SELECT status FROM batches WHERE batch_id=?", (approved_batch.batch_id,))["status"] == "PACKAGED"
+    state = json.loads((target.parent / "batch-state.json").read_text())
+    assert state["next_action"] == "open-review"
+    assert next(item for item in state["items"] if item["article_id"] == article["article_id"])["package_path"] == f"publish/{article['article_id']}"
+    assert approved_batch.room.get_article(ignored) == ignored_before
+    assert approved_batch.room.audit(ignored) == ignored_audit
+    # Rebuilding replaces the full managed directory, without duplicate artifacts.
+    workflow.build_packages(approved_batch.batch_id)
+    assert {path.name for path in target.iterdir()} == {article["article_id"], "batch-manifest.json"}
+
+
+@pytest.mark.parametrize("stage", ["copy", "promotion", "database"])
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt, SystemExit])
+def test_package_failure_or_interruption_restores_prior_directory(approved_batch, monkeypatch, stage, error_type):
+    import newsroom.batch_release as release
+
+    publish = publish_root(approved_batch)
+    (publish / "sentinel.txt").write_text("old", encoding="utf-8")
+    before = snapshot(approved_batch)
+    error = error_type("package interrupted")
+    if stage == "database" and error_type is OSError:
+        with approved_batch.room.db.connect() as connection:
+            connection.execute("CREATE TRIGGER reject_package BEFORE UPDATE ON batches "
+                               "BEGIN SELECT RAISE(ABORT,'package interrupted'); END")
+        expected = sqlite3.IntegrityError
+    else:
+        expected = error_type
+        if stage == "copy":
+            import newsroom.service as service
+            original = service.shutil.copyfile
+            count = 0
+            def fail_second_copy(*args, **kwargs):
+                nonlocal count
+                count += 1
+                if count == 2:
+                    raise error
+                return original(*args, **kwargs)
+            monkeypatch.setattr(service.shutil, "copyfile", fail_second_copy)
+        elif stage == "promotion":
+            original = release.os.replace
+            def fail_promotion(source, destination):
+                if Path(destination) == publish and Path(source).name.startswith(".staging-publish-"):
+                    raise error
+                return original(source, destination)
+            monkeypatch.setattr(release.os, "replace", fail_promotion)
+        else:
+            original = approved_batch.room.db.connect
+            def fail_after_promotion():
+                if (publish / "batch-manifest.json").is_file():
+                    raise error
+                return original()
+            monkeypatch.setattr(approved_batch.room.db, "connect", fail_after_promotion)
+    with pytest.raises(expected, match="package interrupted"):
+        BatchReleaseWorkflow(approved_batch.room).build_packages(approved_batch.batch_id)
+    assert {path.name for path in publish.iterdir()} == {"sentinel.txt"}
+    assert (publish / "sentinel.txt").read_text() == "old"
+    assert snapshot(approved_batch) == before
+    assert not list(publish.parent.glob(".staging-publish-*"))
+    assert not list(publish.parent.glob(".previous-publish-*"))
+
+
+@pytest.mark.parametrize("escape", ["publish", "article"])
+def test_packages_never_touch_external_symlink_targets(approved_batch, tmp_path, escape):
+    external = tmp_path.parent / (tmp_path.name + "-external")
+    external.mkdir()
+    sentinel = external / "sentinel.md"
+    sentinel.write_text("external", encoding="utf-8")
+    if escape == "publish":
+        publish_root(approved_batch).rmdir()
+        publish_root(approved_batch).symlink_to(external, target_is_directory=True)
+    else:
+        article = approved_batch.room.get_article(approved_batch.article_ids[0])
+        source = approved_batch.room.root / article["draft_path"]
+        source.unlink()
+        source.symlink_to(sentinel)
+    before = snapshot(approved_batch)
+    with pytest.raises(WorkflowError, match="within|symlink"):
+        BatchReleaseWorkflow(approved_batch.room).build_packages(approved_batch.batch_id)
+    assert sentinel.read_text() == "external"
+    assert {path.name for path in external.iterdir()} == {"sentinel.md"}
+    assert snapshot(approved_batch) == before
+
+
+def publication_payload(batch):
+    return {"schema_version": 1, "batch_id": batch.batch_id, "items": [
+        {"article_id": article_id, "article_url": f"https://news.example/articles/{article_id}"}
+        for article_id in batch.article_ids
+    ]}
+
+
+@pytest.mark.parametrize("mutation,message", [
+    ("missing", "missing article"), ("extra", "unexpected article"),
+    ("duplicate", "duplicate article"), ("wrong_batch", "batch_id"),
+    ("invalid_url", "article_url"), ("unknown_field", "Extra inputs"),
+    ("unknown_item_field", "Extra inputs"), ("wrong_state", "APPROVED"),
+])
+def test_publication_result_rejects_entire_invalid_mapping(approved_batch, tmp_path, mutation, message):
+    payload = publication_payload(approved_batch)
+    if mutation == "missing":
+        payload["items"].pop()
+    elif mutation == "extra":
+        payload["items"].append({"article_id": "art-extra", "article_url": "https://news.example/extra"})
+    elif mutation == "duplicate":
+        payload["items"].append(payload["items"][0])
+    elif mutation == "wrong_batch":
+        payload["batch_id"] = "batch-other"
+    elif mutation == "invalid_url":
+        payload["items"][1]["article_url"] = "file:///tmp/article"
+    elif mutation == "unknown_field":
+        payload["approved"] = True
+    elif mutation == "unknown_item_field":
+        payload["items"][0]["approved"] = True
+    else:
+        with approved_batch.room.db.connect() as connection:
+            connection.execute("UPDATE articles SET status='REVIEWED' WHERE article_id=?", (approved_batch.article_ids[1],))
+    before = snapshot(approved_batch)
+    with pytest.raises(WorkflowError, match=message):
+        BatchReleaseWorkflow(approved_batch.room).register_publications(approved_batch.batch_id, write_plan(tmp_path / "publication.json", payload), "publisher")
+    assert snapshot(approved_batch) == before
+
+
+@pytest.mark.parametrize("inactive", ["EXCLUDED", "REUSED_COMPLETE", None])
+def test_publication_records_all_active_urls_status_timestamps_and_audits(approved_batch, tmp_path, inactive):
+    payload = publication_payload(approved_batch)
+    ignored_before = None
+    if inactive:
+        ignored = approved_batch.article_ids[1]
+        payload["items"].pop()
+        with approved_batch.room.db.connect() as connection:
+            connection.execute("UPDATE batch_items SET item_status=? WHERE article_id=?", (inactive, ignored))
+        ignored_before = approved_batch.room.get_article(ignored)
+    result = BatchReleaseWorkflow(approved_batch.room).register_publications(approved_batch.batch_id, write_plan(tmp_path / "publication.json", payload), "publisher")
+    assert result["published"] == len(payload["items"])
+    assert result["batch_id"] == approved_batch.batch_id
+    assert approved_batch.room.db.one("SELECT status FROM batches WHERE batch_id=?", (approved_batch.batch_id,))["status"] == "PUBLISHED"
+    for item in payload["items"]:
+        article = approved_batch.room.get_article(item["article_id"])
+        assert article["status"] == "PUBLISHED"
+        assert article["article_url"] == item["article_url"]
+        assert article["published_at"]
+        assert article["updated_at"] == article["published_at"]
+        assert article["publish_date"] == article["published_at"][:10]
+        audit = approved_batch.room.audit(item["article_id"])[-1]
+        assert (audit["actor"], audit["from_status"], audit["to_status"]) == ("publisher", "APPROVED", "PUBLISHED")
+    if inactive:
+        assert approved_batch.room.get_article(ignored) == ignored_before
+    state = json.loads((publish_root(approved_batch).parent / "batch-state.json").read_text())
+    assert all(item["approval_state"] == "PUBLISHED" for item in state["items"] if item["item_status"] not in {"EXCLUDED", "REUSED_COMPLETE"})
+
+
+def test_publication_database_failure_rolls_back_urls_statuses_and_audits(approved_batch, tmp_path):
+    with approved_batch.room.db.connect() as connection:
+        connection.execute("CREATE TRIGGER reject_publication BEFORE UPDATE ON articles "
+                           "WHEN NEW.article_id='" + approved_batch.article_ids[1] + "' "
+                           "BEGIN SELECT RAISE(ABORT,'publication rejected'); END")
+    before = snapshot(approved_batch)
+    with pytest.raises(sqlite3.IntegrityError, match="publication rejected"):
+        BatchReleaseWorkflow(approved_batch.room).register_publications(approved_batch.batch_id, write_plan(tmp_path / "publication.json", publication_payload(approved_batch)), "publisher")
+    assert snapshot(approved_batch) == before
+
+
+def test_active_cross_owner_packages_link_to_current_batch_and_refresh_owner(prepared_batch, tmp_path):
+    batch = prepared_batch
+    reused = batch.workflow.prepare(write_batch_csv(tmp_path / "reuse.csv", duplicate_rows()[::2], line_ending="\r\n"))
+    imported = batch.workflow.import_content(batch.batch_id, write_content_result(batch, tmp_path / "content-result.json"))
+    batch.fact_request = json.loads(Path(imported["fact_check_request_path"]).read_text())
+    batch.workflow.import_fact_checks(batch.batch_id, write_fact_check_result(batch, tmp_path / "checks.json", ["PASS", "PASS"]))
+    workflow = BatchReleaseWorkflow(batch.room)
+    payload = image_plan(batch, tmp_path)
+    payload["batch_id"] = reused["batch_id"]
+    workflow.apply_image_plan(reused["batch_id"], write_plan(tmp_path / "images.json", payload))
+    workflow.review(reused["batch_id"], "editor", "checked whole batch")
+    workflow.approve(reused["batch_id"], "editor", "approved whole batch")
+    workflow.build_packages(reused["batch_id"])
+    current_root = tmp_path / "workspace/batches" / reused["batch_id"]
+    state = json.loads((current_root / "batch-state.json").read_text())
+    assert state["status"] == "PACKAGED"
+    for item in state["items"]:
+        assert item["package_path"] == f"publish/{item['article_id']}"
+        assert (current_root / item["package_path"] / "article.md").is_file()
+        assert item["owning_batch_id"] == batch.batch_id
+    owner_state = json.loads((tmp_path / "workspace/batches" / batch.batch_id / "batch-state.json").read_text())
+    assert all(item["approval_state"] == "APPROVED" for item in owner_state["items"])
+    payload = publication_payload(batch)
+    payload["batch_id"] = reused["batch_id"]
+    workflow.register_publications(reused["batch_id"], write_plan(tmp_path / "publications.json", payload), "publisher")
+    owner_state = json.loads((tmp_path / "workspace/batches" / batch.batch_id / "batch-state.json").read_text())
+    assert all(item["approval_state"] == "PUBLISHED" for item in owner_state["items"])
+
+
+def test_reused_complete_package_link_only_falls_back_to_owner(approved_batch, tmp_path):
+    workflow = BatchReleaseWorkflow(approved_batch.room)
+    workflow.build_packages(approved_batch.batch_id)
+    reused = approved_batch.workflow.prepare(write_batch_csv(tmp_path / "reuse.csv", duplicate_rows()[::2], line_ending="\r\n"))
+    current_id = reused["batch_id"]
+    active, inactive = approved_batch.article_ids
+    with approved_batch.room.db.connect() as connection:
+        connection.execute("UPDATE batch_items SET item_status='FACT_CHECKED' WHERE batch_id=? AND article_id=?", (current_id, active))
+    workflow.build_packages(current_id)
+    current_root = tmp_path / "workspace/batches" / current_id
+    state = json.loads((current_root / "batch-state.json").read_text())
+    items = {item["article_id"]: item for item in state["items"]}
+    assert items[active]["package_path"] == f"publish/{active}"
+    assert items[inactive]["package_path"] == f"../{approved_batch.batch_id}/publish/{inactive}"
+    assert not (current_root / "publish" / inactive).exists()
+    # A stale local directory must never redirect a REUSED_COMPLETE link.
+    (current_root / "publish" / inactive).mkdir()
+    state = workflow.workspace.refresh(current_id)
+    items = {item["article_id"]: item for item in state["items"]}
+    assert items[inactive]["package_path"] == f"../{approved_batch.batch_id}/publish/{inactive}"
+
+
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt, SystemExit])
+def test_package_interruption_immediately_after_promotion_restores_prior_tree(approved_batch, monkeypatch, error_type):
+    import newsroom.batch_release as release
+
+    publish = publish_root(approved_batch)
+    (publish / "sentinel.txt").write_text("old", encoding="utf-8")
+    before = snapshot(approved_batch)
+    original = release.os.replace
+    def interrupt_after_promotion(source, destination):
+        original(source, destination)
+        if Path(destination) == publish and Path(source).name.startswith(".staging-publish-"):
+            raise error_type("after promotion")
+    monkeypatch.setattr(release.os, "replace", interrupt_after_promotion)
+    with pytest.raises(error_type, match="after promotion"):
+        BatchReleaseWorkflow(approved_batch.room).build_packages(approved_batch.batch_id)
+    assert {path.name for path in publish.iterdir()} == {"sentinel.txt"}
+    assert (publish / "sentinel.txt").read_text() == "old"
+    assert snapshot(approved_batch) == before
+    assert not list(publish.parent.glob(".previous-publish-*"))
