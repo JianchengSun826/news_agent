@@ -1,31 +1,27 @@
 # Data Model
 
-SQLite schema version 2 由 `newsroom init` 幂等创建。再次运行 `init` 会把 version 1 数据库迁移到 version 2。
+SQLite schema version 3 is created or upgraded by `newsroom init`. Existing v1/v2 databases are copied to `data/backups/` before migration. SQLite remains canonical; CSV, JSON, and Markdown are interchange or artifact formats.
 
-写入 SQLite 前，候选与图片 metadata 通过 Pydantic v2 模型校验日期、URL、必填文本、priority 范围和图片 provenance。SQLite 保留 canonical representation，Pydantic 模型不替代数据库约束与 audit trail。
+## Core records
 
-## candidates
+`candidates` stores discovery metadata, normalized event fields, source URLs, duplicate state, selection state, audit timestamps, and `candidate_fingerprint`. The SHA-256 fingerprint canonicalizes event date, company, product, event type, core fact, and primary URL so a new CSV can reuse an old candidate.
 
-保存 `candidate_id`、status、discovered/event timestamps、title、core_fact、company/product/topic/subtopic、event_type、JSON keywords、primary/secondary source URLs、discovery channel、priority、duplicate_status、matching_event_id、event_id、selected、rejection reason、notes 和 audit timestamps。`core_fact` 是无营销语言的一句话事实。`primary_source` 必填；`secondary_sources` 是 JSON 数组，primary-only 候选使用空数组 `[]`。
+`articles` links one candidate to at most one article. It stores workflow status, event metadata, current artifact paths, title/slug, `fact_check_outcome`, `revision_number`, selected `image_id`, publication data, and timestamps. Research, article, and fact-check files use `-vN.md`; current paths point to the active version.
 
-Duplicate status 仅允许 `NEW`、`FOLLOW_UP`、`RELATED`、`POSSIBLE_DUPLICATE`、`DUPLICATE`。人工覆盖必须记录 actor 和 reason。
+`images` is the permanent publication record. Legacy manual/AI provenance remains supported. Batch-selected images additionally copy `image_candidate_id`, rights basis, rights statement, landing page, creator, license, rights URL, and attribution so a publication package does not depend on transient model output.
 
-## articles
+`sources` is the domain reliability registry. `state_transitions` is the append-only actor/reason audit log.
 
-一条 selected candidate 对应至多一条 article。保存 specification 要求的 event/status/publish 字段、中文标题、slug、摘要、分类、来源、artifact 路径、image ID 和 timestamps。Research Brief 与最终稿始终为不同文件。
+## Batch records
 
-## sources
+`batches` stores `batch_id`, original filename and byte SHA-256, aggregate status, latest content request ID, latest fact-check request ID, and timestamps. An identical file hash returns the existing batch.
 
-独立 registry 保存 source_id、name、domain、type、reliability、usage policy、notes 和 active。类型为 PRIMARY/WIRE/MAINSTREAM_MEDIA/TECH_MEDIA/RESEARCH/COMMUNITY/SOCIAL；可靠性为 HIGH/MEDIUM/LOW。
+`batch_items` links each batch candidate to its reused or new article. It records deterministic duplicate classification, batch-specific status, content version, and the latest actionable error. Important statuses are `WAITING_DUPLICATE`, `READY_FOR_CONTENT`, `CONTENT_IMPORTED`, `FACT_CHECKED`, `NEEDS_REVISION`, `REUSED_COMPLETE`, and `EXCLUDED`.
 
-## images
+`batch_requests` is immutable handoff history. Each `req-...` stores type (`CONTENT`, `FACT_CHECK`, or `REVISION`), revision, request path, expected result filename, imported result path/hash, status, and timestamps. Identity plus exact membership prevents a stale or partial JSON from being applied.
 
-保存 image type、项目内 `image_path`、source/creator/license/attribution 或 AI provider/model/prompt path、生成/下载时间和 notes。实际文件保存在 `images/ARTICLE_ID/hero.EXT`。AI 图片需要文件、provider、model 与 prompt；其他图片需要文件、URL、creator、license 与 license URL。
+`image_candidates` stores Claude search suggestions: article/batch IDs, landing and optional direct image URLs, creator, rights basis, license, original rights URL and statement, attribution, relevance, and review status. Allowed rights bases are `PUBLIC_DOMAIN`, `OPEN_LICENSE`, `OFFICIAL_PRESS_LICENSE`, and `OWNED`.
 
-## state_transitions
+## Identifiers and formats
 
-Append-only audit log：entity type/id、from/to status、actor、reason、created_at。重要决定不得通过覆盖此表删除历史。
-
-## Identifiers and interchange
-
-业务记录使用随机前缀 ID，如 `cand-…`、`art-…`、`img-…`。`event_id` 为 `company-product-or-topic-event-type-YYYYMMDD`，小写 ASCII 且以连字符分隔。CSV 使用 JSON 数组字符串表示 keywords 与 secondary_sources，以便无损导入。
+Random IDs use `cand-...`, `art-...`, `batch-...`, `req-...`, `imgcand-...`, and `img-...`. `event_id` and slugs use lowercase ASCII with hyphens. Times are UTC ISO-8601. JSON model boundaries reject extra fields. CSV keywords and secondary sources use `|` separators.

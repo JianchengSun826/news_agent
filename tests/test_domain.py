@@ -225,6 +225,42 @@ def test_approval_guard_and_publication_package(newsroom: Newsroom, tmp_path: Pa
         newsroom.create_publication_package(article_id)
 
 
+def test_batch_article_publication_package_uses_current_version_and_rights(
+    newsroom: Newsroom, tmp_path: Path
+):
+    article_id = prepare_fact_checked_article(newsroom, tmp_path)
+    article_dir = newsroom.root / "articles" / article_id
+    current_article = article_dir / "article-v2.md"
+    current_markdown = "# 修订后的文章\n\n这是当前第二版文章，发布包必须使用这一版本。\n"
+    current_article.write_text(current_markdown, encoding="utf-8")
+    with newsroom.db.connect() as connection:
+        connection.execute(
+            "UPDATE articles SET draft_path=?,revision_number=2 WHERE article_id=?",
+            (str(current_article.relative_to(newsroom.root)), article_id),
+        )
+    image_candidate = add_image_candidate(newsroom, article_id, "batch-publication")
+    downloaded = tmp_path / "licensed.jpg"
+    downloaded.write_bytes(b"licensed-image")
+    image_id = newsroom.register_image(
+        article_id,
+        image_file=downloaded,
+        image_candidate_id=image_candidate["image_candidate_id"],
+        rights_confirmed=True,
+    )
+    newsroom.complete_review(article_id, "editor", "current article and image rights reviewed")
+    newsroom.approve(article_id, "editor", "approved current revision")
+
+    package = newsroom.create_publication_package(article_id)
+
+    metadata = json.loads((package / "metadata.json").read_text(encoding="utf-8"))
+    rights = json.loads((package / "image-license.json").read_text(encoding="utf-8"))
+    assert metadata["revision_number"] == 2
+    assert rights["image_id"] == image_id
+    assert rights["image_candidate_id"] == image_candidate["image_candidate_id"]
+    assert rights["rights_basis"] == "OPEN_LICENSE"
+    assert (package / "article.md").read_text(encoding="utf-8") == current_markdown
+
+
 def test_database_schema_contains_audit_and_registry(newsroom: Newsroom):
     tables = Database(newsroom.db_path).table_names()
     assert {"candidates", "articles", "sources", "images", "state_transitions"} <= tables

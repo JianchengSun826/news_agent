@@ -709,13 +709,13 @@ class BatchWorkflow:
         if item["item_status"] != "WAITING_DUPLICATE":
             raise WorkflowError("duplicate resolution requires WAITING_DUPLICATE")
 
-        classification = item["duplicate_classification"]
         if decision == "exclude":
             self.room.reject_candidate(candidate_id, actor, reason)
             article_id = None
             item_status = "EXCLUDED"
         else:
-            if classification in {"POSSIBLE_DUPLICATE", "DUPLICATE"}:
+            current_classification = self.room.get_candidate(candidate_id)["duplicate_status"]
+            if current_classification in {"POSSIBLE_DUPLICATE", "DUPLICATE"}:
                 raise WorkflowError(
                     "duplicate override is required before including POSSIBLE_DUPLICATE or DUPLICATE"
                 )
@@ -1079,7 +1079,7 @@ class BatchWorkflow:
             "image_pending_article_ids": [
                 item["article_id"]
                 for item in items
-                if item["item_status"] == "FACT_CHECKED"
+                if item["article_status"] == "FACT_CHECKED"
             ],
         }
         request = None

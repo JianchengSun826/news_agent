@@ -1,299 +1,173 @@
-# Phase 1 操作流程
+# Phase 1.1 批处理操作流程
 
-## 1. 首次初始化
+本流程的边界固定：Gemini 只负责定时发现、整理 Google Sheet 和生成 CSV；CSV 之后的研究、写作与图片搜索在第一个 Claude App 对话完成，事实核验在一个全新的 Claude 对话完成。CLI 不调用任何模型 API，不自动下载图片，也不自动发布。
+
+## 1. 从 Gemini 获得 CSV
+
+在 Google Sheet 的 `Inbox` 审核 Gemini 发现的新闻。确认 primary URL 支持 `core_fact`，移除错误 secondary URL，核对事件日期，并把通过项标为 `READY_TO_IMPORT`。从保留表头的 `Ready to Import` worksheet 下载 CSV。
+
+CSV 至少需要以下列；额外审核列可以保留，CLI 会忽略它们：
+
+```text
+candidate_title,core_fact,event_date,company,product,topic,subtopic,event_type,keywords,primary_source,secondary_sources,discovered_from,priority
+```
+
+`keywords` 和多个 `secondary_sources` 使用 `|` 分隔。只有 primary 可靠时，把 `secondary_sources` 留空。
+
+## 2. 初始化并准备整批文章
 
 ```bash
 cd /Users/jianchengsun/agent/news_agent
 uv sync --locked --dev
 uv run newsroom init
+uv run newsroom batch prepare ~/Downloads/tech-newsroom-candidates.csv
 ```
 
-正式数据库位于 `data/newsroom.db`。查看命令参数：
+`init` 会幂等升级数据库；从旧 schema 升级前，备份写入 `data/backups/`。`batch prepare` 会验证整份 CSV、复用此前导入的候选、自动处理 `NEW`、创建文章记录，并返回：
+
+- `batch_id`：后续命令使用的 `batch-...`；
+- `content_request_path`：第一个 Claude 窗口要上传的 JSON；
+- `counts` 和 `items`：批次状态。
+
+同一文件重复执行会返回原批次。即使以前运行过 `candidate import`，也可以直接执行 `batch prepare`；系统按候选指纹复用数据。
+
+查看进度：
 
 ```bash
-uv run newsroom --help
-uv run newsroom candidate add --help
+uv run newsroom batch status BATCH_ID
 ```
 
-## 2. 设置 Google Sheet
+## 3. 只处理有歧义的重复项
 
-创建私有 spreadsheet：
+`NEW` 已自动进入写作。`WAITING_DUPLICATE` 才需要人工操作。
 
-- 文件名：`Tech Newsroom Candidates`
-- 第一个 worksheet：`Inbox`
-- 使用运行 Gemini Spark 的同一 Google Account 创建，不要共享
-
-将以下表头按顺序粘贴到 `Inbox` 第一行：
-
-```text
-discovered_at,event_date,candidate_title,core_fact,company,product,topic,subtopic,event_type,keywords,primary_source,primary_source_status,secondary_sources,secondary_source_status,rejected_secondary_sources,source_status,source_review_reason,discovered_from,priority,duplicate_hint,candidate_add_command,review_status,notes
-```
-
-选择范围，点击 `Data → Data validation → Add rule → Dropdown`。显示方式选 `Chip`，无效数据选 `Reject input`：
-
-| 范围 | 选项 |
-| --- | --- |
-| `G2:G` | `AI`, `AI Agent`, `AI Coding`, `Semiconductors`, `Cloud`, `Data Centers`, `Developer Tools`, `Robotics`, `Autonomous Vehicles`, `Cybersecurity`, `Technology Business` |
-| `I2:I` | `launch`, `update`, `research`, `funding`, `acquisition`, `security-patch`, `security-incident`, `shipment`, `policy`, `earnings`, `partnership`, `other` |
-| `L2:L` | `UNVERIFIED_BY_HUMAN`, `VERIFIED`, `INVALID` |
-| `N2:N` | `NOT_PROVIDED`, `UNVERIFIED_BY_HUMAN`, `VERIFIED`, `PARTIALLY_VERIFIED`, `INVALID` |
-| `P2:P` | `PRIMARY_ONLY`, `SECONDARY_UNVERIFIED`, `CORROBORATED`, `SOURCE_CONFLICT`, `INSUFFICIENT` |
-| `S2:S` | `1`, `2`, `3`, `4`, `5` |
-| `T2:T` | `NEW`, `FOLLOW_UP`, `RELATED`, `POSSIBLE_DUPLICATE`, `DUPLICATE` |
-| `V2:V` | `PENDING`, `READY_TO_IMPORT`, `IMPORTED`, `ON_HOLD`, `REJECTED` |
-
-新建 worksheet `Ready to Import`，在 `A1` 输入：
-
-```text
-={Inbox!A1:W1; IFNA(FILTER(Inbox!A2:W, Inbox!V2:V="READY_TO_IMPORT"),)}
-```
-
-不要直接编辑 `Ready to Import`；所有修改都在 `Inbox` 完成。
-
-## 3. 设置 Gemini Spark
-
-1. 在 Gemini 连接 Google Workspace。
-2. 切换到 Spark，新建定时 Task。
-3. 复制完整的 [Gemini Spark Prompt](../prompts/gemini_spark_discovery.md)。
-4. 确认 schedule、时区、spreadsheet 名称和 worksheet 名称。
-5. 执行一次 `Run now`，确认 Gemini 只向 `Inbox` 追加行。
-
-## 4. 审核每日候选
-
-在 `Inbox` 筛选 `review_status = PENDING`，逐行操作：
-
-1. 打开 `primary_source`，确认页面存在并支持 `core_fact`。
-2. 核对 `event_date` 是事件日期。
-3. 检查最近 30 天是否已有相同事件。
-4. 有 secondary URL 时，确认它存在、支持同一事实，并且与 primary 独立。
-5. 修正 title、分类、关键词、priority 和 notes。
-
-按审核结果填写：
-
-| 结果 | 状态设置 |
-| --- | --- |
-| Primary 和 secondary 均有效 | `primary_source_status=VERIFIED`、`secondary_source_status=VERIFIED`、`source_status=CORROBORATED`、`review_status=READY_TO_IMPORT` |
-| Primary 有效但没有 secondary | `primary_source_status=VERIFIED`、`secondary_source_status=NOT_PROVIDED`、`source_status=PRIMARY_ONLY`、`review_status=READY_TO_IMPORT` |
-| Secondary 错误但 primary 有效 | 清空 `secondary_sources`，把错误 URL 移到 `rejected_secondary_sources`，设置 `secondary_source_status=INVALID`、`source_status=PRIMARY_ONLY`、`review_status=READY_TO_IMPORT` |
-| Primary 不支持核心事实 | `primary_source_status=INVALID`、`source_status=INSUFFICIENT`、`review_status=REJECTED` |
-| 暂时无法判断 | `review_status=ON_HOLD`，在 `notes` 写明原因 |
-
-## 5. 下载并导入候选
-
-1. 打开 `Ready to Import` worksheet。
-2. 选择 `File → Download → Comma-separated values (.csv)`。
-3. 在项目目录运行：
+排除：
 
 ```bash
-uv run newsroom candidate import \
-  ~/Downloads/tech-newsroom-candidates.csv
+uv run newsroom batch resolve BATCH_ID CANDIDATE_ID \
+  --decision exclude --actor editor --reason "与已选事件重复"
 ```
 
-4. 保存命令输出的所有 `candidate_ids`。
-5. 确认导入结果：
+`FOLLOW_UP` 或 `RELATED` 可直接 include：
 
 ```bash
-uv run newsroom candidate list
-uv run newsroom candidate show CANDIDATE_ID
+uv run newsroom batch resolve BATCH_ID CANDIDATE_ID \
+  --decision include --actor editor --reason "属于有独立新闻价值的后续事件"
 ```
 
-6. 导入成功后，把对应 `Inbox` 行的 `review_status` 改为 `IMPORTED`。导入失败时保留 `READY_TO_IMPORT`，修正后重新下载。
-
-## 6. 手动添加单条候选
-
-只有 primary source：
-
-```bash
-uv run newsroom candidate add \
-  --candidate-title "示例标题" \
-  --core-fact "Company released Product on 2026-09-29." \
-  --event-date "2026-09-29" \
-  --company "Company" \
-  --product "Product" \
-  --topic "AI" \
-  --subtopic "Developer Tools" \
-  --event-type "launch" \
-  --primary-source "https://company.example/announcement" \
-  --keyword "company" \
-  --priority 4
-```
-
-有独立来源时增加一个或多个：
-
-```bash
---secondary-source "https://media.example/report"
-```
-
-没有可靠 secondary 时完全省略该参数。
-
-## 7. 处理导入后的候选
-
-每个 `CANDIDATE_ID` 先运行去重：
-
-```bash
-uv run newsroom duplicate-check CANDIDATE_ID
-```
-
-需要人工覆盖时：
+`POSSIBLE_DUPLICATE` 或 `DUPLICATE` 必须先记录人工覆盖，再 include：
 
 ```bash
 uv run newsroom duplicate-check CANDIDATE_ID \
-  --override NEW \
-  --actor editor \
-  --reason "确认是独立事件"
+  --override NEW --actor editor --reason "来源与事件日期证明是独立事件"
+
+uv run newsroom batch resolve BATCH_ID CANDIDATE_ID \
+  --decision include --actor editor --reason "已完成重复项覆盖"
 ```
 
-采用候选：
+每次 include 都会生成新的不可变 content request；以最新 `batch status` 返回的路径为准。
 
-```bash
-uv run newsroom candidate select CANDIDATE_ID \
-  --actor editor \
-  --reason "来源和新闻价值已确认"
-```
+## 4. 第一个 Claude 窗口：整批研究、写作和图片搜索
 
-不采用候选：
-
-```bash
-uv run newsroom candidate reject CANDIDATE_ID \
-  --actor editor \
-  --reason "来源不足或价值有限"
-```
-
-## 8. 研究、写作与事实核验
-
-创建 Research Brief，并记录输出的 `ARTICLE_ID`：
-
-```bash
-uv run newsroom brief create CANDIDATE_ID
-uv run newsroom prompt create ARTICLE_ID --purpose research
-```
-
-完成研究后登记 Markdown：
-
-```bash
-uv run newsroom research register ARTICLE_ID --file research/manual-result.md
-```
-
-生成写作 prompt，完成文章后登记：
-
-```bash
-uv run newsroom prompt create ARTICLE_ID --purpose writing
-uv run newsroom article register ARTICLE_ID \
-  --file articles/my-article.md \
-  --title "中文标题" \
-  --slug "article-slug"
-```
-
-完成事实核验后登记：
-
-```bash
-uv run newsroom prompt create ARTICLE_ID --purpose fact_check
-uv run newsroom fact-check register ARTICLE_ID \
-  --file articles/my-fact-check.md
-```
-
-## 9. 图片、审核与发布
-
-生成图片 prompt：
-
-```bash
-uv run newsroom prompt create ARTICLE_ID --purpose image
-```
-
-先准备好本地图片，例如：
+新建一个 Claude App 对话，上传 `content_request_path` 指向的一个 JSON 文件，只发送一次：
 
 ```text
-~/Downloads/hero.png
+严格执行文件中的 instructions，完成全部条目，并生成其中指定的 output_file。
 ```
 
-登记 AI 图片：
+Claude 应返回一个可下载 JSON，包含整批 Research Brief、完整 Markdown 文章，以及每篇最多三个图片候选。图片必须有原始落地页和原始权利页面；不接受搜索缩略图、版权不明的媒体图片或仅以 fair use 为依据的图片。
+
+下载后一次性导入：
+
+```bash
+uv run newsroom batch content-import BATCH_ID \
+  ~/Downloads/BATCH_ID-content-result.json
+```
+
+CLI 会先验证整个 JSON。缺少文章、出现额外文章、slug 冲突或图片权利字段不完整时，整批不写入。成功后自动返回 `fact_check_request_path`。
+
+## 5. 第二个 Claude 窗口：一次独立核验
+
+必须新建 Claude 对话，上传 `fact_check_request_path`，仍只发送同一句固定指令。下载结果后运行：
+
+```bash
+uv run newsroom batch fact-check-import BATCH_ID \
+  ~/Downloads/BATCH_ID-fact-check-result-v1.json
+```
+
+- `PASS` → `FACT_CHECKED`，进入图片人工确认；
+- `FAIL` → `NEEDS_REVISION`，不会阻塞同批其他文章。
+
+核验只做一次整批交接；每篇文章仍分别获得 PASS/FAIL 和 claim-level 报告。
+
+## 6. 仅在 FAIL 时修订
+
+```bash
+uv run newsroom batch revision-request BATCH_ID
+```
+
+把返回的 revision request 上传到一个 Claude 对话，发送固定指令，下载后导入：
+
+```bash
+uv run newsroom batch revision-import BATCH_ID \
+  ~/Downloads/BATCH_ID-revision-result-v2.json
+```
+
+CLI 保留 v1，写入 `research-brief-v2.md` 和 `article-v2.md`，并自动生成新的 fact-check request。使用新的 Claude 对话核验，再运行 `fact-check-import`。旧 request 的结果不能用于新一轮。
+
+## 7. 人工确认并登记图片
+
+查看某篇文章的候选：
+
+```bash
+uv run newsroom image candidates ARTICLE_ID
+```
+
+对选中的 `image_candidate_id`：
+
+1. 打开 `landing_page_url` 和 `rights_url`；
+2. 确认作者、许可、署名要求与 CLI 记录一致；
+3. 人工下载原图并检查画面、格式和分辨率；
+4. 显式确认权利并登记：
 
 ```bash
 uv run newsroom image register ARTICLE_ID \
-  --file ~/Downloads/hero.png \
-  --type AI_GENERATED \
-  --ai-provider Gemini \
-  --ai-model manual-subscription \
-  --prompt-path "output/prompts/ARTICLE_ID-image.md"
-```
-
-登记外部授权图片：
-
-```bash
-uv run newsroom image register ARTICLE_ID \
+  --candidate IMAGE_CANDIDATE_ID \
   --file ~/Downloads/hero.jpg \
-  --type WIKIMEDIA \
-  --source-url "https://commons.wikimedia.org/example" \
-  --creator "Creator Name" \
-  --license "CC BY 4.0" \
-  --license-url "https://creativecommons.org/licenses/by/4.0/" \
-  --attribution "Creator Name, CC BY 4.0"
+  --rights-confirmed
 ```
 
-登记时，CLI 会把图片复制为 `images/ARTICLE_ID/hero.EXT`，并把相对路径、来源、许可证或 AI provenance 保存到 SQLite。目标文件已存在时不会覆盖。
+CLI 不下载图片，也不替编辑判断版权。候选属于另一篇文章、未提供文件或未写 `--rights-confirmed` 时会拒绝登记。
 
-完成最终审核和批准：
+## 8. 审核、批准、发布包和发布登记
 
 ```bash
 uv run newsroom review ARTICLE_ID \
-  --actor editor \
-  --reason "已检查事实、来源、标题和图片权利"
+  --actor editor --reason "已检查文章、核验报告、图片与权利页面"
 
 uv run newsroom approve ARTICLE_ID \
-  --actor editor \
-  --reason "批准生成发布包"
-```
+  --actor editor --reason "当前版本及发布素材已确认"
 
-生成发布包：
-
-```bash
 uv run newsroom publish-package ARTICLE_ID
 ```
 
-最终新闻以本地发布包呈现：
-
-```text
-output/ARTICLE_ID/
-├── article.md
-├── hero.png
-├── metadata.json
-├── sources.md
-├── research-brief.md
-├── fact-check.md
-├── image-brief.md
-├── image-license.json
-└── publication-checklist.md
-```
-
-- `article.md` 是提供给读者的 Markdown 新闻正文。
-- `hero.png` 表示已登记的实际图片；扩展名与输入图片一致。
-- `metadata.json` 保存标题、slug、分类和发布 metadata。
-- `sources.md`、`research-brief.md` 和 `fact-check.md` 供编辑核验。
-- `image-license.json` 保存图片授权或 AI 生成记录。
-- `publication-checklist.md` 是发布前检查清单。
-
-发布包包含实际图片，但不会自动生成网页或上传 CMS。发布时，把发布包中的 `article.md` 和 `hero.EXT` 上传到 WordPress、Ghost、微信公众号或其他平台。
-
-人工发布后登记 URL：
+发布包位于 `output/ARTICLE_ID/`，包含当前版本的 `article.md`、Research Brief、fact-check、图片、来源、metadata、图片权利记录和 checklist。人工上传到 CMS 后，用真实 URL 登记：
 
 ```bash
 uv run newsroom publish ARTICLE_ID \
-  --actor editor \
-  --url "https://your-site.example/article-slug"
-```
+  --actor editor --url "https://your-site.example/article-slug"
 
-查看结果：
-
-```bash
 uv run newsroom published list
 uv run newsroom stats
 ```
 
-## 10. 测试与 Demo
+仍需人工完成的步骤只有：Sheet 来源审核、重复项歧义判断、两个 Claude 文件交接、图片权利页与文件检查、最终编辑批准、CMS 上传和真实 URL 登记。
+
+## 9. 验证与离线 Demo
 
 ```bash
 uv run pytest -q
 bash scripts/demo.sh
 ```
 
-Demo 使用 `demo-workspace/`，不会修改正式数据库。
+Demo 在 `demo-workspace/` 内生成合成 Claude JSON，完整走通批次准备、内容导入、独立核验、图片登记、批准、发布包和发布登记，不访问网络或模型服务。

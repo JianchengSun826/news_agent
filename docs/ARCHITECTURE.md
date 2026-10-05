@@ -1,15 +1,19 @@
 # Architecture
 
-## Phase 1 components
+## Phase 1.1 components
 
-`newsroom.cli` 使用 Typer 将类型化命令转换为领域操作；`newsroom.models` 使用 Pydantic v2 校验候选和图片输入，并负责 ID、URL 与时间格式；`newsroom.service.Newsroom` 执行状态 gate、artifact 复制和发布包生成；`newsroom.dedup` 是无网络的事件级 heuristic；`newsroom.db` 管理 SQLite schema 和参数化查询。
+`newsroom.cli` exposes Typer commands. `newsroom.batch.BatchWorkflow` coordinates durable CSV batches and manual Claude file handoffs. `newsroom.service.Newsroom` owns single-record state transitions, image registration, approval, and publication packages. Pydantic v2 models in `newsroom.models` and `newsroom.batch_models` validate CLI and JSON boundaries with unknown fields rejected. `newsroom.dedup` performs deterministic offline event comparison, and `newsroom.db` manages SQLite schema and migrations.
 
-SQLite 位于 `data/newsroom.db`，是唯一事实来源。Markdown、JSON 和 CSV 是人工界面与导出格式。外部 LLM 不在 runtime 内：`prompts/` 使用 provider-neutral frontmatter，人工复制到订阅产品并将结果注册回来。
+SQLite at `data/newsroom.db` is the canonical state store. Markdown files are versioned editorial artifacts. CSV is the Gemini-to-local boundary; JSON request/result files under `output/batches/BATCH_ID/` are the local-to-Claude boundary.
 
-## Boundaries
+## Provider and trust boundaries
 
-Phase 1 没有 provider SDK、网络抓取、scheduler、Web frontend、embedding、向量数据库或自动发布。未来 provider 必须通过 Search/Research/Writing/FactCheck/Image adapter 接入，并保留 ManualProvider 路径。任何重大选择写入 `docs/ADR/`。
+Gemini ends at the reviewed CSV. Claude App receives one content request for the whole eligible batch, then a separate fresh conversation receives one fact-check request. There is no model SDK or network call in the runtime. The application never downloads images, decides that a license is valid, or publishes to a CMS.
 
-## Reliability and security
+Every Claude result is validated for schema, request identity, exact article membership, slugs, and image rights metadata before writes begin. Multi-article imports use one SQLite transaction and staged files. Immutable `batch_requests` retain every content, fact-check, and revision exchange; a newer request ID invalidates stale results.
 
-状态更新和 audit insert 在同一 SQLite transaction 中完成。所有 SQL 使用参数绑定。CLI 拒绝无效 URL、跳步、未解决重复项、缺少实际图片文件、无图片权利记录和缺少人工 review 的审批。系统保存已登记的图片文件、URL、metadata 和人工笔记，不绕过 paywall，不长期保存第三方全文。
+## Reliability and human gates
+
+Database migration to schema v3 is additive and backs up a v1/v2 database before changes. SQL uses parameter binding, UTC ISO-8601 timestamps, and append-only state transitions. Content import preserves article versions. `FAIL` is stored as valid fact-check data and routes only that article to revision.
+
+Humans remain responsible for Sheet source review, ambiguous duplicate decisions, Claude App upload/download, opening image landing and rights pages, downloading and visually inspecting the image, final review, approval, CMS upload, and publication URL registration.
