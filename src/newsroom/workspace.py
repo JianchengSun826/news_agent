@@ -104,7 +104,7 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def _cell(value: Any) -> str:
-    return str(value if value is not None else "—").replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", "<br>").replace("[", "\\[").replace("]", "\\]").replace("<", "&lt;").replace(">", "&gt;")
+    return str(value if value is not None else "—").replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("[", "\\[").replace("]", "\\]").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
 
 
 def _link(label: Any, path: str | None) -> str:

@@ -175,3 +175,17 @@ def test_failed_json_replacement_preserves_previous_view(prepared_batch, monkeyp
         workspace.refresh(batch_id)
     assert json_path.read_bytes() == previous
     assert not list(json_path.parent.glob("*.tmp"))
+
+
+def test_dashboard_multiline_cell_escapes_source_html_before_line_breaks(prepared_batch):
+    room, batch_id = prepared_batch
+    with room.db.connect() as connection:
+        connection.execute(
+            "UPDATE batch_items SET error_message=? WHERE batch_id=?",
+            ("校验 <script>失败</script>\n重新检查", batch_id),
+        )
+    workspace = BatchWorkspace(room)
+    workspace.refresh(batch_id)
+    readme = (workspace.batch_root(batch_id) / "README.md").read_text()
+    assert "校验 &lt;script&gt;失败&lt;/script&gt;<br>重新检查" in readme
+    assert "&lt;br&gt;" not in readme
