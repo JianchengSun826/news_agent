@@ -92,7 +92,8 @@ def test_prepare_auto_selects_new_and_pauses_non_new(newsroom: Newsroom, tmp_pat
     assert status["counts"]["WAITING_DUPLICATE"] == 1
     request = json.loads(Path(result["content_request_path"]).read_text(encoding="utf-8"))
     assert len(request["items"]) == 2
-    assert "instructions" in request
+    assert "research_brief_md" in request["instructions"]
+    assert "rights_url" in request["instructions"]
 
 
 def test_prepare_reuses_old_candidate_and_completed_article(newsroom: Newsroom, tmp_path: Path):
@@ -178,6 +179,44 @@ def test_resolve_requires_override_for_possible_duplicate(newsroom: Newsroom, tm
         BatchWorkflow(newsroom).resolve(
             result["batch_id"], waiting[0]["candidate_id"], "include", "editor", "include it"
         )
+
+
+def test_resolve_includes_possible_duplicate_after_explicit_override(
+    newsroom: Newsroom, tmp_path: Path
+):
+    rows = [
+        candidate_row(),
+        candidate_row(
+            candidate_title="Tool gains a separate announcement",
+            core_fact="Example described a separate Tool announcement for customers.",
+            event_date="2026-10-06",
+            primary_source="https://example.com/official/tool-followup",
+        ),
+    ]
+    workflow = BatchWorkflow(newsroom)
+    result = workflow.prepare(write_batch_csv(tmp_path / "override.csv", rows))
+    waiting = [
+        item
+        for item in workflow.status(result["batch_id"])["items"]
+        if item["item_status"] == "WAITING_DUPLICATE"
+    ][0]
+    newsroom.override_duplicate(
+        waiting["candidate_id"], "FOLLOW_UP", "confirmed separate follow-up", "editor"
+    )
+
+    resolved = workflow.resolve(
+        result["batch_id"],
+        waiting["candidate_id"],
+        "include",
+        "editor",
+        "explicit override recorded",
+    )
+
+    item = next(
+        item for item in resolved["items"] if item["candidate_id"] == waiting["candidate_id"]
+    )
+    assert item["item_status"] == "READY_FOR_CONTENT"
+    assert item["article_id"]
 
 
 @pytest.fixture
@@ -327,6 +366,7 @@ def content_batch(prepared_batch: SimpleNamespace, tmp_path: Path) -> SimpleName
     imported = prepared_batch.workflow.import_content(prepared_batch.batch_id, content_result)
     fact_request_path = Path(imported["fact_check_request_path"])
     fact_request = json.loads(fact_request_path.read_text(encoding="utf-8"))
+    assert "blocking_issues" in fact_request["instructions"]
     prepared_batch.fact_request_path = fact_request_path
     prepared_batch.fact_request = fact_request
     prepared_batch.article_ids = [item["article_id"] for item in fact_request["items"]]
@@ -386,6 +426,7 @@ def revised_batch(content_batch: SimpleNamespace, tmp_path: Path) -> SimpleNames
     content_batch.workflow.import_fact_checks(content_batch.batch_id, failed)
     revision_request_path = content_batch.workflow.create_revision_request(content_batch.batch_id)
     revision_request = json.loads(revision_request_path.read_text(encoding="utf-8"))
+    assert "research_brief_md" in revision_request["instructions"]
     result_items = []
     for item in revision_request["items"]:
         result_items.append(
