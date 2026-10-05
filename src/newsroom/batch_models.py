@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
 SCHEMA_VERSION = 1
@@ -192,6 +193,32 @@ class BatchRevisionRequest(BatchRequestDocument):
 
 class BatchRevisionResult(BatchDocument):
     items: list[RevisionResultItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def unique_items(self) -> Self:
+        _reject_duplicate_article_ids(self.items)
+        return self
+
+
+class BatchImageSelection(StrictModel):
+    article_id: str = Field(pattern=r"^art-[a-z0-9]+$")
+    image_candidate_id: str = Field(pattern=r"^imgcand-[a-z0-9]+$")
+    image_file: Path
+    rights_confirmed: Literal[True]
+
+    @field_validator("rights_confirmed", mode="before")
+    @classmethod
+    def literal_confirmation(cls, value: Any) -> bool:
+        if value is not True:
+            raise ValueError("rights_confirmed must be literal true")
+        return value
+
+
+class BatchImagePlan(StrictModel):
+    schema_version: Literal[1] = SCHEMA_VERSION
+    batch_id: str = Field(pattern=r"^batch-[a-z0-9]+$")
+    # An incomplete list is a resumable draft, never an executable image plan.
+    items: list[BatchImageSelection]
 
     @model_validator(mode="after")
     def unique_items(self) -> Self:

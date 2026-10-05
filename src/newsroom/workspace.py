@@ -127,6 +127,9 @@ class BatchWorkspace:
     def article_root(self, batch_id: str, article_id: str) -> Path:
         return BatchWorkspacePaths(self.batch_root(batch_id)).articles / _identifier(article_id)
 
+    def image_draft_path(self, batch_id: str) -> Path:
+        return self.batch_root(batch_id) / "image-selections.json"
+
     def _batch(self, batch_id: str) -> dict[str, Any]:
         _identifier(batch_id)
         batch = self.room.db.one("SELECT * FROM batches WHERE batch_id=?", (batch_id,))
