@@ -4,6 +4,10 @@ __pycache__/
 .pytest_cache/
 *.pyc
 data/*.db
+data/backups/
+articles/
+images/
+research/
 output/*/
 !output/.gitkeep
 demo-workspace/
