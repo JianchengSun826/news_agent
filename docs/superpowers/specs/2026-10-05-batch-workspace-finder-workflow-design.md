@@ -4,7 +4,7 @@
 
 **Phase:** Phase 1.1 — Human-in-the-loop batch workflow
 
-**Status:** Draft for user review
+**Status:** Approved
 
 ## Context
 
