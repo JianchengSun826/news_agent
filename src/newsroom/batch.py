@@ -3,11 +3,20 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
+import shutil
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .batch_models import BatchContentRequest, ContentRequestItem, candidate_fingerprint
+from .batch_models import (
+    BatchContentRequest,
+    BatchContentResult,
+    BatchFactCheckRequest,
+    ContentRequestItem,
+    FactCheckRequestItem,
+    candidate_fingerprint,
+)
 from .models import CandidateInput, new_id, utc_now
 from .service import Newsroom, WorkflowError
 
@@ -93,6 +102,194 @@ class BatchWorkflow:
 
     def status(self, batch_id: str) -> dict[str, Any]:
         return self._summary(batch_id)
+
+    def import_content(self, batch_id: str, result_path: Path) -> dict[str, Any]:
+        source = Path(result_path)
+        raw = source.read_bytes()
+        result_sha256 = hashlib.sha256(raw).hexdigest()
+        payload = BatchContentResult.model_validate_json(raw)
+        batch = self.room.db.one("SELECT * FROM batches WHERE batch_id=?", (batch_id,))
+        if not batch:
+            raise WorkflowError(f"batch not found: {batch_id}")
+        request_id = batch["content_request_id"]
+        if not request_id:
+            raise WorkflowError("batch has no content request")
+        request_row = self.room.db.one(
+            "SELECT * FROM batch_requests WHERE request_id=? AND request_type='CONTENT'",
+            (request_id,),
+        )
+        if not request_row:
+            raise WorkflowError(f"content request not found: {request_id}")
+        if request_row["status"] == "COMPLETED":
+            if request_row["result_sha256"] != result_sha256:
+                raise WorkflowError("content request already completed with a different result")
+            return self._content_import_summary(batch_id, request_id)
+        if request_row["status"] != "PENDING":
+            raise WorkflowError(f"content request is not open: {request_row['status']}")
+
+        self._validate_result_identity(
+            payload.batch_id,
+            payload.request_id,
+            payload.output_file,
+            batch_id,
+            request_row,
+        )
+        request_document = json.loads(
+            (self.room.root / request_row["request_path"]).read_text(encoding="utf-8")
+        )
+        expected_ids = {item["article_id"] for item in request_document["items"]}
+        actual_ids = {item.article_id for item in payload.items}
+        self._validate_membership(expected_ids, actual_ids)
+        self._validate_slugs(payload)
+
+        batch_dir = self.room.root / "output" / "batches" / batch_id
+        staging = batch_dir / f".staging-{request_id}"
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True)
+        for item in payload.items:
+            item_dir = staging / item.article_id
+            item_dir.mkdir()
+            (item_dir / "research-brief-v1.md").write_text(
+                item.research_brief_md.rstrip() + "\n", encoding="utf-8"
+            )
+            (item_dir / "article-v1.md").write_text(
+                item.article_md.rstrip() + "\n", encoding="utf-8"
+            )
+
+        stored_result = batch_dir / f"{request_id}-content-result.json"
+        created_paths: list[Path] = []
+        fact_check_path: Path | None = None
+        try:
+            if stored_result.exists():
+                raise WorkflowError(f"stored content result already exists: {stored_result}")
+            shutil.copyfile(source, stored_result)
+            created_paths.append(stored_result)
+            with self.room.db.connect() as connection:
+                for item in payload.items:
+                    article = connection.execute(
+                        "SELECT * FROM articles WHERE article_id=?", (item.article_id,)
+                    ).fetchone()
+                    if not article or article["status"] != "SELECTED":
+                        current = article["status"] if article else "missing"
+                        raise WorkflowError(
+                            f"content import requires SELECTED article {item.article_id}; current status is {current}"
+                        )
+                    research_path = (
+                        self.room.root
+                        / "research"
+                        / item.article_id
+                        / "research-brief-v1.md"
+                    )
+                    article_path = (
+                        self.room.root / "articles" / item.article_id / "article-v1.md"
+                    )
+                    research_path.parent.mkdir(parents=True, exist_ok=True)
+                    article_path.parent.mkdir(parents=True, exist_ok=True)
+                    if research_path.exists() or article_path.exists():
+                        raise WorkflowError(f"version 1 artifacts already exist for {item.article_id}")
+                    os.replace(staging / item.article_id / research_path.name, research_path)
+                    created_paths.append(research_path)
+                    os.replace(staging / item.article_id / article_path.name, article_path)
+                    created_paths.append(article_path)
+                    now = utc_now()
+                    connection.execute(
+                        "UPDATE articles SET status='RESEARCHED',research_brief_path=?,updated_at=? "
+                        "WHERE article_id=?",
+                        (str(research_path.relative_to(self.room.root)), now, item.article_id),
+                    )
+                    self.room._transition(
+                        connection,
+                        "article",
+                        item.article_id,
+                        "SELECTED",
+                        "RESEARCHED",
+                        "claude-app",
+                        "batch research brief imported",
+                    )
+                    connection.execute(
+                        "UPDATE articles SET status='DRAFTED',draft_path=?,title_cn=?,slug=?,updated_at=? "
+                        "WHERE article_id=?",
+                        (
+                            str(article_path.relative_to(self.room.root)),
+                            item.title_cn,
+                            item.slug,
+                            now,
+                            item.article_id,
+                        ),
+                    )
+                    self.room._transition(
+                        connection,
+                        "article",
+                        item.article_id,
+                        "RESEARCHED",
+                        "DRAFTED",
+                        "claude-app",
+                        "batch article draft imported",
+                    )
+                    for image in item.image_candidates:
+                        values = image.model_dump(mode="json")
+                        image_candidate_id = new_id("imgcand")
+                        connection.execute(
+                            "INSERT INTO image_candidates(image_candidate_id,batch_id,article_id,"
+                            "landing_page_url,direct_image_url,creator,rights_basis,license_name,"
+                            "rights_url,rights_statement,attribution_required,attribution_text,"
+                            "relevance,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                image_candidate_id,
+                                batch_id,
+                                item.article_id,
+                                values["landing_page_url"],
+                                values["direct_image_url"],
+                                values["creator"],
+                                values["rights_basis"],
+                                values["license_name"],
+                                values["rights_url"],
+                                values["rights_statement"],
+                                int(values["attribution_required"]),
+                                values["attribution_text"],
+                                values["relevance"],
+                                now,
+                                now,
+                            ),
+                        )
+                    connection.execute(
+                        "UPDATE batch_items SET item_status='CONTENT_IMPORTED',error_message=NULL,"
+                        "updated_at=? WHERE batch_id=? AND article_id=?",
+                        (now, batch_id, item.article_id),
+                    )
+                completed_at = utc_now()
+                connection.execute(
+                    "UPDATE batch_requests SET result_path=?,result_sha256=?,status='COMPLETED',"
+                    "completed_at=? WHERE request_id=?",
+                    (
+                        str(stored_result.relative_to(self.room.root)),
+                        result_sha256,
+                        completed_at,
+                        request_id,
+                    ),
+                )
+                fact_check_path = self._write_fact_check_request(
+                    connection, batch_id, sorted(expected_ids), revision_number=1
+                )
+                created_paths.append(fact_check_path)
+                connection.execute(
+                    "UPDATE batches SET status='WAITING_FACT_CHECK',updated_at=? WHERE batch_id=?",
+                    (completed_at, batch_id),
+                )
+        except Exception:
+            for path in reversed(created_paths):
+                path.unlink(missing_ok=True)
+            raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+        return {
+            "batch_id": batch_id,
+            "request_id": request_id,
+            "imported": len(payload.items),
+            "fact_check_request_path": str(fact_check_path),
+        }
 
     def resolve(
         self,
@@ -281,6 +478,130 @@ class BatchWorkflow:
                 (request_id, now, batch_id),
             )
         return path
+
+    def _write_fact_check_request(
+        self,
+        connection,
+        batch_id: str,
+        article_ids: list[str],
+        revision_number: int,
+    ) -> Path:
+        request_id = new_id("req")
+        output_file = f"{batch_id}-fact-check-result-v{revision_number}.json"
+        instructions = (
+            self.room.project_root / "prompts" / "claude_batch_fact_check.md"
+        ).read_text(encoding="utf-8").strip()
+        items: list[FactCheckRequestItem] = []
+        for article_id in article_ids:
+            row = connection.execute(
+                "SELECT * FROM articles WHERE article_id=?", (article_id,)
+            ).fetchone()
+            if not row:
+                raise WorkflowError(f"article not found: {article_id}")
+            research_path = self.room.root / row["research_brief_path"]
+            article_path = self.room.root / row["draft_path"]
+            items.append(
+                FactCheckRequestItem(
+                    article_id=article_id,
+                    revision_number=row["revision_number"],
+                    title_cn=row["title_cn"],
+                    research_brief_md=research_path.read_text(encoding="utf-8"),
+                    article_md=article_path.read_text(encoding="utf-8"),
+                    primary_source=row["primary_source"],
+                    secondary_sources=json.loads(row["secondary_sources"]),
+                )
+            )
+        request = BatchFactCheckRequest(
+            batch_id=batch_id,
+            request_id=request_id,
+            output_file=output_file,
+            instructions=instructions,
+            items=items,
+        )
+        batch_dir = self.room.root / "output" / "batches" / batch_id
+        path = batch_dir / f"{request_id}-fact-check-request-v{revision_number}.json"
+        path.write_text(
+            json.dumps(request.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        now = utc_now()
+        connection.execute(
+            "INSERT INTO batch_requests(request_id,batch_id,request_type,revision_number,"
+            "request_path,expected_result_filename,status,created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (
+                request_id,
+                batch_id,
+                "FACT_CHECK",
+                revision_number,
+                str(path.relative_to(self.room.root)),
+                output_file,
+                "PENDING",
+                now,
+            ),
+        )
+        connection.execute(
+            "UPDATE batches SET fact_check_request_id=?,updated_at=? WHERE batch_id=?",
+            (request_id, now, batch_id),
+        )
+        return path
+
+    @staticmethod
+    def _validate_result_identity(
+        actual_batch_id: str,
+        actual_request_id: str,
+        actual_output_file: str,
+        batch_id: str,
+        request_row: dict[str, Any],
+    ) -> None:
+        if actual_batch_id != batch_id:
+            raise WorkflowError("result batch_id does not match the requested batch")
+        if actual_request_id != request_row["request_id"]:
+            raise WorkflowError("result request_id does not match the open request")
+        if actual_output_file != request_row["expected_result_filename"]:
+            raise WorkflowError("result output_file does not match the requested filename")
+
+    @staticmethod
+    def _validate_membership(expected_ids: set[str], actual_ids: set[str]) -> None:
+        missing = sorted(expected_ids - actual_ids)
+        unexpected = sorted(actual_ids - expected_ids)
+        if missing:
+            raise WorkflowError(f"missing article IDs: {', '.join(missing)}")
+        if unexpected:
+            raise WorkflowError(f"unexpected article IDs: {', '.join(unexpected)}")
+
+    def _validate_slugs(self, payload: BatchContentResult) -> None:
+        slugs = [item.slug for item in payload.items]
+        if len(slugs) != len(set(slugs)):
+            raise WorkflowError("duplicate slug in content result")
+        article_ids = [item.article_id for item in payload.items]
+        placeholders = ",".join("?" for _ in article_ids)
+        existing = self.room.db.one(
+            f"SELECT slug FROM articles WHERE slug IN ({','.join('?' for _ in slugs)}) "
+            f"AND article_id NOT IN ({placeholders}) LIMIT 1",
+            (*slugs, *article_ids),
+        )
+        if existing:
+            raise WorkflowError(f"duplicate slug already exists: {existing['slug']}")
+
+    def _content_import_summary(self, batch_id: str, request_id: str) -> dict[str, Any]:
+        batch = self.room.db.one("SELECT * FROM batches WHERE batch_id=?", (batch_id,))
+        fact_request = self.room.db.one(
+            "SELECT request_path FROM batch_requests WHERE request_id=?",
+            (batch["fact_check_request_id"],),
+        )
+        count = self.room.db.one(
+            "SELECT COUNT(*) AS count FROM batch_items WHERE batch_id=? "
+            "AND item_status IN ('CONTENT_IMPORTED','FACT_CHECKED','NEEDS_REVISION')",
+            (batch_id,),
+        )
+        return {
+            "batch_id": batch_id,
+            "request_id": request_id,
+            "imported": count["count"],
+            "fact_check_request_path": (
+                str(self.room.root / fact_request["request_path"]) if fact_request else None
+            ),
+        }
 
     def _refresh_batch_status(self, batch_id: str) -> None:
         counts = Counter(
