@@ -161,6 +161,18 @@ def test_prepare_validates_entire_csv_before_mutation(newsroom: Newsroom, tmp_pa
     assert newsroom.db.one("SELECT COUNT(*) AS count FROM batches")["count"] == 0
 
 
+def test_prepare_ignores_whitespace_only_csv_rows(newsroom: Newsroom, tmp_path: Path):
+    csv_path = write_batch_csv(
+        tmp_path / "blank-row.csv",
+        [candidate_row(), {field: " " for field in CSV_FIELDS}],
+    )
+
+    result = BatchWorkflow(newsroom).prepare(csv_path)
+
+    assert result["counts"] == {"READY_FOR_CONTENT": 1}
+    assert newsroom.db.one("SELECT COUNT(*) AS count FROM candidates")["count"] == 1
+
+
 def test_resolve_requires_override_for_possible_duplicate(newsroom: Newsroom, tmp_path: Path):
     rows = [
         candidate_row(),
@@ -312,6 +324,8 @@ def test_content_import_registers_every_item_and_creates_fact_check_request(
         assert article["status"] == "DRAFTED"
         assert Path(prepared_batch.room.root, article["draft_path"]).name == "article-v1.md"
     assert Path(result["fact_check_request_path"]).exists()
+    status = prepared_batch.workflow.status(prepared_batch.batch_id)
+    assert status["fact_check_request_path"] == result["fact_check_request_path"]
 
 
 def test_one_missing_article_rolls_back_entire_content_import(

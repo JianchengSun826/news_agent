@@ -745,6 +745,12 @@ class BatchWorkflow:
                 )
             rows: list[dict[str, Any]] = []
             for line_number, row in enumerate(reader, start=2):
+                if not any(
+                    value.strip()
+                    for value in row.values()
+                    if isinstance(value, str)
+                ):
+                    continue
                 try:
                     parsed = CandidateInput.model_validate(
                         {
@@ -1088,6 +1094,12 @@ class BatchWorkflow:
                 "SELECT request_path FROM batch_requests WHERE request_id=?",
                 (batch["content_request_id"],),
             )
+        fact_check_request = None
+        if batch["fact_check_request_id"]:
+            fact_check_request = self.room.db.one(
+                "SELECT request_path FROM batch_requests WHERE request_id=?",
+                (batch["fact_check_request_id"],),
+            )
         return {
             "batch_id": batch_id,
             "status": batch["status"],
@@ -1097,6 +1109,11 @@ class BatchWorkflow:
             "action_required": actions,
             "content_request_path": (
                 str(self.room.root / request["request_path"]) if request else None
+            ),
+            "fact_check_request_path": (
+                str(self.room.root / fact_check_request["request_path"])
+                if fact_check_request
+                else None
             ),
             "items": items,
         }

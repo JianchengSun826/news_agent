@@ -13,6 +13,7 @@ candidate_title,core_fact,event_date,company,product,topic,subtopic,event_type,k
 ```
 
 `keywords` 和多个 `secondary_sources` 使用 `|` 分隔。只有 primary 可靠时，把 `secondary_sources` 留空。
+导出的尾部空行或仅含空白字符的整行会被 CLI 自动忽略；含有部分数据但缺少必填字段的行仍会拒绝整批导入并报告行号。
 
 ## 2. 初始化并准备整批文章
 
@@ -36,6 +37,8 @@ uv run newsroom batch prepare ~/Downloads/tech-newsroom-candidates.csv
 ```bash
 uv run newsroom batch status BATCH_ID
 ```
+
+状态输出始终包含 `content_request_path`；内容导入完成后还会包含当前版本的 `fact_check_request_path`，可直接用于定位要上传到 Claude 的文件。
 
 ## 3. 只处理有歧义的重复项
 
