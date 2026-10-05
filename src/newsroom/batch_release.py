@@ -155,8 +155,13 @@ class BatchReleaseWorkflow:
                 ) from None
             raise
         else:
-            if previous_holder is not None and previous_holder.exists():
-                shutil.rmtree(previous_holder)
+            # Commit and refresh define success. Cleanup cannot reverse that
+            # outcome; any leftover backup is noncanonical recovery data.
+            try:
+                if previous_holder is not None and previous_holder.exists():
+                    shutil.rmtree(previous_holder)
+            except BaseException:
+                pass
         return publish
 
     @staticmethod

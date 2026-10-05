@@ -761,3 +761,59 @@ def test_package_reports_original_interruption_and_compensation_failure(approved
         assert backups[0].read_text() == "old"
         assert approved_batch.room.db.one("SELECT * FROM batches WHERE batch_id=?", (approved_batch.batch_id,)) == prior_batch
     assert not list(publish.parent.glob(".staging-publish-*"))
+
+
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt, SystemExit])
+def test_package_post_commit_backup_cleanup_failure_returns_committed_success(approved_batch, monkeypatch, error_type):
+    import newsroom.batch_release as release
+
+    workflow = BatchReleaseWorkflow(approved_batch.room)
+    publish = publish_root(approved_batch)
+    (publish / "discard.txt").write_text("old disposable file", encoding="utf-8")
+    (publish / "recovery.txt").write_text("retained recovery data", encoding="utf-8")
+    before = snapshot(approved_batch)
+    original = release.shutil.rmtree
+    def fail_partial_backup_cleanup(path, *args, **kwargs):
+        if Path(path).name.startswith(".previous-publish-"):
+            # Model a cleanup that has already removed one old file before
+            # failing. The remaining tree is recovery data, never canonical.
+            (Path(path) / "publish/discard.txt").unlink()
+            raise error_type("backup cleanup interrupted")
+        return original(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(release.shutil, "rmtree", fail_partial_backup_cleanup)
+        try:
+            result = workflow.build_packages(approved_batch.batch_id)
+        except BaseException as error:
+            pytest.fail(f"committed packages must return success after backup cleanup fails: {error!r}")
+        assert result == publish
+    assert {path.name for path in publish.iterdir()} == {*approved_batch.article_ids, "batch-manifest.json"}
+    manifest = json.loads((publish / "batch-manifest.json").read_text())
+    assert manifest["batch_id"] == approved_batch.batch_id
+    assert {item["article_id"] for item in manifest["items"]} == set(approved_batch.article_ids)
+    for article_id in approved_batch.article_ids:
+        article = approved_batch.room.get_article(article_id)
+        package = publish / article_id
+        assert (package / "article.md").read_bytes() == (approved_batch.room.root / article["draft_path"]).read_bytes()
+        assert (package / "hero.jpg").is_file()
+        assert json.loads((package / "metadata.json").read_text())["status"] == "APPROVED"
+        assert "[x] approved for publication" in (package / "publication-checklist.md").read_text()
+    after = snapshot(approved_batch)
+    assert after["batches"][0]["status"] == "PACKAGED"
+    assert {table: rows for table, rows in after.items() if table != "batches"} == {table: rows for table, rows in before.items() if table != "batches"}
+    state = json.loads((publish.parent / "batch-state.json").read_text())
+    assert state["status"] == "PACKAGED"
+    assert state["next_action"] == "open-review"
+    backups = list(publish.parent.glob(".previous-publish-*"))
+    assert len(backups) == 1
+    retained = backups[0] / "publish/recovery.txt"
+    assert retained.read_text() == "retained recovery data"
+    assert not (backups[0] / "publish/discard.txt").exists()
+    assert not list(publish.parent.glob(".staging-publish-*"))
+    # A subsequent build uses a fresh unique backup and cleans up only that
+    # backup; the incomplete recovery data from the first build is untouched.
+    assert workflow.build_packages(approved_batch.batch_id) == publish
+    assert list(publish.parent.glob(".previous-publish-*")) == backups
+    assert retained.read_text() == "retained recovery data"
+    assert {path.name for path in publish.iterdir()} == {*approved_batch.article_ids, "batch-manifest.json"}
+    assert not list(publish.parent.glob(".staging-publish-*"))
