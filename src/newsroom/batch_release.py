@@ -71,6 +71,7 @@ class BatchReleaseWorkflow:
 
     def build_packages(self, batch_id: str) -> Path:
         """Stage and validate the whole batch; compensate filesystem on DB failure."""
+        prior_batch = self.workspace._batch(batch_id)
         articles = self._active_articles(batch_id)
         self._require_article_status(articles, "APPROVED")
         # Read deserialized canonical metadata, including list-valued sources.
@@ -85,7 +86,6 @@ class BatchReleaseWorkflow:
         staging: Path | None = None
         previous: Path | None = None
         previous_holder: Path | None = None
-        committed = False
         try:
             staging = Path(tempfile.mkdtemp(prefix=".staging-publish-", dir=root))
             manifest_items = []
@@ -109,22 +109,54 @@ class BatchReleaseWorkflow:
             os.replace(staging, publish)
             with self.room.db.connect() as connection:
                 connection.execute("UPDATE batches SET status='PACKAGED',updated_at=? WHERE batch_id=?", (utc_now(), batch_id))
-            committed = True
-        except BaseException:
-            if not committed:
-                # Inspect the tree rather than a flag set after os.replace:
-                # a BaseException can arrive immediately after the rename.
-                if staging is not None and not staging.exists() and publish.exists():
+            # Retain the prior tree through the canonical update and view refresh.
+            self._refresh_workspaces(batch_id, articles)
+        except BaseException as original_error:
+            compensation_errors: list[BaseException] = []
+            # A rename or SQLite context exit can complete and then raise;
+            # inspect the filesystem and restore the captured canonical values.
+            promoted = staging is not None and not staging.exists()
+            try:
+                if promoted and publish.exists():
                     shutil.rmtree(publish)
                 if previous is not None and previous.exists():
                     os.replace(previous, publish)
+            except BaseException as error:
+                compensation_errors.append(error)
+            if promoted:
+                try:
+                    with self.room.db.connect() as connection:
+                        connection.execute("BEGIN")
+                        current = connection.execute(
+                            "SELECT status,updated_at FROM batches WHERE batch_id=?", (batch_id,)
+                        ).fetchone()
+                        prior_values = (prior_batch["status"], prior_batch["updated_at"])
+                        # A pre-commit rejection already rolled back. Avoid an
+                        # unnecessary UPDATE that could retrigger the same guard.
+                        if current is None or tuple(current) != prior_values:
+                            connection.execute(
+                                "UPDATE batches SET status=?,updated_at=? WHERE batch_id=?",
+                                (*prior_values, batch_id),
+                            )
+                except BaseException as error:
+                    compensation_errors.append(error)
+            try:
+                if staging is not None and staging.exists():
+                    shutil.rmtree(staging)
+                # Never delete the remaining backup if restoration failed.
+                if previous_holder is not None and previous_holder.exists() and (previous is None or not previous.exists()):
+                    shutil.rmtree(previous_holder)
+            except BaseException as error:
+                compensation_errors.append(error)
+            if compensation_errors:
+                raise BaseExceptionGroup(
+                    "publication packaging failed; compensation incomplete",
+                    [original_error, *compensation_errors],
+                ) from None
             raise
-        finally:
-            if staging is not None and staging.exists():
-                shutil.rmtree(staging)
-            if previous_holder is not None and previous_holder.exists() and (committed or previous is None or not previous.exists()):
+        else:
+            if previous_holder is not None and previous_holder.exists():
                 shutil.rmtree(previous_holder)
-        self._refresh_workspaces(batch_id, articles)
         return publish
 
     @staticmethod

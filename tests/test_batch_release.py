@@ -651,3 +651,113 @@ def test_package_interruption_immediately_after_promotion_restores_prior_tree(ap
     assert (publish / "sentinel.txt").read_text() == "old"
     assert snapshot(approved_batch) == before
     assert not list(publish.parent.glob(".previous-publish-*"))
+
+
+def interrupt_after_package_commit(batch, monkeypatch, interruption):
+    """Keep real SQLite commits, then inject one interruption at context exit."""
+    from contextlib import contextmanager
+
+    original = batch.room.db.connect
+    injected = False
+    @contextmanager
+    def commit_then_interrupt():
+        nonlocal injected
+        with original() as connection:
+            yield connection
+            packaged_update = connection.in_transaction and connection.execute(
+                "SELECT status FROM batches WHERE batch_id=?", (batch.batch_id,)
+            ).fetchone()["status"] == "PACKAGED"
+        if packaged_update and not injected:
+            injected = True
+            raise interruption
+    monkeypatch.setattr(batch.room.db, "connect", commit_then_interrupt)
+
+
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+def test_package_post_commit_interruption_restores_exact_metadata_and_allows_retry(approved_batch, monkeypatch, error_type):
+    workflow = BatchReleaseWorkflow(approved_batch.room)
+    publish = publish_root(approved_batch)
+    (publish / "sentinel.txt").write_text("old", encoding="utf-8")
+    with approved_batch.room.db.connect() as connection:
+        connection.execute("UPDATE batches SET updated_at=? WHERE batch_id=?", ("2000-01-01T00:00:00+00:00", approved_batch.batch_id))
+    before = snapshot(approved_batch)
+    prior_batch = approved_batch.room.db.one("SELECT * FROM batches WHERE batch_id=?", (approved_batch.batch_id,))
+    interruption = error_type("interrupted after SQLite commit")
+    interrupt_after_package_commit(approved_batch, monkeypatch, interruption)
+    with pytest.raises(error_type) as caught:
+        workflow.build_packages(approved_batch.batch_id)
+    assert caught.value is interruption
+    assert {path.name for path in publish.iterdir()} == {"sentinel.txt"}
+    assert (publish / "sentinel.txt").read_text() == "old"
+    assert approved_batch.room.db.one("SELECT * FROM batches WHERE batch_id=?", (approved_batch.batch_id,)) == prior_batch
+    assert snapshot(approved_batch) == before
+    assert not list(publish.parent.glob(".staging-publish-*"))
+    assert not list(publish.parent.glob(".previous-publish-*"))
+    assert workflow.build_packages(approved_batch.batch_id) == publish
+    assert approved_batch.room.db.one("SELECT status FROM batches WHERE batch_id=?", (approved_batch.batch_id,))["status"] == "PACKAGED"
+    assert {path.name for path in publish.iterdir()} == {*approved_batch.article_ids, "batch-manifest.json"}
+    after = snapshot(approved_batch)
+    assert {table: rows for table, rows in after.items() if table != "batches"} == {table: rows for table, rows in before.items() if table != "batches"}
+    assert not list(publish.parent.glob(".staging-publish-*"))
+    assert not list(publish.parent.glob(".previous-publish-*"))
+
+
+def test_package_refresh_failure_restores_prior_tree_and_batch_metadata(approved_batch, monkeypatch):
+    workflow = BatchReleaseWorkflow(approved_batch.room)
+    publish = publish_root(approved_batch)
+    (publish / "sentinel.txt").write_text("old", encoding="utf-8")
+    with approved_batch.room.db.connect() as connection:
+        connection.execute("UPDATE batches SET updated_at=? WHERE batch_id=?", ("2000-01-01T00:00:00+00:00", approved_batch.batch_id))
+    before = snapshot(approved_batch)
+    failure = OSError("workspace refresh failed")
+    def fail_refresh(*args):
+        raise failure
+    monkeypatch.setattr(workflow, "_refresh_workspaces", fail_refresh)
+    with pytest.raises(OSError) as caught:
+        workflow.build_packages(approved_batch.batch_id)
+    assert caught.value is failure
+    assert {path.name for path in publish.iterdir()} == {"sentinel.txt"}
+    assert snapshot(approved_batch) == before
+    assert not list(publish.parent.glob(".staging-publish-*"))
+    assert not list(publish.parent.glob(".previous-publish-*"))
+
+
+@pytest.mark.parametrize("compensation", ["database", "filesystem"])
+def test_package_reports_original_interruption_and_compensation_failure(approved_batch, monkeypatch, compensation):
+    import newsroom.batch_release as release
+
+    workflow = BatchReleaseWorkflow(approved_batch.room)
+    publish = publish_root(approved_batch)
+    (publish / "sentinel.txt").write_text("old", encoding="utf-8")
+    prior_batch = approved_batch.room.db.one("SELECT * FROM batches WHERE batch_id=?", (approved_batch.batch_id,))
+    interruption = KeyboardInterrupt("interrupted after SQLite commit")
+    if compensation == "database":
+        with approved_batch.room.db.connect() as connection:
+            connection.execute("CREATE TRIGGER reject_compensation BEFORE UPDATE ON batches "
+                               "WHEN NEW.status != 'PACKAGED' BEGIN SELECT RAISE(ABORT,'metadata restoration rejected'); END")
+    else:
+        original_replace = release.os.replace
+        def fail_restoration(source, destination):
+            if Path(source).parent.name.startswith(".previous-publish-"):
+                raise OSError("directory restoration rejected")
+            return original_replace(source, destination)
+        monkeypatch.setattr(release.os, "replace", fail_restoration)
+    interrupt_after_package_commit(approved_batch, monkeypatch, interruption)
+    with pytest.raises(BaseException) as caught:
+        workflow.build_packages(approved_batch.batch_id)
+    assert isinstance(caught.value, BaseExceptionGroup)
+    assert caught.value.exceptions[0] is interruption
+    assert len(caught.value.exceptions) == 2
+    if compensation == "database":
+        assert isinstance(caught.value.exceptions[1], sqlite3.IntegrityError)
+        assert "metadata restoration rejected" in str(caught.value.exceptions[1])
+        assert {path.name for path in publish.iterdir()} == {"sentinel.txt"}
+        assert approved_batch.room.db.one("SELECT status FROM batches WHERE batch_id=?", (approved_batch.batch_id,))["status"] == "PACKAGED"
+    else:
+        assert isinstance(caught.value.exceptions[1], OSError)
+        assert "directory restoration rejected" in str(caught.value.exceptions[1])
+        backups = list(publish.parent.glob(".previous-publish-*/publish/sentinel.txt"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == "old"
+        assert approved_batch.room.db.one("SELECT * FROM batches WHERE batch_id=?", (approved_batch.batch_id,)) == prior_batch
+    assert not list(publish.parent.glob(".staging-publish-*"))
