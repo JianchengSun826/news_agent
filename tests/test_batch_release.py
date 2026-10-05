@@ -208,6 +208,51 @@ def test_image_plan_failure_rolls_back_files_database_and_audits(all_pass_batch,
     assert_no_image_files(all_pass_batch)
 
 
+@pytest.mark.parametrize("interruption_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("stage", ["promotion", "database"])
+def test_image_plan_interruption_cleans_files_rolls_back_and_allows_retry(
+    all_pass_batch, tmp_path, monkeypatch, interruption_type, stage,
+):
+    import newsroom.batch_release as release
+
+    payload = image_plan(all_pass_batch, tmp_path)
+    plan_path = write_plan(tmp_path / "plan.json", payload)
+    before = snapshot(all_pass_batch)
+    interruption = interruption_type("image operation interrupted")
+    workflow = BatchReleaseWorkflow(all_pass_batch.room)
+    original = release.os.link if stage == "promotion" else all_pass_batch.room._transition
+    calls = 0
+
+    def interrupt_second(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if stage == "database":
+            # Complete real SQL writes, including the audit, before interruption.
+            result = original(*args, **kwargs)
+        if calls == 2:
+            raise interruption
+        if stage == "promotion":
+            result = original(*args, **kwargs)
+        return result
+
+    with monkeypatch.context() as patch:
+        if stage == "promotion":
+            patch.setattr(release.os, "link", interrupt_second)
+        else:
+            patch.setattr(all_pass_batch.room, "_transition", interrupt_second)
+        with pytest.raises(interruption_type) as caught:
+            workflow.apply_image_plan(all_pass_batch.batch_id, plan_path)
+
+    assert caught.value is interruption
+    assert snapshot(all_pass_batch) == before
+    assert_no_image_files(all_pass_batch)
+    result = workflow.apply_image_plan(all_pass_batch.batch_id, plan_path)
+    assert result["registered"] == 2
+    assert all(all_pass_batch.room.get_article(article_id)["status"] == "IMAGE_READY" for article_id in all_pass_batch.article_ids)
+    assert all_pass_batch.room.db.one("SELECT COUNT(*) AS count FROM images")["count"] == 2
+    assert not list((tmp_path / "workspace").rglob(".staging-images-*"))
+
+
 def test_image_plan_promotes_every_file_before_database_updates(all_pass_batch, tmp_path, monkeypatch):
     payload = image_plan(all_pass_batch, tmp_path)
     original = all_pass_batch.room._transition

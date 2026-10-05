@@ -105,7 +105,8 @@ class BatchReleaseWorkflow:
                         "batch downloaded image and original rights page confirmed",
                     )
                     images.append({"article_id": image.article_id, "image_id": image_id, "image_path": relative_path})
-        except Exception:
+        except BaseException:
+            # Interruptions must clean promoted files just as SQLite rolls back.
             for path in reversed(promoted):
                 path.unlink(missing_ok=True)
             raise
