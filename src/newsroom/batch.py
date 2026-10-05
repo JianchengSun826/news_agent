@@ -77,7 +77,7 @@ class BatchWorkflow:
             article = self.room.db.one(
                 "SELECT * FROM articles WHERE candidate_id=?", (candidate["candidate_id"],)
             )
-            item_status, duplicate_classification = self._process_candidate(candidate, article)
+            item_status, duplicate_classification = self._process_candidate(candidate, article, batch_id)
             if article is None:
                 article = self.room.db.one(
                     "SELECT * FROM articles WHERE candidate_id=?", (candidate["candidate_id"],)
@@ -720,7 +720,7 @@ class BatchWorkflow:
                     "duplicate override is required before including POSSIBLE_DUPLICATE or DUPLICATE"
                 )
             self.room.select_candidate(candidate_id, actor, reason)
-            article = self.room.create_brief(candidate_id)
+            article = self.room.create_brief(candidate_id, owning_batch_id=batch_id)
             article_id = article["article_id"]
             item_status = "READY_FOR_CONTENT"
 
@@ -781,7 +781,7 @@ class BatchWorkflow:
         return [item.strip() for item in (value or "").split("|") if item.strip()]
 
     def _process_candidate(
-        self, candidate: dict[str, Any], article: dict[str, Any] | None
+        self, candidate: dict[str, Any], article: dict[str, Any] | None, batch_id: str
     ) -> tuple[str, str | None]:
         if article:
             if article["status"] == "SELECTED":
@@ -790,7 +790,7 @@ class BatchWorkflow:
         if candidate["status"] == "REJECTED":
             return "EXCLUDED", candidate["duplicate_status"]
         if candidate["status"] == "SELECTED":
-            self.room.create_brief(candidate["candidate_id"])
+            self.room.create_brief(candidate["candidate_id"], owning_batch_id=batch_id)
             return "READY_FOR_CONTENT", candidate["duplicate_status"]
         if candidate["status"] == "CANDIDATE":
             duplicate = self.room.check_duplicate(candidate["candidate_id"])
@@ -805,7 +805,7 @@ class BatchWorkflow:
         self.room.select_candidate(
             candidate["candidate_id"], "system", "batch auto-selected deterministic NEW candidate"
         )
-        self.room.create_brief(candidate["candidate_id"])
+        self.room.create_brief(candidate["candidate_id"], owning_batch_id=batch_id)
         return "READY_FOR_CONTENT", classification
 
     def _write_content_request(self, batch_id: str) -> Path | None:

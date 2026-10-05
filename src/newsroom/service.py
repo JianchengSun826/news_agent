@@ -167,7 +167,7 @@ class Newsroom:
             connection.execute("UPDATE candidates SET status='REJECTED',rejection_reason=?,updated_at=? WHERE candidate_id=?", (reason, utc_now(), candidate_id))
             self._transition(connection, "candidate", candidate_id, candidate["status"], "REJECTED", actor, reason)
 
-    def create_brief(self, candidate_id: str) -> dict[str, Any]:
+    def create_brief(self, candidate_id: str, owning_batch_id: str | None = None) -> dict[str, Any]:
         candidate = self.get_candidate(candidate_id)
         if candidate["status"] != "SELECTED":
             raise WorkflowError("brief creation requires SELECTED")
@@ -179,9 +179,9 @@ class Newsroom:
         path.write_text(self._brief_template(candidate), encoding="utf-8")
         with self.db.connect() as connection:
             connection.execute(
-                """INSERT INTO articles(article_id,candidate_id,event_id,status,event_date,core_fact,topic,subtopic,company,product,event_type,keywords,primary_source,secondary_sources,research_brief_path,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (article_id,candidate_id,candidate["event_id"],"SELECTED",candidate["event_date"],candidate["core_fact"],candidate["topic"],candidate["subtopic"],candidate["company"],candidate["product"],candidate["event_type"],json.dumps(candidate["keywords"],ensure_ascii=False),candidate["primary_source"],json.dumps(candidate["secondary_sources"],ensure_ascii=False),str(path.relative_to(self.root)),now,now),
+                """INSERT INTO articles(article_id,candidate_id,event_id,status,event_date,core_fact,topic,subtopic,company,product,event_type,keywords,primary_source,secondary_sources,research_brief_path,created_at,updated_at,owning_batch_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (article_id,candidate_id,candidate["event_id"],"SELECTED",candidate["event_date"],candidate["core_fact"],candidate["topic"],candidate["subtopic"],candidate["company"],candidate["product"],candidate["event_type"],json.dumps(candidate["keywords"],ensure_ascii=False),candidate["primary_source"],json.dumps(candidate["secondary_sources"],ensure_ascii=False),str(path.relative_to(self.root)),now,now,owning_batch_id),
             )
             self._transition(connection, "article", article_id, None, "SELECTED", "system", "research brief created after human selection")
         return self.get_article(article_id)

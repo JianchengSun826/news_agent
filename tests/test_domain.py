@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from newsroom.db import Database
+from newsroom.db import SCHEMA, Database
 from newsroom.dedup import classify_candidate
 from newsroom.models import CandidateInput, make_event_id
 from newsroom.service import Newsroom, WorkflowError
@@ -280,7 +280,7 @@ def test_init_migrates_v1_images_table_to_store_image_path(tmp_path: Path):
         columns = {row[1] for row in connection.execute("PRAGMA table_info(images)")}
         versions = [row[0] for row in connection.execute("SELECT version FROM schema_version ORDER BY version")]
     assert "image_path" in columns
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
 
 
 def build_v2_database(tmp_path: Path, *, duplicate_candidates: bool = False) -> Path:
@@ -314,7 +314,7 @@ def build_v2_database(tmp_path: Path, *, duplicate_candidates: bool = False) -> 
     return db_path
 
 
-def test_init_migrates_v2_to_v3_and_creates_backup(tmp_path: Path):
+def test_init_migrates_v2_to_v4_and_creates_backup(tmp_path: Path):
     db_path = build_v2_database(tmp_path)
 
     Database(db_path).initialize("2026-10-05T00:00:00+00:00")
@@ -330,7 +330,7 @@ def test_init_migrates_v2_to_v3_and_creates_backup(tmp_path: Path):
     assert "candidate_fingerprint" in candidate_columns
     assert {"fact_check_outcome", "revision_number"} <= article_columns
     assert {"image_candidate_id", "rights_basis", "rights_statement"} <= image_columns
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
     assert fingerprint
     assert len(list((tmp_path / "data" / "backups").glob("newsroom-v2-*.db"))) == 1
 
@@ -344,7 +344,7 @@ def test_migration_reports_fingerprint_collisions_without_merging(tmp_path: Path
     assert len(list((tmp_path / "data" / "backups").glob("*.db"))) == 1
 
 
-def test_version_3_init_is_idempotent_and_does_not_create_extra_backup(tmp_path: Path):
+def test_version_4_init_is_idempotent_and_does_not_create_extra_backup(tmp_path: Path):
     room = Newsroom(tmp_path)
 
     room.init()
@@ -378,3 +378,70 @@ def test_reject_records_reason_in_candidate_and_audit(newsroom: Newsroom):
     assert stored["status"] == "REJECTED"
     assert stored["rejection_reason"] == "insufficient reader value"
     assert newsroom.audit(candidate["candidate_id"])[-1]["to_status"] == "REJECTED"
+
+
+def build_v3_database(tmp_path: Path) -> Path:
+    db_path = tmp_path / "data" / "newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    # Reproduce the v3 schema without either v4 column.
+    schema = SCHEMA.replace("  owning_batch_id TEXT REFERENCES batches(batch_id),\n", "")
+    schema = schema.replace("  workspace_version INTEGER NOT NULL DEFAULT 0,\n", "")
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(schema)
+        connection.execute(
+            "INSERT INTO schema_version VALUES (3, '2026-10-04T00:00:00+00:00')"
+        )
+        connection.execute(
+            "INSERT INTO batches(batch_id,source_filename,source_sha256,status,created_at,updated_at) "
+            "VALUES ('batch-legacy','legacy.csv','legacy-hash','PREPARING','old','old')"
+        )
+    return db_path
+
+
+def test_v3_upgrade_adds_workspace_columns_and_backup(tmp_path: Path):
+    db_path = build_v3_database(tmp_path)
+    database = Database(db_path)
+    candidate = add_candidate(Newsroom(tmp_path))
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO articles(article_id,candidate_id,event_id,status,event_date,core_fact,"
+            "topic,subtopic,company,product,event_type,keywords,primary_source,secondary_sources,"
+            "created_at,updated_at) "
+            "SELECT 'art-legacy',candidate_id,'event-legacy','SELECTED',event_date,core_fact,"
+            "topic,subtopic,company,product,event_type,keywords,primary_source,secondary_sources,"
+            "created_at,updated_at FROM candidates WHERE candidate_id=?",
+            (candidate["candidate_id"],),
+        )
+
+    database.initialize("2026-10-05T00:00:00+00:00")
+
+    assert "owning_batch_id" in {row["name"] for row in database.all("PRAGMA table_info(articles)")}
+    assert "workspace_version" in {row["name"] for row in database.all("PRAGMA table_info(batches)")}
+    assert database.one("SELECT workspace_version FROM batches")["workspace_version"] == 0
+    legacy_article = database.one("SELECT * FROM articles WHERE article_id='art-legacy'")
+    assert legacy_article["owning_batch_id"] is None
+    assert legacy_article["candidate_id"] == candidate["candidate_id"]
+    assert legacy_article["core_fact"] == "OpenAI released Codex Desktop on 2026-09-28."
+    assert database.one("SELECT MAX(version) AS version FROM schema_version")["version"] == 4
+    backups = list((db_path.parent / "backups").glob("newsroom-v3-*.db"))
+    assert len(backups) == 1
+    backup = Database(backups[0])
+    assert backup.one("SELECT MAX(version) AS version FROM schema_version")["version"] == 3
+    assert "owning_batch_id" not in {row["name"] for row in backup.all("PRAGMA table_info(articles)")}
+    original_backup = backups[0].read_bytes()
+
+    database.initialize("2026-10-06T00:00:00+00:00")
+
+    assert list((db_path.parent / "backups").glob("*.db")) == backups
+    assert backups[0].read_bytes() == original_backup
+    assert database.one("SELECT COUNT(*) AS count FROM batches")["count"] == 1
+
+
+def test_manual_article_has_no_owning_batch(newsroom: Newsroom):
+    candidate = add_candidate(newsroom)
+    newsroom.check_duplicate(candidate["candidate_id"])
+    newsroom.select_candidate(candidate["candidate_id"], "editor", "selected manually")
+
+    article = newsroom.create_brief(candidate["candidate_id"])
+
+    assert article["owning_batch_id"] is None

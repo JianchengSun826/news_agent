@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS candidates (
 CREATE TABLE IF NOT EXISTS articles (
   article_id TEXT PRIMARY KEY,
   candidate_id TEXT NOT NULL UNIQUE REFERENCES candidates(candidate_id),
+  owning_batch_id TEXT REFERENCES batches(batch_id),
   event_id TEXT NOT NULL,
   status TEXT NOT NULL,
   publish_date TEXT,
@@ -117,6 +118,7 @@ CREATE TABLE IF NOT EXISTS batches (
   batch_id TEXT PRIMARY KEY,
   source_filename TEXT NOT NULL,
   source_sha256 TEXT NOT NULL UNIQUE,
+  workspace_version INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
   content_request_id TEXT,
   fact_check_request_id TEXT,
@@ -197,7 +199,7 @@ class Database:
             row = connection.execute("SELECT MAX(version) FROM schema_version").fetchone()
             return int(row[0] or 0)
 
-    def _backup_before_v3(self, version: int, applied_at: str) -> None:
+    def _backup_before_upgrade(self, version: int, applied_at: str) -> None:
         backup_dir = self.path.parent / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         stamp = re.sub(r"[^0-9A-Za-z]+", "", applied_at)
@@ -237,8 +239,8 @@ class Database:
     def initialize(self, applied_at: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         existing_version = self._existing_version()
-        if existing_version in {1, 2}:
-            self._backup_before_v3(existing_version, applied_at)
+        if existing_version in {1, 2, 3}:
+            self._backup_before_upgrade(existing_version, applied_at)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             connection.execute(
@@ -264,6 +266,13 @@ class Database:
             self._backfill_candidate_fingerprints(connection)
             connection.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (3, ?)",
+                (applied_at,),
+            )
+
+            self._add_column(connection, "articles", "owning_batch_id TEXT REFERENCES batches(batch_id)")
+            self._add_column(connection, "batches", "workspace_version INTEGER NOT NULL DEFAULT 0")
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (4, ?)",
                 (applied_at,),
             )
 

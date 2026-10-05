@@ -1,12 +1,12 @@
 # Data Model
 
-SQLite schema version 3 is created or upgraded by `newsroom init`. Existing v1/v2 databases are copied to `data/backups/` before migration. SQLite remains canonical; CSV, JSON, and Markdown are interchange or artifact formats.
+SQLite schema version 4 is created or upgraded by `newsroom init`. Existing v1/v2/v3 databases are copied to `data/backups/` before migration. SQLite remains canonical; CSV, JSON, and Markdown are interchange or artifact formats.
 
 ## Core records
 
 `candidates` stores discovery metadata, normalized event fields, source URLs, duplicate state, selection state, audit timestamps, and `candidate_fingerprint`. The SHA-256 fingerprint canonicalizes event date, company, product, event type, core fact, and primary URL so a new CSV can reuse an old candidate.
 
-`articles` links one candidate to at most one article. It stores workflow status, event metadata, current artifact paths, title/slug, `fact_check_outcome`, `revision_number`, selected `image_id`, publication data, and timestamps. Research, article, and fact-check files use `-vN.md`; current paths point to the active version.
+`articles` links one candidate to at most one article. It stores workflow status, event metadata, current artifact paths, title/slug, `fact_check_outcome`, `revision_number`, selected `image_id`, publication data, and timestamps. `owning_batch_id` references the batch that first created an article and is immutable through the workflow. New articles created during batch preparation or duplicate inclusion store that batch ID; reusing an article never transfers ownership. Legacy and manually created articles retain nullable ownership, including when later reused by a batch. Research, article, and fact-check files use `-vN.md`; current paths point to the active version.
 
 `images` is the permanent publication record. Legacy manual/AI provenance remains supported. Batch-selected images additionally copy `image_candidate_id`, rights basis, rights statement, landing page, creator, license, rights URL, and attribution so a publication package does not depend on transient model output.
 
@@ -14,7 +14,7 @@ SQLite schema version 3 is created or upgraded by `newsroom init`. Existing v1/v
 
 ## Batch records
 
-`batches` stores `batch_id`, original filename and byte SHA-256, aggregate status, latest content request ID, latest fact-check request ID, and timestamps. An identical file hash returns the existing batch.
+`batches` stores `batch_id`, original filename and byte SHA-256, aggregate status, latest content request ID, latest fact-check request ID, and timestamps. `workspace_version` is a non-null integer starting at 0, recording the batch workspace layout version. An identical file hash returns the existing batch.
 
 `batch_items` links each batch candidate to its reused or new article. It records deterministic duplicate classification, batch-specific status, content version, and the latest actionable error. Important statuses are `WAITING_DUPLICATE`, `READY_FOR_CONTENT`, `CONTENT_IMPORTED`, `FACT_CHECKED`, `NEEDS_REVISION`, `REUSED_COMPLETE`, and `EXCLUDED`.
 

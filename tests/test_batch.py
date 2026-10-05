@@ -126,6 +126,7 @@ def test_prepare_reuses_old_candidate_and_completed_article(newsroom: Newsroom, 
     assert item["candidate_id"] == candidate["candidate_id"]
     assert item["article_id"] == article["article_id"]
     assert item["item_status"] == "REUSED_COMPLETE"
+    assert newsroom.get_article(article["article_id"])["owning_batch_id"] is None
     assert newsroom.db.one("SELECT COUNT(*) AS count FROM candidates")["count"] == 1
 
 
@@ -147,6 +148,10 @@ def test_byte_different_csv_reuses_candidates_but_creates_new_batch(newsroom: Ne
     two = BatchWorkflow(newsroom).prepare(second_path)
 
     assert one["batch_id"] != two["batch_id"]
+    article = newsroom.get_article(one["items"][0]["article_id"])
+    assert article["owning_batch_id"] == one["batch_id"]
+    recreated = newsroom.create_brief(article["candidate_id"], owning_batch_id=two["batch_id"])
+    assert recreated["owning_batch_id"] == one["batch_id"]
     assert newsroom.db.one("SELECT COUNT(*) AS count FROM candidates")["count"] == 1
 
 
@@ -229,6 +234,7 @@ def test_resolve_includes_possible_duplicate_after_explicit_override(
     )
     assert item["item_status"] == "READY_FOR_CONTENT"
     assert item["article_id"]
+    assert newsroom.get_article(item["article_id"])["owning_batch_id"] == result["batch_id"]
 
 
 @pytest.fixture
@@ -496,3 +502,21 @@ def test_second_round_rejects_first_round_fact_check_result(
 
     with pytest.raises(WorkflowError, match="request_id"):
         revised_batch.workflow.import_fact_checks(revised_batch.batch_id, stale)
+
+
+@pytest.mark.parametrize("preselected", [False, True])
+def test_batch_created_article_records_owning_batch(
+    newsroom: Newsroom, tmp_path: Path, preselected: bool
+):
+    source = write_batch_csv(tmp_path / "batch.csv", [candidate_row()])
+    if preselected:
+        candidate_id = newsroom.import_candidates(source)[0]
+        newsroom.check_duplicate(candidate_id)
+        newsroom.select_candidate(candidate_id, "editor", "selected before batch preparation")
+
+    prepared = BatchWorkflow(newsroom).prepare(source)
+
+    article = newsroom.get_article(prepared["items"][0]["article_id"])
+    assert article["owning_batch_id"] == prepared["batch_id"]
+    batch = newsroom.db.one("SELECT workspace_version FROM batches WHERE batch_id=?", (prepared["batch_id"],))
+    assert batch["workspace_version"] == 0
