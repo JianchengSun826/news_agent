@@ -8,29 +8,19 @@ import typer
 from pydantic import ValidationError
 
 from .batch import BatchWorkflow
+from .batch_release import BatchReleaseWorkflow
 from .service import Newsroom, WorkflowError
+from .workspace import BatchWorkspace
 
 T = TypeVar("T")
 
 app = typer.Typer(help="Human-in-the-loop technology newsroom", no_args_is_help=True)
 candidate_app = typer.Typer(help="Manage news candidates", no_args_is_help=True)
-brief_app = typer.Typer(help="Manage research briefs", no_args_is_help=True)
-article_app = typer.Typer(help="Register article drafts", no_args_is_help=True)
-fact_check_app = typer.Typer(help="Register manual fact checks", no_args_is_help=True)
-image_app = typer.Typer(help="Register image rights and provenance", no_args_is_help=True)
 published_app = typer.Typer(help="Query published articles", no_args_is_help=True)
-prompt_app = typer.Typer(help="Create manual provider prompts", no_args_is_help=True)
-research_app = typer.Typer(help="Register manual research", no_args_is_help=True)
 batch_app = typer.Typer(help="Process a reviewed CSV with manual Claude batch handoffs", no_args_is_help=True)
 
 app.add_typer(candidate_app, name="candidate")
-app.add_typer(brief_app, name="brief")
-app.add_typer(article_app, name="article")
-app.add_typer(fact_check_app, name="fact-check")
-app.add_typer(image_app, name="image")
 app.add_typer(published_app, name="published")
-app.add_typer(prompt_app, name="prompt")
-app.add_typer(research_app, name="research")
 app.add_typer(batch_app, name="batch")
 
 CLAUDE_INSTRUCTION = "严格执行文件中的 instructions，完成全部条目，并生成其中指定的 output_file。"
@@ -171,6 +161,68 @@ def batch_revision_import(
     _json(_with_claude_instruction(result))
 
 
+@batch_app.command("image-plan")
+def batch_image_plan(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    plan_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+) -> None:
+    """Validate all confirmed image selections and register local files together."""
+    _json(_run(lambda: BatchReleaseWorkflow(_room(ctx)).apply_image_plan(batch_id, plan_json)))
+
+
+@batch_app.command("review")
+def batch_review(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    actor: Annotated[str, typer.Option()],
+    reason: Annotated[str, typer.Option()],
+) -> None:
+    """Record human review for every active article in the batch."""
+    _json(_run(lambda: BatchReleaseWorkflow(_room(ctx)).review(batch_id, actor, reason)))
+
+
+@batch_app.command("approve")
+def batch_approve(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    actor: Annotated[str, typer.Option()],
+    reason: Annotated[str, typer.Option()],
+) -> None:
+    """Record final human approval for every active article in the batch."""
+    _json(_run(lambda: BatchReleaseWorkflow(_room(ctx)).approve(batch_id, actor, reason)))
+
+
+@batch_app.command("publish-packages")
+def batch_publish_packages(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+) -> None:
+    """Build validated publication packages for the whole approved batch."""
+    path = _run(lambda: BatchReleaseWorkflow(_room(ctx)).build_packages(batch_id))
+    _json({"batch_id": batch_id, "path": str(path)})
+
+
+@batch_app.command("publish-register")
+def batch_publish_register(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    result_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    actor: Annotated[str, typer.Option()],
+) -> None:
+    """Register the complete set of URLs after human CMS publication."""
+    _json(_run(lambda: BatchReleaseWorkflow(_room(ctx)).register_publications(batch_id, result_json, actor)))
+
+
+@batch_app.command("refresh-workspace")
+def batch_refresh_workspace(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+) -> None:
+    """Rebuild local workspace views from canonical SQLite state."""
+    _json(_run(lambda: BatchWorkspace(_room(ctx)).refresh(batch_id)))
+
+
 @candidate_app.command("list")
 def candidate_list(ctx: typer.Context) -> None:
     """List candidates in editorial priority order."""
@@ -221,75 +273,6 @@ def duplicate_check(ctx: typer.Context, candidate_id: Annotated[str, typer.Argum
         _run(lambda: room.override_duplicate(candidate_id, override, reason, actor))
         result["override"] = override
     _json(result)
-
-
-@brief_app.command("create")
-def brief_create(ctx: typer.Context, candidate_id: Annotated[str, typer.Argument(metavar="ID")]) -> None:
-    _json(_run(lambda: _room(ctx).create_brief(candidate_id)))
-
-
-@prompt_app.command("create")
-def prompt_create(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], purpose: Annotated[str, typer.Option()]) -> None:
-    _json({"path": str(_run(lambda: _room(ctx).create_prompt(article_id, purpose)))})
-
-
-@research_app.command("register")
-def research_register(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], file: Annotated[Path, typer.Option(exists=True, dir_okay=False)]) -> None:
-    room = _room(ctx)
-    _run(lambda: room.register_research(article_id, file))
-    _json(room.get_article(article_id))
-
-
-@article_app.command("register")
-def article_register(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], file: Annotated[Path, typer.Option(exists=True, dir_okay=False)], title: Annotated[str, typer.Option()], slug: Annotated[str, typer.Option()]) -> None:
-    room = _room(ctx)
-    _run(lambda: room.register_article(article_id, file, title, slug))
-    _json(room.get_article(article_id))
-
-
-@fact_check_app.command("register")
-def fact_check_register(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], file: Annotated[Path, typer.Option(exists=True, dir_okay=False)]) -> None:
-    room = _room(ctx)
-    _run(lambda: room.register_fact_check(article_id, file))
-    _json(room.get_article(article_id))
-
-
-@image_app.command("register")
-def image_register(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], file: Annotated[Path, typer.Option(exists=True, dir_okay=False)], image_type: Annotated[str | None, typer.Option("--type")] = None, candidate: Annotated[str | None, typer.Option("--candidate")] = None, rights_confirmed: Annotated[bool, typer.Option("--rights-confirmed")] = False, source_url: Annotated[str | None, typer.Option()] = None, creator: Annotated[str | None, typer.Option()] = None, license_name: Annotated[str | None, typer.Option("--license")] = None, license_url: Annotated[str | None, typer.Option()] = None, attribution: Annotated[str | None, typer.Option()] = None, ai_provider: Annotated[str | None, typer.Option()] = None, ai_model: Annotated[str | None, typer.Option()] = None, prompt_path: Annotated[str | None, typer.Option()] = None) -> None:
-    image_id = _run(lambda: _room(ctx).register_image(article_id, image_type=image_type, image_file=file, source_url=source_url, creator=creator, license=license_name, license_url=license_url, attribution_text=attribution, ai_provider=ai_provider, ai_model=ai_model, prompt_path=prompt_path, image_candidate_id=candidate, rights_confirmed=rights_confirmed))
-    _json({"image_id": image_id})
-
-
-@image_app.command("candidates")
-def image_candidates(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")]) -> None:
-    """List image options returned by the Claude content batch."""
-    _json(_run(lambda: _room(ctx).list_image_candidates(article_id)))
-
-
-@app.command("review")
-def review(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], actor: Annotated[str, typer.Option()], reason: Annotated[str, typer.Option()]) -> None:
-    room = _room(ctx)
-    _run(lambda: room.complete_review(article_id, actor, reason))
-    _json(room.get_article(article_id))
-
-
-@app.command("approve")
-def approve(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], actor: Annotated[str, typer.Option()], reason: Annotated[str, typer.Option()]) -> None:
-    room = _room(ctx)
-    _run(lambda: room.approve(article_id, actor, reason))
-    _json(room.get_article(article_id))
-
-
-@app.command("publish-package")
-def publish_package(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")]) -> None:
-    _json({"path": str(_run(lambda: _room(ctx).create_publication_package(article_id)))})
-
-
-@app.command("publish")
-def publish(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], actor: Annotated[str, typer.Option()], url: Annotated[str | None, typer.Option()] = None) -> None:
-    room = _room(ctx)
-    _run(lambda: room.publish(article_id, actor, url))
-    _json(room.get_article(article_id))
 
 
 @published_app.command("list")

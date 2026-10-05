@@ -120,53 +120,62 @@ CLI 保留 v1，写入 `research-brief-v2.md` 和 `article-v2.md`，并自动生
 
 ## 7. 人工确认并登记图片
 
-查看某篇文章的候选：
-
-```bash
-uv run newsroom image candidates ARTICLE_ID
-```
-
-对选中的 `image_candidate_id`：
+在批次目录的 `articles/ARTICLE_ID/image-candidates.json` 查看图片候选。对每篇有效文章选中的 `image_candidate_id`：
 
 1. 打开 `landing_page_url` 和 `rights_url`；
-2. 确认作者、许可、署名要求与 CLI 记录一致；
+2. 确认作者、许可、署名要求与记录一致；
 3. 人工下载原图并检查画面、格式和分辨率；
-4. 显式确认权利并登记：
+4. 把全部选择写入一个 JSON，其中 `image_file` 为人工下载文件的本地路径，`rights_confirmed` 必须显式为 `true`：
 
-```bash
-uv run newsroom image register ARTICLE_ID \
-  --candidate IMAGE_CANDIDATE_ID \
-  --file ~/Downloads/hero.jpg \
-  --rights-confirmed
+```json
+{
+  "schema_version": 1,
+  "batch_id": "BATCH_ID",
+  "items": [
+    {
+      "article_id": "ARTICLE_ID",
+      "image_candidate_id": "IMAGE_CANDIDATE_ID",
+      "image_file": "/absolute/path/to/hero.jpg",
+      "rights_confirmed": true
+    }
+  ]
+}
 ```
 
-CLI 不下载图片，也不替编辑判断版权。候选属于另一篇文章、未提供文件或未写 `--rights-confirmed` 时会拒绝登记。
+```bash
+uv run newsroom batch image-plan BATCH_ID ~/Downloads/BATCH_ID-image-plan.json
+```
+
+CLI 不下载图片，也不替编辑判断版权。缺少有效文章、候选属于另一篇文章、缺少本地文件或未显式确认权利时，整批拒绝登记。
 
 ## 8. 审核、批准、发布包和发布登记
 
 整批发布闸门以 SQLite 中的有效条目为准：`EXCLUDED` 与 `REUSED_COMPLETE` 不阻塞操作、不改变文章状态，也不接收当前批次的发布包或要求发布 URL。整批审核要求全部有效文章为 `IMAGE_READY`；整批批准要求全部为 `REVIEWED`。先验证整批，再在一个事务内记录相同审核人及理由的文章状态转换。
 
-整批发布包要求全部有效文章为 `APPROVED`。系统先暂存并验证各篇当前版本的文章、研究简报、事实核验、图片、metadata、许可、来源及 checklist，以及 `batch-manifest.json`，再替换 `workspace/batches/BATCH_ID/publish/`。失败或中断会保留之前的发布目录并回滚数据库；成功后批次为 `PACKAGED`，文章仍为 `APPROVED`。人工上传后，以包含 `schema_version: 1`、正确 `batch_id` 和 `items`（每项为 `article_id`、HTTP(S) `article_url`）的 JSON 登记整批发布结果；文章集合必须恰好对应全部有效文章，缺失、额外或重复项均整批拒绝。成功登记在一个事务内更新文章 URL、时间、审计及 `PUBLISHED` 状态。
+整批发布包要求全部有效文章为 `APPROVED`。系统先暂存并验证各篇当前版本的文章、研究简报、事实核验、图片、metadata、许可、来源及 checklist，以及 `batch-manifest.json`，再替换 `workspace/batches/BATCH_ID/publish/`。失败或中断会保留之前的发布目录并回滚数据库；成功后批次为 `PACKAGED`，文章仍为 `APPROVED`。数据库提交和工作区刷新成功后，旧包备份清理若失败，命令仍返回成功；残留的 `.previous-publish-*` 只是不作为当前发布包的恢复数据。人工上传后，以包含 `schema_version: 1`、正确 `batch_id` 和 `items`（每项为 `article_id`、HTTP(S) `article_url`）的 JSON 登记整批发布结果；文章集合必须恰好对应全部有效文章，缺失、额外或重复项均整批拒绝。成功登记在一个事务内更新文章 URL、时间、审计及 `PUBLISHED` 状态。
 
 ```bash
-uv run newsroom review ARTICLE_ID \
+uv run newsroom batch review BATCH_ID \
   --actor editor --reason "已检查文章、核验报告、图片与权利页面"
 
-uv run newsroom approve ARTICLE_ID \
+uv run newsroom batch approve BATCH_ID \
   --actor editor --reason "当前版本及发布素材已确认"
 
-uv run newsroom publish-package ARTICLE_ID
+uv run newsroom batch publish-packages BATCH_ID
 ```
 
-发布包位于 `output/ARTICLE_ID/`，包含当前版本的 `article.md`、Research Brief、fact-check、图片、来源、metadata、图片权利记录和 checklist。人工上传到 CMS 后，用真实 URL 登记：
+发布包位于 `workspace/batches/BATCH_ID/publish/ARTICLE_ID/`，包含当前版本的 `article.md`、Research Brief、fact-check、图片、来源、metadata、图片权利记录和 checklist。人工上传到 CMS 后，用真实 URL 登记：
 
 ```bash
-uv run newsroom publish ARTICLE_ID \
-  --actor editor --url "https://your-site.example/article-slug"
+uv run newsroom batch publish-register BATCH_ID \
+  ~/Downloads/BATCH_ID-publication-result.json --actor editor
 
 uv run newsroom published list
 uv run newsroom stats
+uv run newsroom batch refresh-workspace BATCH_ID
 ```
+
+选择后的受支持 CLI 操作统一使用 `batch`；单篇文章服务仅保留为内部恢复和构建辅助，不再注册为用户命令。`refresh-workspace` 从 SQLite 重建工作区视图，不改变流程状态。
 
 仍需人工完成的步骤只有：Sheet 来源审核、重复项歧义判断、两个 Claude 文件交接、图片权利页与文件检查、最终编辑批准、CMS 上传和真实 URL 登记。
 

@@ -92,6 +92,9 @@ def test_cli_imports_primary_only_candidate_csv(tmp_path: Path):
 
 
 def test_typer_exposes_required_nested_commands():
-    for command in (["candidate", "add", "--help"], ["brief", "create", "--help"], ["article", "register", "--help"], ["fact-check", "register", "--help"], ["image", "register", "--help"], ["published", "list", "--help"]):
+    for command in (["candidate", action, "--help"] for action in ("add", "import", "export", "list", "show", "select", "reject")):
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+    for command in (["duplicate-check", "--help"], ["published", "list", "--help"], ["stats", "--help"]):
         result = runner.invoke(app, list(command))
         assert result.exit_code == 0, result.output

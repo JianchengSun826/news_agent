@@ -3,11 +3,19 @@ from __future__ import annotations
 import csv
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from typer.main import get_command
 
 from typer.testing import CliRunner
 
 from newsroom.cli import app
 from newsroom.service import Newsroom
+
+from test_batch import (
+    newsroom, prepared_batch, write_content_result, write_fact_check_result,
+)
 
 
 runner = CliRunner()
@@ -52,93 +60,196 @@ def write_candidate_csv(path: Path) -> Path:
     return path
 
 
-def batch_image_workspace(tmp_path: Path) -> tuple[Path, str, Path]:
-    room = Newsroom(tmp_path)
-    room.init()
-    candidate = room.add_candidate(
-        candidate_title="Example launches Tool",
-        core_fact="Example launched Tool on 2026-10-05.",
-        event_date="2026-10-05",
-        company="Example",
-        product="Tool",
-        topic="AI",
-        subtopic="Developer Tools",
-        event_type="launch",
-        keywords=["example", "tool"],
-        primary_source="https://example.com/tool",
-        secondary_sources=[],
-        discovered_from="test",
-        priority=4,
-    )
-    room.check_duplicate(candidate["candidate_id"])
-    room.select_candidate(candidate["candidate_id"], "editor", "test selection")
-    article = room.create_brief(candidate["candidate_id"])
-    now = "2026-10-05T00:00:00+00:00"
-    with room.db.connect() as connection:
-        connection.execute(
-            "UPDATE articles SET status='FACT_CHECKED' WHERE article_id=?",
-            (article["article_id"],),
-        )
-        connection.execute(
-            "INSERT INTO batches(batch_id,source_filename,source_sha256,status,created_at,updated_at) "
-            "VALUES ('batch-cli','test.csv','batch-cli','READY_FOR_IMAGE',?,?)",
-            (now, now),
-        )
-        connection.execute(
-            "INSERT INTO image_candidates(image_candidate_id,batch_id,article_id,landing_page_url,"
-            "creator,rights_basis,license_name,rights_url,rights_statement,attribution_required,"
-            "attribution_text,relevance,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                "imgcand-cli",
-                "batch-cli",
-                article["article_id"],
-                "https://images.example.org/tool",
-                "Example Team",
-                "OPEN_LICENSE",
-                "CC BY 4.0",
-                "https://creativecommons.org/licenses/by/4.0/",
-                "Original page declares CC BY 4.0.",
-                1,
-                "Example Team / CC BY 4.0",
-                "Product image",
-                now,
-                now,
-            ),
-        )
-    image_file = tmp_path / "downloaded.jpg"
-    image_file.write_bytes(b"jpeg")
-    return tmp_path, article["article_id"], image_file
+def test_cli_exposes_only_batch_post_selection_workflow():
+    help_result = runner.invoke(app, ["--help"])
+    assert help_result.exit_code == 0, help_result.output
+    commands = set(get_command(app).commands)
+    assert commands == {"init", "candidate", "duplicate-check", "batch", "published", "stats"}
+    for command in (
+        "image-plan", "review", "approve", "publish-packages",
+        "publish-register", "refresh-workspace",
+    ):
+        result = runner.invoke(app, ["batch", command, "--help"])
+        assert result.exit_code == 0, result.output
 
 
-def test_cli_lists_and_registers_image_candidate(tmp_path: Path):
-    root, article_id, image_file = batch_image_workspace(tmp_path)
+@pytest.mark.parametrize("command", [
+    "brief", "prompt", "research", "article", "fact-check", "image",
+    "review", "approve", "publish-package", "publish",
+])
+def test_removed_commands_are_rejected_without_creating_files(tmp_path: Path, command: str):
+    result = runner.invoke(app, ["--root", str(tmp_path), command])
+    assert result.exit_code == 2
+    assert "No such command" in result.output
+    assert list(tmp_path.iterdir()) == []
 
-    listed = runner.invoke(
-        app, ["--root", str(root), "image", "candidates", article_id]
-    )
-    assert listed.exit_code == 0, listed.output
-    candidate_id = json.loads(listed.output)[0]["image_candidate_id"]
-    registered = runner.invoke(
-        app,
-        [
-            "--root",
-            str(root),
-            "image",
-            "register",
-            article_id,
-            "--candidate",
-            candidate_id,
-            "--file",
-            str(image_file),
-            "--rights-confirmed",
-        ],
-    )
 
-    assert registered.exit_code == 0, registered.output
-    image_id = json.loads(registered.output)["image_id"]
-    stored = Newsroom(root).db.one("SELECT * FROM images WHERE image_id=?", (image_id,))
-    assert stored["image_candidate_id"] == candidate_id
-    assert stored["rights_basis"] == "OPEN_LICENSE"
+@pytest.fixture
+def release_batch(prepared_batch: SimpleNamespace, tmp_path: Path) -> SimpleNamespace:
+    batch = prepared_batch
+    content = write_content_result(batch, tmp_path / "content-result.json")
+    result = invoke_batch(batch, "content-import", str(content))
+    assert result.exit_code == 0, result.output
+    batch.fact_request = json.loads(Path(json.loads(result.output)["fact_check_request_path"]).read_text())
+    checks = write_fact_check_result(batch, tmp_path / "checks.json", ["PASS", "PASS"])
+    result = invoke_batch(batch, "fact-check-import", str(checks))
+    assert result.exit_code == 0, result.output
+    image_items = []
+    for index, article_id in enumerate(batch.article_ids):
+        image_file = tmp_path / f"download-{index}.JPG"
+        image_file.write_bytes(f"local image {index}".encode())
+        image_items.append({
+            "article_id": article_id,
+            "image_candidate_id": batch.room.list_image_candidates(article_id)[0]["image_candidate_id"],
+            "image_file": str(image_file),
+            "rights_confirmed": True,
+        })
+    batch.image_plan = tmp_path / "images.json"
+    batch.image_plan.write_text(json.dumps({"schema_version": 1, "batch_id": batch.batch_id, "items": image_items}))
+    batch.publication_result = tmp_path / "publications.json"
+    batch.publication_result.write_text(json.dumps({
+        "schema_version": 1, "batch_id": batch.batch_id,
+        "items": [{"article_id": article_id, "article_url": f"https://news.example/{index}"}
+                  for index, article_id in enumerate(batch.article_ids)],
+    }))
+    return batch
+
+
+def invoke_batch(batch: SimpleNamespace, command: str, *args: str):
+    return runner.invoke(app, ["--root", str(batch.room.root), "batch", command, batch.batch_id, *args])
+
+
+def release_steps(batch: SimpleNamespace) -> list[tuple[str, list[str]]]:
+    return [
+        ("image-plan", [str(batch.image_plan)]),
+        ("review", ["--actor", "reviewer", "--reason", "checked whole batch"]),
+        ("approve", ["--actor", "approver", "--reason", "approved whole batch"]),
+        ("publish-packages", []),
+        ("publish-register", [str(batch.publication_result), "--actor", "publisher"]),
+    ]
+
+
+def workspace_snapshot(batch: SimpleNamespace) -> tuple[list[str], dict[str, bytes]]:
+    with batch.room.db.connect() as connection:
+        database = list(connection.iterdump())
+    files = {str(path.relative_to(batch.room.root)): path.read_bytes()
+             for path in batch.room.root.rglob("*") if path.is_file() and path != batch.room.db_path}
+    return database, files
+
+
+def test_cli_batch_release_sequence_and_workspace_refresh(release_batch: SimpleNamespace):
+    batch = release_batch
+    root = batch.room.root / "workspace/batches" / batch.batch_id
+    for (command, args), expected_state in zip(release_steps(batch), [
+        "IMAGE_READY", "REVIEWED", "APPROVED", "APPROVED", "PUBLISHED",
+    ], strict=True):
+        result = invoke_batch(batch, command, *args)
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["batch_id"] == batch.batch_id
+        assert all(batch.room.get_article(article_id)["status"] == expected_state for article_id in batch.article_ids)
+        if command == "image-plan":
+            assert payload["registered"] == 2
+            for item in payload["items"]:
+                image = batch.room.db.one("SELECT * FROM images WHERE image_id=?", (item["image_id"],))
+                assert image["rights_basis"] == "OFFICIAL_PRESS_LICENSE"
+                assert (batch.room.root / image["image_path"]).read_bytes().startswith(b"local image")
+        elif command in {"review", "approve"}:
+            key = "reviewed" if command == "review" else "approved"
+            assert payload[key] == 2
+            assert all(batch.room.audit(article_id)[-1]["actor"] == args[1] for article_id in batch.article_ids)
+        elif command == "publish-packages":
+            assert Path(payload["path"]) == root / "publish"
+            manifest = json.loads((root / "publish/batch-manifest.json").read_text())
+            assert {item["article_id"] for item in manifest["items"]} == set(batch.article_ids)
+            for article_id in batch.article_ids:
+                article = batch.room.get_article(article_id)
+                assert (root / "publish" / article_id / "article.md").read_bytes() == (batch.room.root / article["draft_path"]).read_bytes()
+                assert (root / "publish" / article_id / "hero.jpg").is_file()
+        else:
+            assert payload["published"] == 2
+            for index, article_id in enumerate(batch.article_ids):
+                article = batch.room.get_article(article_id)
+                assert article["article_url"] == f"https://news.example/{index}"
+                assert article["published_at"]
+
+    before = workspace_snapshot(batch)
+    (root / "batch-state.json").unlink()
+    result = invoke_batch(batch, "refresh-workspace")
+    assert result.exit_code == 0, result.output
+    state = json.loads(result.output)
+    assert state["batch_id"] == batch.batch_id
+    assert state["status"] == "PUBLISHED"
+    assert all(item["approval_state"] == "PUBLISHED" for item in state["items"])
+    assert json.loads((root / "batch-state.json").read_text()) == state
+    assert workspace_snapshot(batch) == before
+
+
+@pytest.mark.parametrize("command,argument_key,message", [
+    ("image-plan", "image_plan", "rights_confirmed"),
+    ("review", None, "IMAGE_READY"),
+    ("approve", None, "REVIEWED"),
+    ("publish-packages", None, "APPROVED"),
+    ("publish-register", "publication_result", "APPROVED"),
+])
+def test_cli_batch_release_errors_preserve_database_and_files(release_batch, command, argument_key, message):
+    batch = release_batch
+    if command == "image-plan":
+        payload = json.loads(batch.image_plan.read_text())
+        payload["items"][1]["rights_confirmed"] = False
+        batch.image_plan.write_text(json.dumps(payload))
+    args = [str(getattr(batch, argument_key))] if argument_key else []
+    if command in {"review", "approve"}:
+        args += ["--actor", "editor", "--reason", "checked batch"]
+    elif command == "publish-register":
+        args += ["--actor", "publisher"]
+    before = workspace_snapshot(batch)
+    result = invoke_batch(batch, command, *args)
+    assert result.exit_code == 2, result.output
+    assert message in result.output
+    assert workspace_snapshot(batch) == before
+
+
+@pytest.mark.parametrize("command", ["image-plan", "review", "approve", "publish-packages", "publish-register", "refresh-workspace"])
+def test_cli_batch_release_missing_batch_preserves_database_and_files(release_batch, command):
+    batch = release_batch
+    args = []
+    if command in {"image-plan", "publish-register"}:
+        args.append(str(batch.image_plan if command == "image-plan" else batch.publication_result))
+    if command in {"review", "approve"}:
+        args += ["--actor", "editor", "--reason", "checked batch"]
+    if command == "publish-register":
+        args += ["--actor", "publisher"]
+    before = workspace_snapshot(batch)
+    result = runner.invoke(app, ["--root", str(batch.room.root), "batch", command, "batch-missing", *args])
+    assert result.exit_code == 2, result.output
+    assert "batch not found: batch-missing" in result.output
+    assert workspace_snapshot(batch) == before
+
+
+@pytest.mark.parametrize("failure", ["actor", "reason", "publication_mapping"])
+def test_cli_batch_release_rejects_invalid_confirmation_without_mutation(release_batch, failure):
+    batch = release_batch
+    steps = release_steps(batch)
+    limit = 1 if failure != "publication_mapping" else 4
+    for command, args in steps[:limit]:
+        result = invoke_batch(batch, command, *args)
+        assert result.exit_code == 0, result.output
+    if failure == "publication_mapping":
+        payload = json.loads(batch.publication_result.read_text())
+        payload["items"].pop()
+        batch.publication_result.write_text(json.dumps(payload))
+        command, args = steps[-1]
+        message = "missing article IDs"
+    else:
+        command = "review"
+        args = ["--actor", "" if failure == "actor" else "editor", "--reason", "" if failure == "reason" else "checked batch"]
+        message = f"transition {failure} is required"
+    before = workspace_snapshot(batch)
+    result = invoke_batch(batch, command, *args)
+    assert result.exit_code == 2, result.output
+    assert message in result.output
+    assert workspace_snapshot(batch) == before
 
 
 def test_typer_exposes_batch_commands():
