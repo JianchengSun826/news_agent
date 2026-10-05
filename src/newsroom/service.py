@@ -261,10 +261,82 @@ class Newsroom:
         path = self._copy_artifact(article_id, source, "articles", "fact-check.md")
         self._advance_article(article_id, "DRAFTED", "FACT_CHECKED", "editor", "manual fact check registered", {"fact_check_path": path})
 
-    def register_image(self, article_id: str, *, image_type: str, image_file: Path | None = None, source_url: str | None = None, creator: str | None = None, license: str | None = None, license_url: str | None = None, attribution_text: str | None = None, ai_provider: str | None = None, ai_model: str | None = None, prompt_path: str | None = None, notes: str = "") -> str:
+    def list_image_candidates(self, article_id: str) -> list[dict[str, Any]]:
+        self.get_article(article_id)
+        return self.db.all(
+            "SELECT * FROM image_candidates WHERE article_id=? "
+            "ORDER BY CASE review_status WHEN 'SELECTED' THEN 0 ELSE 1 END,created_at,image_candidate_id",
+            (article_id,),
+        )
+
+    def register_image(self, article_id: str, *, image_type: str | None = None, image_file: Path | None = None, source_url: str | None = None, creator: str | None = None, license: str | None = None, license_url: str | None = None, attribution_text: str | None = None, ai_provider: str | None = None, ai_model: str | None = None, prompt_path: str | None = None, notes: str = "", image_candidate_id: str | None = None, rights_confirmed: bool = False) -> str:
         article = self.get_article(article_id)
         if article["status"] != "FACT_CHECKED":
             raise WorkflowError("image registration requires FACT_CHECKED")
+        if image_candidate_id:
+            candidate = self.db.one(
+                "SELECT * FROM image_candidates WHERE image_candidate_id=?",
+                (image_candidate_id,),
+            )
+            if not candidate:
+                raise WorkflowError(f"image candidate not found: {image_candidate_id}")
+            if candidate["article_id"] != article_id:
+                raise WorkflowError("image candidate belongs to a different article")
+            if not rights_confirmed:
+                raise WorkflowError(
+                    "--rights-confirmed is required after reviewing the original rights page"
+                )
+            if candidate["review_status"] == "SELECTED":
+                raise WorkflowError("image candidate is already selected")
+            if image_file is None:
+                raise WorkflowError("image file is required")
+            image_file = Path(image_file)
+            image_path = self._copy_artifact(
+                article_id, image_file, "images", f"hero{image_file.suffix.lower()}"
+            )
+            image_id = new_id("img")
+            now = utc_now()
+            with self.db.connect() as connection:
+                connection.execute(
+                    "INSERT INTO images(image_id,article_id,image_type,source_url,creator,license,"
+                    "license_url,attribution_text,image_path,image_candidate_id,rights_basis,"
+                    "rights_statement,downloaded_at,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        image_id,
+                        article_id,
+                        "LICENSED_SOURCE",
+                        candidate["landing_page_url"],
+                        candidate["creator"],
+                        candidate["license_name"] or candidate["rights_basis"],
+                        candidate["rights_url"],
+                        candidate["attribution_text"],
+                        image_path,
+                        image_candidate_id,
+                        candidate["rights_basis"],
+                        candidate["rights_statement"],
+                        now,
+                        notes,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE image_candidates SET review_status='SELECTED',updated_at=? "
+                    "WHERE image_candidate_id=?",
+                    (now, image_candidate_id),
+                )
+                connection.execute(
+                    "UPDATE articles SET image_id=?,status='IMAGE_READY',updated_at=? WHERE article_id=?",
+                    (image_id, now, article_id),
+                )
+                self._transition(
+                    connection,
+                    "article",
+                    article_id,
+                    "FACT_CHECKED",
+                    "IMAGE_READY",
+                    "editor",
+                    "downloaded image and original rights page confirmed",
+                )
+            return image_id
         try:
             image = ImageInput(image_type=image_type, source_url=source_url, creator=creator, license=license, license_url=license_url, attribution_text=attribution_text, ai_provider=ai_provider, ai_model=ai_model, prompt_path=prompt_path, notes=notes).model_dump(mode="json")
         except ValidationError as error:

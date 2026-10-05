@@ -169,9 +169,15 @@ def fact_check_register(ctx: typer.Context, article_id: Annotated[str, typer.Arg
 
 
 @image_app.command("register")
-def image_register(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], image_type: Annotated[str, typer.Option("--type")], file: Annotated[Path, typer.Option(exists=True, dir_okay=False)], source_url: Annotated[str | None, typer.Option()] = None, creator: Annotated[str | None, typer.Option()] = None, license_name: Annotated[str | None, typer.Option("--license")] = None, license_url: Annotated[str | None, typer.Option()] = None, attribution: Annotated[str | None, typer.Option()] = None, ai_provider: Annotated[str | None, typer.Option()] = None, ai_model: Annotated[str | None, typer.Option()] = None, prompt_path: Annotated[str | None, typer.Option()] = None) -> None:
-    image_id = _run(lambda: _room(ctx).register_image(article_id, image_type=image_type, image_file=file, source_url=source_url, creator=creator, license=license_name, license_url=license_url, attribution_text=attribution, ai_provider=ai_provider, ai_model=ai_model, prompt_path=prompt_path))
+def image_register(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")], file: Annotated[Path, typer.Option(exists=True, dir_okay=False)], image_type: Annotated[str | None, typer.Option("--type")] = None, candidate: Annotated[str | None, typer.Option("--candidate")] = None, rights_confirmed: Annotated[bool, typer.Option("--rights-confirmed")] = False, source_url: Annotated[str | None, typer.Option()] = None, creator: Annotated[str | None, typer.Option()] = None, license_name: Annotated[str | None, typer.Option("--license")] = None, license_url: Annotated[str | None, typer.Option()] = None, attribution: Annotated[str | None, typer.Option()] = None, ai_provider: Annotated[str | None, typer.Option()] = None, ai_model: Annotated[str | None, typer.Option()] = None, prompt_path: Annotated[str | None, typer.Option()] = None) -> None:
+    image_id = _run(lambda: _room(ctx).register_image(article_id, image_type=image_type, image_file=file, source_url=source_url, creator=creator, license=license_name, license_url=license_url, attribution_text=attribution, ai_provider=ai_provider, ai_model=ai_model, prompt_path=prompt_path, image_candidate_id=candidate, rights_confirmed=rights_confirmed))
     _json({"image_id": image_id})
+
+
+@image_app.command("candidates")
+def image_candidates(ctx: typer.Context, article_id: Annotated[str, typer.Argument(metavar="ID")]) -> None:
+    """List image options returned by the Claude content batch."""
+    _json(_run(lambda: _room(ctx).list_image_candidates(article_id)))
 
 
 @app.command("review")

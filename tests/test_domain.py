@@ -120,6 +120,89 @@ def test_image_file_is_required_to_become_ready(newsroom: Newsroom, tmp_path: Pa
     assert newsroom.get_article(article_id)["status"] == "FACT_CHECKED"
 
 
+def add_image_candidate(room: Newsroom, article_id: str, batch_id: str = "batch-images") -> dict:
+    now = "2026-10-05T00:00:00+00:00"
+    candidate_id = "imgcand-example"
+    with room.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO batches(batch_id,source_filename,source_sha256,status,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (batch_id, "images.csv", batch_id, "READY_FOR_IMAGE", now, now),
+        )
+        connection.execute(
+            "INSERT INTO image_candidates(image_candidate_id,batch_id,article_id,landing_page_url,"
+            "direct_image_url,creator,rights_basis,license_name,rights_url,rights_statement,"
+            "attribution_required,attribution_text,relevance,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                candidate_id,
+                batch_id,
+                article_id,
+                "https://images.example.org/press/tool",
+                "https://images.example.org/press/tool.jpg",
+                "Example Press Team",
+                "OPEN_LICENSE",
+                "CC BY 4.0",
+                "https://creativecommons.org/licenses/by/4.0/",
+                "The source page identifies the image as CC BY 4.0.",
+                1,
+                "Example Press Team / CC BY 4.0",
+                "The image depicts the announced product.",
+                now,
+                now,
+            ),
+        )
+    return room.list_image_candidates(article_id)[0]
+
+
+def test_candidate_image_requires_explicit_rights_confirmation(newsroom: Newsroom, tmp_path: Path):
+    article_id = prepare_fact_checked_article(newsroom, tmp_path)
+    candidate = add_image_candidate(newsroom, article_id)
+    image = tmp_path / "hero.jpg"
+    image.write_bytes(b"jpeg")
+
+    with pytest.raises(WorkflowError, match="rights-confirmed"):
+        newsroom.register_image(
+            article_id,
+            image_file=image,
+            image_type="OPEN_LICENSE",
+            image_candidate_id=candidate["image_candidate_id"],
+        )
+
+
+def test_candidate_image_cannot_be_registered_for_another_article(newsroom: Newsroom, tmp_path: Path):
+    article_id = prepare_fact_checked_article(newsroom, tmp_path)
+    candidate = add_image_candidate(newsroom, article_id)
+    with newsroom.db.connect() as connection:
+        connection.execute("UPDATE articles SET status='FACT_CHECKED' WHERE article_id=?", (article_id,))
+    other_candidate = add_candidate(
+        newsroom,
+        candidate_title="Other image story",
+        core_fact="Other released Image Tool on 2026-10-04.",
+        company="Other",
+        product="Image Tool",
+        primary_source="https://other.example/image-tool",
+    )
+    newsroom.check_duplicate(other_candidate["candidate_id"])
+    newsroom.select_candidate(other_candidate["candidate_id"], "editor", "separate story")
+    other_article = newsroom.create_brief(other_candidate["candidate_id"])
+    with newsroom.db.connect() as connection:
+        connection.execute(
+            "UPDATE articles SET status='FACT_CHECKED' WHERE article_id=?",
+            (other_article["article_id"],),
+        )
+    image = tmp_path / "other.jpg"
+    image.write_bytes(b"jpeg")
+
+    with pytest.raises(WorkflowError, match="different article"):
+        newsroom.register_image(
+            other_article["article_id"],
+            image_file=image,
+            image_candidate_id=candidate["image_candidate_id"],
+            rights_confirmed=True,
+        )
+
+
 def test_approval_guard_and_publication_package(newsroom: Newsroom, tmp_path: Path):
     article_id = prepare_fact_checked_article(newsroom, tmp_path)
     with pytest.raises(WorkflowError, match="IMAGE_READY"):
