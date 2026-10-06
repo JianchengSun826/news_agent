@@ -371,6 +371,49 @@ def test_preflight_two_database_bound_images_still_block(legacy_workspace):
     assert any('target collision' in error for error in migrator(f.room).preflight().blocking_errors)
 
 
+def test_preflight_two_database_rows_for_same_bound_source_still_block(legacy_workspace):
+    f = legacy_workspace
+    bound = _add_legacy_image_collision(f, [])
+    with f.room.db.connect() as connection:
+        connection.execute(
+            'INSERT INTO images(image_id,article_id,image_type,image_path) VALUES (?,?,?,?)',
+            ('img-legacy-bound-copy', f.single_id, 'LICENSED', bound.as_posix()),
+        )
+
+    plan = migrator(f.room).preflight()
+    bound_entries = [
+        entry for entry in plan.entries
+        if entry.source == bound and entry.database_table == 'images'
+    ]
+
+    assert len(bound_entries) == 2
+    bound_errors = [
+        error for error in plan.blocking_errors
+        if 'multiple database-bound entries for target' in error
+    ]
+    assert bound_errors == [
+        f'multiple database-bound entries for target: '
+        f'{bound_entries[0].target.as_posix()} (2 records)'
+    ]
+    with pytest.raises(WorkflowError, match='blocking'):
+        migrator(f.room).backup(plan)
+
+
+def test_preflight_single_bound_source_is_not_duplicated_by_filesystem_inventory(legacy_workspace):
+    f = legacy_workspace
+    bound = _add_legacy_image_collision(f, [])
+
+    plan = migrator(f.room).preflight()
+    bound_entries = [
+        entry for entry in plan.entries
+        if entry.source == bound and entry.database_table == 'images'
+    ]
+
+    assert len(bound_entries) == 1
+    assert not any('multiple database-bound entries' in error for error in plan.blocking_errors)
+    assert plan.blocking_errors == []
+
+
 def test_archive_extra_resolution_does_not_hide_ambiguous_ownership(legacy_workspace):
     f = legacy_workspace
     target = Path('workspace/archive/legacy-single-articles') / f.single_id / 'hero.png'

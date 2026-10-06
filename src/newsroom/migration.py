@@ -705,6 +705,7 @@ class WorkspaceMigrator:
         active-workspace, database/database, ancestor and destination collisions
         remain for ``_collisions`` to report as blocking errors.
         """
+        self._check_database_bound_target_uniqueness(plan)
         grouped: dict[str, list[MigrationEntry]] = {}
         for entry in plan.entries:
             grouped.setdefault(_key(entry.target), []).append(entry)
@@ -748,7 +749,24 @@ class WorkspaceMigrator:
             for group in ("claimed", "legacy", "unclaimed"):
                 setattr(plan, group, [replacements.get(entry, entry) for entry in getattr(plan, group)])
 
+    def _check_database_bound_target_uniqueness(self, plan: MigrationPlan) -> None:
+        """Block multiple database records bound to one preferred target."""
+        grouped: dict[str, list[MigrationEntry]] = {}
+        for entry in plan.entries:
+            if entry.database_table is not None and entry.database_field is not None:
+                grouped.setdefault(_key(entry.target), []).append(entry)
+        for entries in grouped.values():
+            if len(entries) > 1:
+                target = min(
+                    (entry.target.as_posix() for entry in entries),
+                    key=lambda value: (_key(value), value),
+                )
+                error = f"multiple database-bound entries for target: {target} ({len(entries)} records)"
+                if error not in plan.blocking_errors:
+                    plan.blocking_errors.append(error)
+
     def _collisions(self, plan: MigrationPlan) -> None:
+        self._check_database_bound_target_uniqueness(plan)
         targets: dict[str, MigrationEntry] = {}
         sources: dict[Path, MigrationEntry] = {}
         for entry in plan.entries:
