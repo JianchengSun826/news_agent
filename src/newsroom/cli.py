@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from .batch import BatchWorkflow
 from .batch_release import BatchReleaseWorkflow
 from .macos import MacOSBatchController, OsaScriptDialogs
+from .migration import WorkspaceMigrator
 from .service import Newsroom, WorkflowError
 from .workspace import BatchWorkspace
 
@@ -19,10 +20,12 @@ app = typer.Typer(help="Human-in-the-loop technology newsroom", no_args_is_help=
 candidate_app = typer.Typer(help="Manage news candidates", no_args_is_help=True)
 published_app = typer.Typer(help="Query published articles", no_args_is_help=True)
 batch_app = typer.Typer(help="Process a reviewed CSV with manual Claude batch handoffs", no_args_is_help=True)
+workspace_app = typer.Typer(help="Inspect local workspace migration", no_args_is_help=True)
 
 app.add_typer(candidate_app, name="candidate")
 app.add_typer(published_app, name="published")
 app.add_typer(batch_app, name="batch")
+app.add_typer(workspace_app, name="workspace")
 
 CLAUDE_INSTRUCTION = "严格执行文件中的 instructions，完成全部条目，并生成其中指定的 output_file。"
 
@@ -61,6 +64,25 @@ def initialize(ctx: typer.Context) -> None:
     room = _room(ctx)
     _run(room.init)
     typer.echo(f"Initialized newsroom at {room.root}")
+
+
+@workspace_app.command("migrate")
+def workspace_migrate(
+    ctx: typer.Context,
+    preflight: Annotated[bool, typer.Option("--preflight", help="Inventory migration without changing workflow")] = False,
+    source_csv: Annotated[list[Path] | None, typer.Option("--source-csv", help="Original CSV selected for hash verification")] = None,
+) -> None:
+    """Save a deterministic read-only migration plan for human review."""
+    if not preflight:
+        typer.echo("error: only --preflight is available; migration execution is not implemented", err=True)
+        raise typer.Exit(code=2)
+    room = _room(ctx)
+    service = WorkspaceMigrator(room)
+    plan = _run(lambda: service.preflight(source_csv))
+    report = _run(lambda: service.save_report(plan))
+    _json({**plan.to_dict(), "report_path": report.relative_to(room.root).as_posix()})
+    if plan.blocking_errors:
+        raise typer.Exit(code=2)
 
 
 @candidate_app.command("add")

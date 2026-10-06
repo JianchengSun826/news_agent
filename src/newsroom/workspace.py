@@ -130,6 +130,24 @@ class BatchWorkspace:
     def image_draft_path(self, batch_id: str) -> Path:
         return self.batch_root(batch_id) / "image-selections.json"
 
+    def source_csv_path(self, batch_id: str) -> Path:
+        return BatchWorkspacePaths(self.batch_root(batch_id)).input / "candidates.csv"
+
+    def request_artifact_path(
+        self, batch_id: str, request_type: str, revision_number: int, *,
+        result: bool = False, historical_request_id: str | None = None,
+    ) -> Path:
+        """Derive migration destinations using the same canonical handoff names."""
+        if request_type not in {"CONTENT", "FACT_CHECK", "REVISION"} or revision_number < 1:
+            raise WorkflowError("invalid workspace request type or revision")
+        paths = BatchWorkspacePaths(self.batch_root(batch_id))
+        directory = paths.archive if result else paths.requests
+        if historical_request_id:
+            directory = directory / _identifier(historical_request_id)
+        kind = request_type.lower().replace("_", "-")
+        version = "" if request_type == "CONTENT" else f"-v{revision_number}"
+        return directory / f"{kind}-{'result' if result else 'request'}{version}.json"
+
     def _batch(self, batch_id: str) -> dict[str, Any]:
         _identifier(batch_id)
         batch = self.room.db.one("SELECT * FROM batches WHERE batch_id=?", (batch_id,))

@@ -65,7 +65,7 @@ def test_cli_exposes_only_batch_post_selection_workflow():
     help_result = runner.invoke(app, ["--help"])
     assert help_result.exit_code == 0, help_result.output
     commands = {name for name, command in get_command(app).commands.items() if not command.hidden}
-    assert commands == {"init", "candidate", "duplicate-check", "batch", "published", "stats"}
+    assert commands == {"init", "candidate", "duplicate-check", "batch", "published", "stats", "workspace"}
     for command in (
         "image-plan", "review", "approve", "publish-packages",
         "publish-register", "refresh-workspace",

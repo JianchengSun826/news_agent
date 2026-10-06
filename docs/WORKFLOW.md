@@ -179,6 +179,10 @@ uv run newsroom batch refresh-workspace BATCH_ID
 
 仍需人工完成的步骤只有：Sheet 来源审核、重复项歧义判断、两个 Claude 文件交接、图片权利页与文件检查、最终编辑批准、CMS 上传和真实 URL 登记。
 
+迁移旧工作区前，可运行 `uv run newsroom workspace migrate --preflight`。此命令只读取数据库与文件，并把确定性的 JSON 清单保存到 `data/workspace-migration-preflight.json`；它不会更新流程状态、移动素材或创建迁移暂存目录。缺失的数据库引用、路径逃逸、符号链接、归属歧义或目标冲突会阻塞迁移并返回非零状态。可重复使用 `--source-csv PATH` 指定原始 CSV，只有字节级 SHA-256 与已记录批次一致时才会列为可复制输入；缺失原始 CSV 不会阻塞。
+
+当前命令仅支持预检，尚不执行迁移。内部备份服务仅接受仍然有效且没有阻塞问题的清单，在 `data/backups/` 创建 SQLite 备份、素材归档、报告和 manifest，并重新打开数据库、检查归档成员安全性、提取并核对所有文件哈希后才返回。失败的备份会删除或标记 `INCOMPLETE`，不得用于迁移。
+
 ## 9. 验证与离线 Demo
 
 ```bash
