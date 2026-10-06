@@ -64,7 +64,7 @@ JSON 的 `batch_id`、`request_id` 和 `output_file` 必须属于当前任务，
 
 选择草稿保存在批次 `image-selections.json`，中途取消可继续；不会部分登记图片。完整计划要求每篇恰好一项、候选归属正确、文件可读、`rights_confirmed: true`，验证全部后才暂存文件并一次事务登记。原图位于所属批次 `articles/ARTICLE_ID/hero.EXT`。旧状态混合已登记与未登记时要恢复/修复，不能继续部分登记。
 
-检查操作 03 的全部当前素材后，依次使用 05、06、07。审核要求全部 `IMAGE_READY`，批准要求全部 `REVIEWED`，发布包要求全部 `APPROVED`；任何一篇不满足就整批拒绝。`EXCLUDED` 与 `REUSED_COMPLETE` 不参与这些闸门，复用文章仍由原批次拥有，本批次只提供链接。
+检查操作 03 的全部当前素材后，依次使用 05、06、07。审核要求全部 `IMAGE_READY`，批准要求全部 `REVIEWED`，发布包要求全部 `APPROVED`；任何一篇不满足就整批拒绝。`EXCLUDED` 与 `REUSED_COMPLETE` 不参与这些闸门，有非空 `owning_batch_id` 的复用文章仍由原批次拥有，本批次只提供链接。历史复用文章可能为 NULL，没有批次素材链接；应根据数据库记录的规范/旧路径查找，或先完成迁移与归属核对，不能假定它属于某个旧批次。
 
 完整发布包位于 `publish/ARTICLE_ID/`，整批索引是 `publish/batch-manifest.json`。先暂存验证全部包再整体替换，失败保留旧包并恢复数据库。成功后批次为 `PACKAGED`，文章仍为 `APPROVED`。
 
@@ -78,7 +78,7 @@ uv run newsroom batch refresh-workspace BATCH_ID
 
 JSON 含 `schema_version: 1`、`batch_id` 和 `items`；每项为 `article_id`、`article_url`，集合恰好覆盖全部有效文章。缺失、额外或重复项均拒绝，全部 URL、时间和审计在一次事务中写入，最后所有文章与批次为 `PUBLISHED`。
 
-选择后的单篇 `brief/prompt/research/article/fact-check/image` 内容命令、顶层 `review`、`approve`、`publish-package`、`publish` 均已移除；保留的单篇服务只是内部恢复/构建工具。当前备用 CLI 也必须使用 `batch`。
+选择后的单篇 `brief/prompt/research/article/fact-check/image` 内容命令、顶层 `review`、`approve`、`publish-package`、`publish` 均已移除；保留的单篇服务只是内部恢复/构建工具。改变内容和发布流程状态的备用 CLI 必须使用 `batch`；顶层只读 `published list` 与 `stats` 仍受支持。
 
 ## 五、迁移、备份与恢复
 
@@ -103,4 +103,4 @@ uv run pytest -q
 bash scripts/demo.sh
 ```
 
-Demo 每次重建独立 `demo-workspace/`，用两个合成候选、本地 SVG 和合成 Claude JSON 走完所有批次操作。两篇均到达 `PUBLISHED`，验证批次 README 与 manifest 存在且没有旧 artifact 根目录。它不打开原生窗口、不访问网络、不迁移真实工作区；示例新闻、权利及 URL 仅用于验证。原 Phase 1 手册保存在 `docs/archive/WORKFLOW_PHASE1_ORIGINAL.md`，不是受支持操作路径。
+Demo 每次重建独立 `demo-workspace/`，用两个合成候选、本地 SVG 和合成 Claude JSON 走完所有批次操作。两篇均到达 `PUBLISHED`，验证批次 README 与 manifest 存在且没有 `research/`、`articles/`、`images/` 或 `output/` 四个旧 artifact 根目录。它不打开原生窗口、不访问网络、不迁移真实工作区；示例新闻、权利及 URL 仅用于验证。原 Phase 1 手册保存在 `docs/archive/WORKFLOW_PHASE1_ORIGINAL.md`，不是受支持操作路径。

@@ -63,7 +63,7 @@ workspace/batches/BATCH_ID/
   publish/batch-manifest.json      整批发布包索引
 ```
 
-`REUSED_COMPLETE` 链接到原拥有批次，不复制为本批次待编辑文章；`EXCLUDED` 不参与后续闸门。历史单篇及未归属文件迁移为 `workspace/archive/` 下只读参考。
+`REUSED_COMPLETE` 不复制为本批次待编辑文章。有非空 `owning_batch_id` 时链接到原拥有批次；历史文章可能仍为 NULL，没有可用的批次工作区链接，需按数据库记录的规范/旧路径查找素材，或先完成迁移与归属核对。复用不会推断或转移拥有批次。`EXCLUDED` 不参与后续闸门。历史单篇及未归属文件迁移为 `workspace/archive/` 下只读参考。
 
 ## 4. 第一个 Claude 窗口：整批研究、写作与图片搜索
 
@@ -135,7 +135,7 @@ uv run newsroom duplicate-check CANDIDATE_ID --override NEW --actor editor --rea
 uv run newsroom batch resolve BATCH_ID CANDIDATE_ID --decision include --actor editor --reason "已完成覆盖审核"
 ```
 
-选择后备用入口全部为整批操作。路径以当前 `batch status`、README/request 的输出名为准：
+选择后改变内容和发布流程状态的备用入口均为整批操作；顶层只读 `published list` 与 `stats` 仍受支持。路径以当前 `batch status`、README/request 的输出名为准：
 
 ```bash
 uv run newsroom batch status BATCH_ID
@@ -185,4 +185,4 @@ uv run pytest -q
 bash scripts/demo.sh
 ```
 
-Demo 重建独立 `demo-workspace/`，准备两个候选，按当前 request 生成并导入合成 content 和独立 fact-check JSON，用一个完整图片计划，再依次整批 review、approve、publish-packages、publish-register。脚本断言两篇及批次均为 `PUBLISHED`、批次 README 和 publish manifest 存在，且没有顶层 `research/`、`articles/`、`images/`。发布包位于 `demo-workspace/workspace/batches/BATCH_ID/publish/`。整个 demo 使用本地 SVG、合成权利记录和示例 URL，不访问网络或模型、不打开原生对话框、不迁移真实数据。
+Demo 重建独立 `demo-workspace/`，准备两个候选，按当前 request 生成并导入合成 content 和独立 fact-check JSON，用一个完整图片计划，再依次整批 review、approve、publish-packages、publish-register。脚本断言两篇及批次均为 `PUBLISHED`、批次 README 和 publish manifest 存在，且没有顶层 `research/`、`articles/`、`images/` 或 `output/`。发布包位于 `demo-workspace/workspace/batches/BATCH_ID/publish/`。整个 demo 使用本地 SVG、合成权利记录和示例 URL，不访问网络或模型、不打开原生对话框、不迁移真实数据。

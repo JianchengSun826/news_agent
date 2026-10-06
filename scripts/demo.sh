@@ -137,9 +137,10 @@ run batch publish-register "$batch_id" "$publication_result" --actor demo-editor
 
 test -f "$demo_root/workspace/batches/$batch_id/README.md"
 test -f "$demo_root/workspace/batches/$batch_id/publish/batch-manifest.json"
-test ! -d "$demo_root/research"
-test ! -d "$demo_root/articles"
-test ! -d "$demo_root/images"
+test ! -e "$demo_root/research"
+test ! -e "$demo_root/articles"
+test ! -e "$demo_root/images"
+test ! -e "$demo_root/output"
 python3 - "$demo_root" "$batch_id" <<'PY'
 import sqlite3
 import sys

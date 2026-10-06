@@ -27,8 +27,9 @@ from test_batch import (
 runner = CliRunner()
 
 
-def test_offline_demo_publishes_complete_batch_without_legacy_roots(tmp_path: Path):
-    """Run the shipped demo; removed single-article calls cannot finish it."""
+@pytest.mark.parametrize("unexpected_output", [False, True], ids=["clean", "legacy-output"])
+def test_offline_demo_publishes_complete_batch_without_legacy_roots(tmp_path: Path, unexpected_output: bool):
+    """Run the shipped demo and reject a regression creating legacy output."""
     repository = Path(__file__).resolve().parents[1]
     sandbox = tmp_path / "demo repository"
     (sandbox / "scripts").mkdir(parents=True)
@@ -42,23 +43,32 @@ def test_offline_demo_publishes_complete_batch_without_legacy_roots(tmp_path: Pa
     launcher = bin_path / "uv"
     launcher.write_text(
         f"#!{sys.executable}\n"
-        "import os, sys\n"
+        "import os, subprocess, sys\n"
+        "from pathlib import Path\n"
         "assert sys.argv[1:3] == ['run', '--project']\n"
         "assert sys.argv[4] == 'newsroom'\n"
-        "os.execv(sys.executable, [sys.executable, '-m', 'newsroom.cli', *sys.argv[5:]])\n",
+        "result = subprocess.run([sys.executable, '-m', 'newsroom.cli', *sys.argv[5:]])\n"
+        "if result.returncode == 0 and sys.argv[-1] == 'init' and os.environ.get('DEMO_TEST_LEGACY_OUTPUT') == '1':\n"
+        "    (Path(sys.argv[6]) / 'output').mkdir()\n"
+        "sys.exit(result.returncode)\n",
         encoding="utf-8",
     )
     launcher.chmod(0o755)
     environment = {**os.environ, "PATH": f"{bin_path}{os.pathsep}{os.environ['PATH']}",
-                   "PYTHONPATH": str(repository / "src")}
+                   "PYTHONPATH": str(repository / "src"),
+                   "DEMO_TEST_LEGACY_OUTPUT": "1" if unexpected_output else "0"}
 
     result = subprocess.run(
         ["bash", str(sandbox / "scripts/demo.sh")], cwd=sandbox,
         env=environment, capture_output=True, text=True, timeout=120,
     )
 
-    assert result.returncode == 0, result.stdout + result.stderr
     root = sandbox / "demo-workspace"
+    if unexpected_output:
+        assert (root / "output").is_dir()
+        assert result.returncode != 0, "demo reported success despite a legacy output directory"
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
     with sqlite3.connect(root / "data/newsroom.db") as connection:
         batches = connection.execute("SELECT batch_id,status FROM batches").fetchall()
         articles = connection.execute("SELECT article_id,status,image_id FROM articles").fetchall()
@@ -78,7 +88,7 @@ def test_offline_demo_publishes_complete_batch_without_legacy_roots(tmp_path: Pa
         assert (batch_root / "publish" / article_id / "hero.svg").is_file()
     assert {kind for kind, _, _ in requests} == {"CONTENT", "FACT_CHECK"}
     assert all(status == "COMPLETED" and (root / path).is_file() for _, status, path in requests)
-    assert all(not (root / name).exists() for name in ("research", "articles", "images"))
+    assert all(not (root / name).exists() for name in ("research", "articles", "images", "output"))
 
 
 def write_candidate_csv(path: Path) -> Path:
