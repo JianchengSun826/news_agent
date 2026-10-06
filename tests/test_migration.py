@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import tarfile
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 from types import SimpleNamespace
@@ -405,6 +406,266 @@ def test_archive_extra_target_rejects_traversal_and_symlink_ancestor(legacy_work
     errors = migrator(f.room).preflight().blocking_errors
     assert any('symlink' in error and 'legacy-files' in error for error in errors)
     assert any('target collision' in error for error in errors)
+
+
+def _unbound_archive_entry(article_id, filename):
+    article_root = Path('workspace/archive/legacy-single-articles') / article_id
+    return MigrationEntry(
+        Path('images') / article_id / filename,
+        article_root / filename,
+        'a' * 64,
+        1,
+        article_id=article_id,
+    )
+
+
+def test_archive_extra_target_fits_name_max_for_ascii_and_multibyte_names(legacy_workspace):
+    f = legacy_workspace
+    service = migrator(f.room)
+    name_max = os.pathconf(f.room.root, 'PC_NAME_MAX')
+    suffix = '.png'
+    ascii_name = 'a' * (name_max - len(suffix.encode())) + suffix
+    unicode_budget = name_max - len(suffix.encode())
+    unicode_name = '界' * (unicode_budget // len('界'.encode())) + 'a' * (unicode_budget % len('界'.encode())) + suffix
+
+    for filename in (ascii_name, unicode_name):
+        target = service._archive_extra_target(_unbound_archive_entry(f.single_id, filename))
+        encoded = target.name.encode('utf-8')
+        assert len(encoded) <= name_max
+        assert target.suffix == suffix
+        assert '--' in target.name
+        assert encoded.decode('utf-8') == target.name
+
+
+def test_archive_extra_target_truncates_pathologically_long_multibyte_extension(legacy_workspace):
+    f = legacy_workspace
+    service = migrator(f.room)
+    name_max = os.pathconf(f.room.root, 'PC_NAME_MAX')
+    entry = _unbound_archive_entry(f.single_id, 'hero.' + '界' * name_max)
+
+    target = service._archive_extra_target(entry)
+
+    assert len(target.name.encode('utf-8')) <= name_max
+    assert target.name.startswith('hero--')
+    assert len(target.suffix) > 1
+    assert target.name.encode('utf-8').decode('utf-8') == target.name
+
+
+def test_archive_extra_keeps_final_extension_when_full_suffix_chain_is_too_long(
+    legacy_workspace,
+):
+    f = legacy_workspace
+    name_max = os.pathconf(f.room.root, 'PC_NAME_MAX')
+    middle = 'x' * (name_max - len('hero..png'.encode('utf-8')))
+    entry = _unbound_archive_entry(f.single_id, f'hero.{middle}.png')
+
+    target = migrator(f.room)._archive_extra_target(entry)
+
+    assert len(entry.source.name.encode('utf-8')) == name_max
+    assert len(target.name.encode('utf-8')) <= name_max
+    assert target.suffix == '.png'
+
+
+def test_archive_extra_drops_extension_punctuation_when_no_extension_character_fits(
+    legacy_workspace, monkeypatch,
+):
+    f = legacy_workspace
+    monkeypatch.setattr(os, 'pathconf', lambda *_args: 15)
+
+    target = migrator(f.room)._archive_extra_target(
+        _unbound_archive_entry(f.single_id, 'hero.png')
+    )
+
+    assert len(target.name.encode('utf-8')) == 15
+    assert not target.name.endswith('.')
+
+
+def test_archive_extra_name_limit_uses_nearest_safe_existing_destination_ancestor(
+    legacy_workspace, monkeypatch,
+):
+    f = legacy_workspace
+    existing = f.room.root / 'workspace/archive'
+    existing.mkdir(parents=True)
+    probes = []
+
+    def name_max(path, name):
+        probes.append((Path(path), name))
+        return 63
+
+    monkeypatch.setattr(os, 'pathconf', name_max)
+
+    target = migrator(f.room)._archive_extra_target(
+        _unbound_archive_entry(f.single_id, 'a' * 200 + '.png')
+    )
+
+    assert probes == [(existing, 'PC_NAME_MAX')]
+    assert len(target.name.encode('utf-8')) <= 63
+
+
+def test_archive_extra_long_name_is_deterministic_independent_of_plan_order(legacy_workspace):
+    f = legacy_workspace
+    service = migrator(f.room)
+    name_max = os.pathconf(f.room.root, 'PC_NAME_MAX')
+    article_root = Path('workspace/archive/legacy-single-articles') / f.single_id
+    preferred = MigrationEntry(
+        Path('images') / f.single_id / 'bound.bin', article_root / 'preferred.bin',
+        'a' * 64, 1, article_id=f.single_id, database_table='images', database_field='image_path',
+    )
+    stem = 'a' * (name_max - len('.bin'))
+    extras = [
+        MigrationEntry(
+            Path('images') / f.single_id / f'{stem[:-1]}{ending}.bin',
+            article_root / 'preferred.bin', digest * 64, 1, article_id=f.single_id,
+        )
+        for ending, digest in [('a', 'b'), ('A', 'c')]
+    ]
+    first = MigrationPlan(legacy=[preferred, *extras])
+    second = MigrationPlan(legacy=[*reversed(extras), preferred])
+
+    service._resolve_archive_extra_collisions(first)
+    service._resolve_archive_extra_collisions(second)
+
+    first_targets = {entry.source: entry.target for entry in first.entries}
+    assert first_targets == {entry.source: entry.target for entry in second.entries}
+    assert len({target.as_posix().casefold() for target in first_targets.values()}) == 3
+    assert all(len(target.name.encode('utf-8')) <= name_max for target in first_targets.values())
+
+
+def test_archive_extra_targets_distinguish_nfc_equivalent_source_paths(legacy_workspace):
+    f = legacy_workspace
+    service = migrator(f.room)
+    article_root = Path('workspace/archive/legacy-single-articles') / f.single_id
+    preferred = MigrationEntry(
+        Path('images') / f.single_id / 'bound.png', article_root / 'hero.png',
+        'a' * 64, 1, article_id=f.single_id, database_table='images', database_field='image_path',
+    )
+    extras = [
+        MigrationEntry(
+            Path('images') / f.single_id / name,
+            article_root / 'hero.png',
+            digest * 64,
+            1,
+            article_id=f.single_id,
+        )
+        for name, digest in [('caf\N{LATIN SMALL LETTER E WITH ACUTE}.png', 'b'), ('cafe\N{COMBINING ACUTE ACCENT}.png', 'c')]
+    ]
+    plan = MigrationPlan(legacy=[preferred, *extras])
+
+    service._resolve_archive_extra_collisions(plan)
+    service._collisions(plan)
+
+    routed = {entry.source: entry.target for entry in plan.entries}
+    targets = list(routed.values())
+    normalized = {unicodedata.normalize('NFC', target.as_posix()).casefold() for target in targets}
+    assert len(normalized) == 3
+    for entry in extras:
+        discriminator = hashlib.sha256(entry.source.as_posix().encode('utf-8')).hexdigest()[:12]
+        assert f'--{discriminator}' in routed[entry.source].name
+    assert plan.blocking_errors == []
+
+
+@pytest.mark.parametrize('limit', [None, 0, 10, 13, True])
+def test_archive_extra_unusable_name_max_blocks_preflight(legacy_workspace, monkeypatch, limit):
+    f = legacy_workspace
+    extra = Path('images') / f.single_id / 'hero.png'
+    _add_legacy_image_collision(f, [(extra, b'extra')])
+
+    def unusable(*_args):
+        if limit is None:
+            raise OSError('pathconf unavailable')
+        return limit
+
+    monkeypatch.setattr(os, 'pathconf', unusable)
+    errors = migrator(f.room).preflight().blocking_errors
+
+    assert any('name limit' in error or 'discriminator' in error for error in errors)
+    assert any('target collision' in error for error in errors)
+    with pytest.raises(WorkflowError, match='blocking'):
+        migrator(f.room).backup(migrator(f.room).preflight())
+
+
+def test_archive_extra_name_limit_failure_keeps_whole_collision_group_blocked(
+    legacy_workspace, monkeypatch,
+):
+    f = legacy_workspace
+    extras = [
+        (Path('images') / f.single_id / 'hero.png', b'first extra'),
+        (Path('articles') / f.single_id / 'hero.png', b'second extra'),
+    ]
+    bound = _add_legacy_image_collision(f, extras)
+    calls = 0
+
+    def fail_second(*_args):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError('second limit unavailable')
+        return 255
+
+    monkeypatch.setattr(os, 'pathconf', fail_second)
+
+    plan = migrator(f.room).preflight()
+    by_source = {entry.source: entry for entry in plan.entries}
+
+    assert calls == 2
+    assert by_source[extras[0][0]].target == by_source[bound].target
+    assert by_source[extras[1][0]].target == by_source[bound].target
+    assert not any('legacy-files' in by_source[source].target.parts for source, _ in extras)
+    assert any('name limit is unavailable' in error for error in plan.blocking_errors)
+    assert any('target collision' in error for error in plan.blocking_errors)
+    with pytest.raises(WorkflowError, match='blocking'):
+        migrator(f.room).backup(plan)
+
+
+def test_archive_extra_existing_generated_destination_remains_blocking(legacy_workspace):
+    f = legacy_workspace
+    service = migrator(f.room)
+    article_root = Path('workspace/archive/legacy-single-articles') / f.single_id
+    preferred = MigrationEntry(
+        Path('images') / f.single_id / 'bound.png', article_root / 'hero.png',
+        'a' * 64, 1, article_id=f.single_id, database_table='images', database_field='image_path',
+    )
+    extra = MigrationEntry(
+        Path('images') / f.single_id / 'hero.png', article_root / 'hero.png',
+        'b' * 64, 1, article_id=f.single_id,
+    )
+    occupied = service._archive_extra_target(extra)
+    (f.room.root / occupied).parent.mkdir(parents=True)
+    (f.room.root / occupied).write_bytes(b'existing unrelated bytes')
+    plan = MigrationPlan(legacy=[preferred, extra])
+
+    service._resolve_archive_extra_collisions(plan)
+    service._collisions(plan)
+
+    assert next(entry for entry in plan.entries if entry.source == extra.source).target == occupied
+    assert any('existing destination' in error for error in plan.blocking_errors)
+
+
+def test_execute_copies_rerouted_extra_with_near_limit_extension(legacy_workspace):
+    f = legacy_workspace
+    name_max = os.pathconf(f.room.root, 'PC_NAME_MAX')
+    extension = 'x' * (name_max - len('hero-v2.'.encode('utf-8')))
+    bound = Path('images') / f.single_id / f'hero-v2.{extension}'
+    extra = Path('images') / f.single_id / f'hero.{extension}'
+    (f.room.root / bound).parent.mkdir(parents=True, exist_ok=True)
+    (f.room.root / bound).write_bytes(b'bound near-limit image')
+    (f.room.root / extra).write_bytes(b'extra near-limit image')
+    with f.room.db.connect() as connection:
+        connection.execute(
+            'INSERT INTO images(image_id,article_id,image_type,image_path) VALUES (?,?,?,?)',
+            ('img-near-limit', f.single_id, 'LICENSED', bound.as_posix()),
+        )
+    service = migrator(f.room)
+    plan = service.preflight()
+
+    assert plan.blocking_errors == []
+    by_source = {entry.source: entry for entry in plan.entries}
+    assert len(by_source[extra].target.name.encode('utf-8')) <= name_max
+
+    service.execute(plan, service.backup(plan))
+
+    assert (f.room.root / by_source[bound].target).read_bytes() == b'bound near-limit image'
+    assert (f.room.root / by_source[extra].target).read_bytes() == b'extra near-limit image'
 
 
 def test_execute_preserves_bound_and_unbound_colliding_images_separately(legacy_workspace):

@@ -600,17 +600,91 @@ class WorkspaceMigrator:
         article_root = Path("workspace/archive/legacy-single-articles") / entry.article_id
         if not entry.target.is_relative_to(article_root) or entry.target == article_root:
             raise WorkflowError("archive extra target is outside its legacy article archive")
+        target_parent = article_root / "legacy-files" / entry.source.parent
+        _safe_relative(target_parent)
+        self._validate_target_ancestors(target_parent / "archive-extra")
+        name_max = self._destination_name_max(target_parent)
         name = entry.source.name
         suffix = "".join(entry.source.suffixes)
         stem = name[:-len(suffix)] if suffix else name
-        source_identity = unicodedata.normalize("NFC", entry.source.as_posix()).encode("utf-8")
+        try:
+            # Hash the exact path spelling. The target collision key normalizes
+            # names, so canonically equivalent source spellings also need
+            # different discriminators to remain distinct on macOS.
+            source_identity = entry.source.as_posix().encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise WorkflowError("archive source path is not valid UTF-8") from error
         discriminator = hashlib.sha256(source_identity).hexdigest()[:12]
-        target = article_root / "legacy-files" / entry.source.parent / f"{stem}--{discriminator}{suffix}"
+        marker = f"--{discriminator}"
+        marker_size = len(marker.encode("utf-8"))
+        if name_max < marker_size:
+            raise WorkflowError("destination name limit cannot fit mandatory archive discriminator")
+        available = name_max - marker_size
+        suffix_size = self._utf8_size(suffix)
+        if suffix_size <= available:
+            retained_suffix = suffix
+        else:
+            final_suffix = entry.source.suffix
+            if self._utf8_size(final_suffix) <= available:
+                retained_suffix = final_suffix
+            else:
+                retained_suffix = self._utf8_prefix(final_suffix, min(32, available))
+            if retained_suffix == ".":
+                retained_suffix = ""
+        stem_budget = available - self._utf8_size(retained_suffix)
+        retained_stem = self._utf8_prefix(stem, stem_budget)
+        leaf = f"{retained_stem}{marker}{retained_suffix}"
+        if self._utf8_size(leaf) > name_max:
+            raise WorkflowError("archive filename exceeds destination name limit")
+        target = target_parent / leaf
         _safe_relative(target)
         if not target.is_relative_to(article_root / "legacy-files"):
             raise WorkflowError("archive extra target escapes legacy-files")
         self._validate_target_ancestors(target)
         return target
+
+    def _destination_name_max(self, target_parent: Path) -> int:
+        """Read the component limit from the nearest existing destination ancestor."""
+        _safe_relative(target_parent)
+        probe = self.room.root / target_parent
+        while not probe.exists():
+            if probe == self.room.root:
+                break
+            probe = probe.parent
+        try:
+            _no_symlinks(probe)
+            if not probe.is_dir():
+                raise WorkflowError("destination name limit probe is not a directory")
+            limit = os.pathconf(probe, "PC_NAME_MAX")
+        except (OSError, ValueError) as error:
+            raise WorkflowError("destination name limit is unavailable") from error
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise WorkflowError("destination name limit is unavailable")
+        return limit
+
+    @staticmethod
+    def _utf8_size(value: str) -> int:
+        try:
+            return len(value.encode("utf-8"))
+        except UnicodeEncodeError as error:
+            raise WorkflowError("archive filename is not valid UTF-8") from error
+
+    @staticmethod
+    def _utf8_prefix(value: str, byte_limit: int) -> str:
+        if byte_limit <= 0:
+            return ""
+        used = 0
+        retained = []
+        for character in value:
+            try:
+                encoded = character.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise WorkflowError("archive filename is not valid UTF-8") from error
+            if used + len(encoded) > byte_limit:
+                break
+            retained.append(character)
+            used += len(encoded)
+        return "".join(retained)
 
     def _resolve_archive_extra_collisions(self, plan: MigrationPlan) -> None:
         """Preserve unbound legacy extras when one database artifact owns a target.
