@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from .batch import BatchWorkflow
 from .batch_release import BatchReleaseWorkflow
 from .macos import MacOSBatchController, MacOSMigrationController, OsaScriptDialogs
-from .migration import MigrationPlan, WorkspaceMigrator
+from .migration import MigrationPlan, WorkspaceMigrator, assert_migration_access
 from .service import Newsroom, WorkflowError
 from .workspace import BatchWorkspace
 
@@ -35,11 +35,17 @@ def root_callback(
     ctx: typer.Context,
     root: Annotated[Path, typer.Option(help="Newsroom workspace root")] = Path.cwd(),
 ) -> None:
+    ctx.meta["migration_access_bypass"] = ctx.invoked_subcommand in {"workspace", "macos-migrate"}
+    if not ctx.meta["migration_access_bypass"]:
+        _run(lambda: assert_migration_access(root))
     ctx.obj = Newsroom(root)
 
 
 def _room(ctx: typer.Context) -> Newsroom:
-    return ctx.ensure_object(Newsroom)
+    room = ctx.ensure_object(Newsroom)
+    if not ctx.meta.get("migration_access_bypass"):
+        _run(lambda: assert_migration_access(room.root))
+    return room
 
 
 def _json(value: object) -> None:

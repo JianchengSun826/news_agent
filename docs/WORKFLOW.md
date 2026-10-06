@@ -192,6 +192,8 @@ uv run newsroom workspace migrate --execute --plan data/workspace-migration-pref
 
 只有最终验证成功后，才删除清单中的旧素材及空旧目录；清单之外的文件保留。journal 位于 `data/workspace-migration-journals/`，依次记录 `BACKED_UP`、`STAGED`、`DATABASE_UPDATED`、`PROMOTED`、`VERIFIED`、`CLEANED`。数据库提交后的失败或中断会从验证备份恢复原数据库和素材；恢复本身失败时保留原错误、恢复错误、暂存和可操作 journal。发现未完成 journal 或暂存时会拒绝再次迁移，须检查 journal 指定的验证备份并完成恢复后重试，不会声称已完成。成功 receipt 位于 `data/workspace-migration-receipt.json`；再次检查必须验证 receipt、manifest、数据库引用和素材且无待清理内容，才返回 `ALREADY_MIGRATED`。
 
+数据库提交前创建持久访问屏障 `data/workspace-migration-lock.json`，绑定本次 journal、manifest 与唯一 owner；提交结果尚不确定时也按可能已提交处理并验证恢复。屏障持续到目录替换、验证及清理完成，或 journal 已记录完整回滚；只有持有相同 owner 与原文件身份的执行者可删除屏障。普通 CLI 和批次 Finder 操作发现屏障后，在访问 Newsroom 路径前返回退出码 2 与恢复指引；迁移预检、备份和迁移控制器保留检查入口，执行仍拒绝未恢复的屏障。崩溃、恢复失败或屏障 owner 改变时保留屏障和诊断。原目录改名为 retained 后与删除前都会复查文件哈希和目录清单；新增文件、目录或修改会中止清理。回滚优先整体移回 retained 原目录，保留人工新增和修改；仅缺失素材从验证归档补回。无法验证原快照时保留素材、暂存和屏障，标记需要人工恢复，不记录成功清理。
+
 刷新批次工作区会在 `workspace/README.md` 旁安装可执行、可搬迁的 `workspace/Migrate Newsroom.command`。Finder 启动器仅分派隐藏 CLI 控制器；控制器先预检、保存并打开报告，存在阻塞时拒绝继续，再要求编辑明确确认，之后才创建验证备份并执行迁移。取消只保留报告，不移动文件、不更改数据库。
 
 ## 9. 验证与离线 Demo

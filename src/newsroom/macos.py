@@ -114,6 +114,8 @@ class MacOSBatchController:
     def run(self, batch_id: str, action: str) -> int:
         """Return zero on success/cancellation and two on expected user errors."""
         try:
+            from .migration import assert_migration_access
+            assert_migration_access(self.room.root)
             if action not in ALLOWED_ACTIONS:
                 raise WorkflowError("未知的 Finder 操作。请从批次 actions 文件夹选择操作。")
             # Validate the identifier and existence even for read-only actions.
