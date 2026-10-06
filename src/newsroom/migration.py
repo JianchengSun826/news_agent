@@ -163,6 +163,16 @@ class WorkspaceMigrator:
             raise WorkflowError(f"missing referenced file: {source.as_posix()}")
         return path
 
+    def _validate_target_ancestors(self, target: Path) -> None:
+        _safe_relative(target)
+        for ancestor in target.parents:
+            path = self.room.root / ancestor
+            if path.is_symlink():
+                raise WorkflowError(f"unsafe target ancestor symlink: {ancestor.as_posix()}")
+            if path.exists() and not path.is_dir():
+                raise WorkflowError(f"target ancestor is not a directory: {ancestor.as_posix()}")
+        _no_symlinks(self.room.root / target)
+
     def preflight(self, source_csvs: list[Path] | None = None) -> MigrationPlan:
         """Inventory exact bytes without creating directories, updating rows, or moving files."""
         plan = MigrationPlan()
@@ -182,6 +192,27 @@ class WorkspaceMigrator:
             return plan
         articles = {a["article_id"]: a for a in tables["articles"]}
         batches = {b["batch_id"]: b for b in tables["batches"]}
+        inventory_roots = ("research", "articles", "images", "output", "workspace")
+        expected_roots = {Path(root) for root in (*inventory_roots, "output/batches", "output/prompts", "workspace/batches", "workspace/archive", "workspace/archive/legacy-single-articles", "workspace/archive/unclaimed-files")}
+        for article_id, article in articles.items():
+            expected_roots.update(Path(root) / article_id for root in ("research", "articles", "images", "output", "workspace/archive/legacy-single-articles"))
+            if article["owning_batch_id"]:
+                root = Path("workspace/batches") / article["owning_batch_id"]
+                expected_roots.update((root / "articles" / article_id, root / "publish" / article_id))
+        for batch_id in batches:
+            root = Path("workspace/batches") / batch_id
+            expected_roots.add(Path("output/batches") / batch_id)
+            expected_roots.update(root / suffix for suffix in (".", "input", "articles", "publish", "actions", "claude", "claude/requests", "claude/inbox", "claude/archive"))
+        for root in sorted(expected_roots):
+            try:
+                _safe_relative(root)
+                absolute = self.room.root / root
+                _no_symlinks(absolute)
+                if absolute.exists() and not absolute.is_dir():
+                    raise WorkflowError("expected a directory")
+            except (OSError, WorkflowError) as error:
+                display = "<invalid absolute root>" if root.is_absolute() else root.as_posix()
+                plan.blocking_errors.append(f"inventory root {display}: {error}")
         for article_id, article in articles.items():
             memberships = {i["batch_id"] for i in tables["batch_items"] if i["article_id"] == article_id and i["item_status"] not in {"REUSED_COMPLETE", "EXCLUDED"}}
             owner = article["owning_batch_id"]
@@ -193,8 +224,7 @@ class WorkspaceMigrator:
         def add(source: Path, target: Path, batch: str | None = None, article: str | None = None, table: str | None = None, db_field: str | None = None, group: str = "claimed", external: bool = False) -> MigrationEntry | None:
             try:
                 path = self._source(source, external)
-                _safe_relative(target)
-                _no_symlinks(self.room.root / target)
+                self._validate_target_ancestors(target)
                 sha, size = _digest(path)
                 entry = MigrationEntry(source, target, sha, size, batch, article, table, db_field)
                 getattr(plan, group).append(entry)
@@ -220,7 +250,7 @@ class WorkspaceMigrator:
                         plan.blocking_errors.append(f"{table}.{db_field}: {error}")
 
         # All output subtrees include packages and prompts, including unknown IDs.
-        for root in ("research", "articles", "images", "output", "workspace"):
+        for root in inventory_roots:
             absolute = self.room.root / root
             if not absolute.exists() and not absolute.is_symlink():
                 continue
@@ -391,10 +421,13 @@ class WorkspaceMigrator:
             raise WorkflowError("migration sources or database changed after preflight")
         parent = self.room.root / "data" / "backups"
         _no_symlinks(parent)
-        parent.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        backup = Path(tempfile.mkdtemp(prefix=f"workspace-migration-{stamp}-", dir=parent))
+        backup: Path | None = None
+        incomplete_text = "Backup incomplete; do not use for migration.\n"
         try:
+            parent.mkdir(parents=True, exist_ok=True)
+            backup = Path(tempfile.mkdtemp(prefix=f"workspace-migration-{stamp}-", dir=parent))
+            (backup / "INCOMPLETE").write_text(incomplete_text, encoding="utf-8")
             with self._connect_readonly() as source, closing(sqlite3.connect(backup / "newsroom.db")) as destination:
                 source.backup(destination)
                 destination.execute("PRAGMA journal_mode=DELETE")
@@ -421,26 +454,39 @@ class WorkspaceMigrator:
                     info.size = len(content)
                     info.mode = 0o644
                     archive.addfile(info, io.BytesIO(content))
-            self.verify_backup(backup)
+            self._verify_backup_contents(backup)
             if self.preflight(selected).to_dict() != plan.to_dict():
                 raise WorkflowError("migration sources or database changed during backup")
+            (backup / "INCOMPLETE").unlink()
             return backup
-        except Exception as error:
+        except BaseException as error:
+            if backup is None:
+                raise
+            failures = [error]
             try:
-                (backup / "INCOMPLETE").write_text("Backup failed verification; do not use for migration.\n", encoding="utf-8")
                 shutil.rmtree(backup)
-            except OSError:
-                # Retain the explicit incomplete marker if removal is unavailable.
-                pass
-            if isinstance(error, WorkflowError):
+            except BaseException as cleanup_error:
+                failures.append(cleanup_error)
+                try:
+                    (backup / "INCOMPLETE").write_text(incomplete_text, encoding="utf-8")
+                except BaseException as marker_error:
+                    failures.append(marker_error)
+            if len(failures) > 1:
+                raise BaseExceptionGroup("backup failed; cleanup also failed", failures) from None
+            if isinstance(error, WorkflowError) or not isinstance(error, Exception):
                 raise
             raise WorkflowError(f"backup verification failed: {error}") from error
 
     def verify_backup(self, backup: Path) -> None:
+        """Accept only a completed backup, then independently verify its contents."""
+        marker = backup / "INCOMPLETE"
+        if marker.exists() or marker.is_symlink():
+            raise WorkflowError("backup verification failed: incomplete backup")
+        self._verify_backup_contents(backup)
+
+    def _verify_backup_contents(self, backup: Path) -> None:
         """Check database, manifest, safe member inventory and extracted exact bytes."""
         try:
-            if (backup / "INCOMPLETE").exists():
-                raise WorkflowError("incomplete backup")
             for name in ("newsroom.db", "manifest.json", "report.json", "artifacts.tar.gz"):
                 _no_symlinks(backup / name)
             manifest_bytes = (backup / "manifest.json").read_bytes()

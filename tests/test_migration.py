@@ -236,11 +236,11 @@ def test_backup_restores_exact_files_and_sqlite(legacy_workspace):
 def test_backup_corruption_is_removed_before_return(legacy_workspace, monkeypatch):
     f = legacy_workspace
     service = migrator(f.room)
-    verify = service.verify_backup
+    verify = service._verify_backup_contents
     def corrupt_then_verify(path):
         (path / 'artifacts.tar.gz').write_bytes(b'corrupt archive')
         verify(path)
-    monkeypatch.setattr(service, 'verify_backup', corrupt_then_verify)
+    monkeypatch.setattr(service, '_verify_backup_contents', corrupt_then_verify)
     with pytest.raises(WorkflowError, match='backup verification'):
         service.backup(service.preflight())
     assert not list((f.room.root / 'data/backups').glob('workspace-migration-*'))
@@ -484,9 +484,10 @@ def test_backup_cleanup_failure_marks_incomplete(legacy_workspace, monkeypatch):
     def fail_verification(path):
         raise WorkflowError('backup verification failed: injected corruption')
     monkeypatch.setattr('newsroom.migration.shutil.rmtree', reject_backup_removal)
-    monkeypatch.setattr(service, 'verify_backup', fail_verification)
-    with pytest.raises(WorkflowError, match='backup verification'):
+    monkeypatch.setattr(service, '_verify_backup_contents', fail_verification)
+    with pytest.raises(ExceptionGroup) as captured:
         service.backup(service.preflight())
+    assert any(isinstance(error, WorkflowError) and 'backup verification' in str(error) for error in exception_tree(captured.value))
     incomplete = list((f.room.root / 'data/backups').glob('workspace-migration-*'))
     assert len(incomplete) == 1
     assert (incomplete[0] / 'INCOMPLETE').is_file()
@@ -597,3 +598,137 @@ def test_preflight_database_isolation_preserves_live_sidecars(legacy_workspace):
         plan = migrator(f.room).preflight()
         assert plan.blocking_errors == []
         assert filesystem_details(f.room.root) == before
+
+
+@pytest.mark.parametrize('inventory_root', ['workspace', 'images', 'output/prompts', 'output/batches', 'workspace/batches/{batch_id}', 'articles/{article_id}', 'workspace/batches/{batch_id}/claude/requests'])
+def test_preflight_inventory_root_must_be_directory(legacy_workspace, inventory_root):
+    f = legacy_workspace
+    inventory_root = inventory_root.format(batch_id=f.batch_id, article_id=f.article_id)
+    path = f.room.root / inventory_root
+    if path.is_dir():
+        shutil.rmtree(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'not a directory')
+    before = filesystem_details(f.room.root)
+    service = migrator(f.room)
+    plan = service.preflight()
+    assert any('inventory root' in error and inventory_root in error for error in plan.blocking_errors)
+    assert str(f.room.root) not in json.dumps(plan.to_dict())
+    with pytest.raises(WorkflowError, match='blocking'):
+        service.backup(plan)
+    assert filesystem_details(f.room.root) == before
+    assert not (f.room.root / 'data/backups').exists()
+
+
+def test_preflight_target_ancestor_file_outside_inventory_blocks(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    ancestor = f.room.root / 'other-destinations/blocked'
+    ancestor.parent.mkdir()
+    ancestor.write_bytes(b'not a directory')
+    service = migrator(f.room)
+    real_target = service._target
+    def target_with_uninventoried_ancestor(source, *args, **kwargs):
+        if source == f.draft:
+            return Path('other-destinations/blocked/article-v2.md')
+        return real_target(source, *args, **kwargs)
+    monkeypatch.setattr(service, '_target', target_with_uninventoried_ancestor)
+    before = filesystem_details(f.room.root)
+    plan = service.preflight()
+    assert any('target ancestor' in error and 'other-destinations/blocked' in error for error in plan.blocking_errors)
+    assert str(f.room.root) not in json.dumps(plan.to_dict())
+    with pytest.raises(WorkflowError, match='blocking'):
+        service.backup(plan)
+    assert filesystem_details(f.room.root) == before
+    assert not (f.room.root / 'data/backups').exists()
+
+
+def exception_tree(error):
+    yield error
+    if isinstance(error, BaseExceptionGroup):
+        for nested in error.exceptions:
+            yield from exception_tree(nested)
+    if error.__cause__ is not None:
+        yield from exception_tree(error.__cause__)
+
+
+def assert_no_unmarked_backup(room):
+    backups = list((room.root / 'data/backups').glob('workspace-migration-*'))
+    assert all((path / 'INCOMPLETE').is_file() for path in backups)
+    assert not (room.root / 'workspace').exists()
+    assert not list(room.root.glob('.workspace-migration-*'))
+
+
+def test_backup_initial_marker_write_failure_removes_directory(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    original = OSError('initial incomplete marker unavailable')
+    real_write = Path.write_text
+    writes_before_marker = []
+    def fail_marker(path, *args, **kwargs):
+        if path.name == 'INCOMPLETE':
+            writes_before_marker.extend(path.parent.iterdir())
+            raise original
+        return real_write(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'write_text', fail_marker)
+    with pytest.raises(BaseException) as captured:
+        service.backup(plan)
+    assert original in list(exception_tree(captured.value))
+    assert writes_before_marker == []
+    assert not list((f.room.root / 'data/backups').glob('workspace-migration-*'))
+    assert_no_unmarked_backup(f.room)
+
+
+@pytest.mark.parametrize('stage', ['archive', 'verification'])
+def test_backup_keyboard_interrupt_preserves_incomplete_lifecycle(legacy_workspace, monkeypatch, stage):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    original = KeyboardInterrupt(f'interrupted {stage}')
+    marker_seen = []
+    def interrupt(*args, **kwargs):
+        backup = next((f.room.root / 'data/backups').glob('workspace-migration-*'))
+        marker_seen.append((backup / 'INCOMPLETE').is_file())
+        raise original
+    if stage == 'archive':
+        monkeypatch.setattr(tarfile.TarFile, 'addfile', interrupt)
+    else:
+        monkeypatch.setattr(service, '_verify_backup_contents', interrupt)
+    with pytest.raises(BaseException) as captured:
+        service.backup(plan)
+    assert original in list(exception_tree(captured.value))
+    assert marker_seen == [True]
+    assert_no_unmarked_backup(f.room)
+
+
+def test_backup_preserves_interrupt_cleanup_and_marker_errors(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    original = KeyboardInterrupt('original verification interruption')
+    cleanup = OSError('backup directory removal unavailable')
+    marker = OSError('incomplete marker update unavailable')
+    real_remove = shutil.rmtree
+    real_write = Path.write_text
+    marker_writes = []
+    def interrupt(path):
+        raise original
+    def fail_removal(path, *args, **kwargs):
+        if Path(path).name.startswith('workspace-migration-'):
+            raise cleanup
+        return real_remove(path, *args, **kwargs)
+    def fail_marker_update(path, *args, **kwargs):
+        if path.name == 'INCOMPLETE':
+            marker_writes.append(path)
+            if len(marker_writes) > 1:
+                raise marker
+        return real_write(path, *args, **kwargs)
+    monkeypatch.setattr(service, '_verify_backup_contents', interrupt)
+    monkeypatch.setattr('newsroom.migration.shutil.rmtree', fail_removal)
+    monkeypatch.setattr(Path, 'write_text', fail_marker_update)
+    with pytest.raises(BaseException) as captured:
+        service.backup(plan)
+    assert isinstance(captured.value, BaseExceptionGroup)
+    errors = list(exception_tree(captured.value))
+    assert all(error in errors for error in (original, cleanup, marker))
+    assert_no_unmarked_backup(f.room)
