@@ -91,10 +91,10 @@ def test_cli_imports_primary_only_candidate_csv(tmp_path: Path):
     assert json.loads(shown.output)["secondary_sources"] == []
 
 
-def test_typer_exposes_required_nested_commands():
+def test_typer_exposes_required_nested_commands(tmp_path):
     for command in (["candidate", action, "--help"] for action in ("add", "import", "export", "list", "show", "select", "reject")):
-        result = runner.invoke(app, command)
+        result = runner.invoke(app, ['--root', str(tmp_path), *command])
         assert result.exit_code == 0, result.output
     for command in (["duplicate-check", "--help"], ["published", "list", "--help"], ["stats", "--help"]):
-        result = runner.invoke(app, list(command))
+        result = runner.invoke(app, ['--root', str(tmp_path), *command])
         assert result.exit_code == 0, result.output

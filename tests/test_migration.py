@@ -7,6 +7,8 @@ from pathlib import Path
 import shutil
 import sqlite3
 import tarfile
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -1267,8 +1269,11 @@ def test_rollback_preserves_untracked_file_and_reports_required_recovery(legacy_
     with pytest.raises(BaseExceptionGroup) as captured:
         service.execute(plan, backup)
     assert original in list(exception_tree(captured.value))
-    assert any('untracked' in str(error) for error in exception_tree(captured.value))
-    assert extra.read_bytes() == b'editor data'
+    assert any('quarantine' in str(error) for error in exception_tree(captured.value))
+    journal = json.loads(next((f.room.root / 'data/workspace-migration-journals').glob('*.json')).read_bytes())
+    quarantine = Path(journal['quarantined_promotions'][0]['path'])
+    assert (quarantine / f.batch_id / extra.name).read_bytes() == b'editor data'
+    assert not extra.exists()
     with pytest.raises(WorkflowError, match='recovery'):
         migrator(f.room).execute_from_current_state()
 
@@ -1311,9 +1316,13 @@ def test_execute_reopens_generated_files_after_promotion(legacy_workspace, monke
         real_promote(*args)
         (f.room.root / f'workspace/batches/{f.batch_id}/OPEN_BATCH.command').write_text('changed dispatch')
     monkeypatch.setattr(service, '_promote_workspace', change_promoted_script)
-    with pytest.raises(WorkflowError, match='hash|launcher'):
+    with pytest.raises(BaseExceptionGroup) as captured:
         service.execute(plan, backup)
+    assert any('hash' in str(error) for error in exception_tree(captured.value))
     assert artifact_snapshot(f.room) == before
+    journal = json.loads(next((f.room.root / 'data/workspace-migration-journals').glob('*.json')).read_bytes())
+    quarantine = Path(journal['quarantined_promotions'][0]['path'])
+    assert (quarantine / f.batch_id / 'OPEN_BATCH.command').read_text() == 'changed dispatch'
 
 
 def test_idempotency_refuses_missing_generated_launcher(legacy_workspace):
@@ -1667,3 +1676,223 @@ def test_changed_retained_original_is_preserved_and_keeps_recovery_barrier(legac
     assert journal['recovery_status'] == 'RECOVERY_REQUIRED'
     assert (f.room.root / 'data/workspace-migration-lock.json').exists()
     assert not service.receipt_path.exists()
+
+
+def test_pending_finder_approval_prevents_migration_until_action_commits(ready_batch):
+    from newsroom.batch_release import BatchReleaseWorkflow
+    from newsroom.macos import MacOSBatchController
+    from test_macos import FakeDialogs
+    f = ready_batch
+    BatchReleaseWorkflow(f.room).review(f.batch_id, 'editor', 'reviewed')
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    report = service.save_report(plan)
+    waiting, resume = Event(), Event()
+
+    class PausedDialogs(FakeDialogs):
+        def confirm(self, *args):
+            waiting.set()
+            assert resume.wait(10), 'approval confirmation was not resumed'
+            return True
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        action = pool.submit(MacOSBatchController(f.room, PausedDialogs()).run, f.batch_id, 'approve')
+        try:
+            assert waiting.wait(10)
+            result = CliRunner().invoke(app, ['--root', str(f.room.root), 'workspace', 'migrate', '--execute', '--plan', str(report), '--backup', str(backup)])
+            assert result.exit_code == 2, result.output
+            assert 'active' in result.output.lower() and 'retry' in result.output.lower()
+            assert not (f.room.root / 'data/workspace-migration-lock.json').exists()
+            assert not list((f.room.root / 'workspace').glob('.migration-staging-*'))
+            assert all(f.room.get_article(article)['status'] == 'REVIEWED' for article in f.article_ids)
+        finally:
+            resume.set()
+        assert action.result(timeout=10) == 0
+    assert all(f.room.get_article(article)['status'] == 'APPROVED' for article in f.article_ids)
+
+
+@pytest.mark.parametrize('mutation', ['article', 'empty_directory', 'added_file', 'symlink'])
+def test_changed_promoted_tree_is_quarantined_before_exact_rollback(legacy_workspace, monkeypatch, mutation):
+    f = legacy_workspace
+    prepare_existing_canonical(f)
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before = artifact_snapshot(f.room)
+    relative = Path('batches') / f.batch_id / 'articles' / f.article_id / 'article-v2.md'
+    added = Path('batches') / f.batch_id / 'editor-added'
+    original = KeyboardInterrupt('stop after promoted editor change')
+    real_verify = service._verify_workspace
+
+    def change_then_interrupt(*args):
+        real_verify(*args)
+        if mutation == 'article':
+            changed = service.workspace.root / relative
+            changed.write_bytes(b'preserve edited promoted article')
+            changed.chmod(0o640)
+        elif mutation == 'empty_directory':
+            (service.workspace.root / added).mkdir(mode=0o750)
+        elif mutation == 'added_file':
+            (service.workspace.root / added).write_bytes(b'preserve added promoted file')
+        else:
+            (service.workspace.root / added).symlink_to('article-v2.md')
+        raise original
+
+    monkeypatch.setattr(service, '_verify_workspace', change_then_interrupt)
+    with pytest.raises(BaseException) as captured:
+        service.execute(plan, backup)
+    assert isinstance(captured.value, BaseExceptionGroup)
+    assert original in list(exception_tree(captured.value))
+    assert f.room.db_path.read_bytes() == (backup / 'newsroom.db').read_bytes()
+    assert artifact_snapshot(f.room) == before
+    journal = json.loads(next((f.room.root / 'data/workspace-migration-journals').glob('*.json')).read_bytes())
+    quarantine = Path(journal['quarantined_promotions'][0]['path'])
+    assert quarantine.is_relative_to(f.room.root / 'data/workspace-migration-recovery')
+    assert journal['stage'] != 'CLEANED' and journal['recovery_status'] == 'RECOVERY_REQUIRED'
+    if mutation == 'article':
+        assert (quarantine / relative.relative_to('batches')).read_bytes() == b'preserve edited promoted article'
+        assert (quarantine / relative.relative_to('batches')).stat().st_mode & 0o777 == 0o640
+    elif mutation == 'empty_directory':
+        assert (quarantine / added.relative_to('batches')).is_dir()
+        assert (quarantine / added.relative_to('batches')).stat().st_mode & 0o777 == 0o750
+    elif mutation == 'added_file':
+        assert (quarantine / added.relative_to('batches')).read_bytes() == b'preserve added promoted file'
+    else:
+        assert (quarantine / added.relative_to('batches')).is_symlink()
+    assert (f.room.root / 'data/workspace-migration-lock.json').exists()
+    assert not service.receipt_path.exists()
+    blocked = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert blocked.exit_code == 2 and 'recovery' in blocked.output.lower()
+
+
+@pytest.mark.parametrize('error_type', [KeyboardInterrupt, SystemExit, OSError])
+@pytest.mark.parametrize('unlinked', [True, False])
+def test_completed_migration_never_rolls_back_when_barrier_release_raises(legacy_workspace, monkeypatch, error_type, unlinked):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    original = error_type('barrier finalization interrupted')
+    real_unlink = Path.unlink
+    committed = {}
+
+    def interrupted_unlink(path, *args, **kwargs):
+        if path.name == 'workspace-migration-lock.json':
+            committed['database'] = f.room.db_path.read_bytes()
+            committed['artifacts'] = artifact_snapshot(f.room)
+            if unlinked:
+                real_unlink(path, *args, **kwargs)
+            raise original
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', interrupted_unlink)
+    result, failure = None, None
+    try:
+        result = service.execute(plan, backup)
+    except BaseException as error:
+        failure = error
+    if unlinked:
+        assert failure is None, repr(failure)
+        assert result['status'] == 'PASS'
+    else:
+        assert isinstance(failure, WorkflowError), repr(failure)
+        assert 'committed' in str(failure) and 'finalization' in str(failure) and 'recovery' in str(failure)
+        assert failure.__cause__ is original
+    assert f.room.db_path.read_bytes() == committed['database']
+    assert artifact_snapshot(f.room) == committed['artifacts']
+    assert f.room.get_article(f.article_id)['draft_path'].startswith('workspace/batches/')
+    assert service.receipt_path.exists()
+    journal = json.loads(next((f.room.root / 'data/workspace-migration-journals').glob('*.json')).read_bytes())
+    assert journal['stage'] == 'CLEANED' and not journal.get('recovery_status')
+    assert journal['finalization_error']['type'] == error_type.__name__
+    assert (f.room.root / 'data/workspace-migration-lock.json').exists() is (not unlinked)
+    normal = CliRunner().invoke(app, ['--root', str(f.room.root), 'batch', 'status', f.batch_id])
+    assert normal.exit_code == (0 if unlinked else 2), normal.output
+
+
+def test_migration_exclusive_lock_refuses_new_actions_before_persistent_barrier(legacy_workspace, monkeypatch):
+    from newsroom.macos import MacOSBatchController
+    from test_macos import FakeDialogs
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    real_stage = service._stage_workspace
+
+    def blocked_then_stage(*args):
+        assert not (f.room.root / 'data/workspace-migration-lock.json').exists()
+        with monkeypatch.context() as patch:
+            patch.setattr('newsroom.cli.Newsroom', lambda *_: pytest.fail('normal action accessed Newsroom during migration'))
+            result = CliRunner().invoke(app, ['--root', str(f.room.root), 'batch', 'status', f.batch_id])
+            assert result.exit_code == 2 and 'migration operation active' in result.output, result.output
+        dialogs = FakeDialogs()
+        controller = MacOSBatchController(f.room, dialogs)
+        with monkeypatch.context() as patch:
+            patch.setattr(controller.workspace, '_batch', lambda *_: pytest.fail('Finder action accessed batch during migration'))
+            assert controller.run(f.batch_id, 'approve') == 2
+        assert not dialogs.confirmations
+        real_stage(*args)
+
+    monkeypatch.setattr(service, '_stage_workspace', blocked_then_stage)
+    assert service.execute(plan, backup)['status'] == 'PASS'
+
+
+def test_normal_cli_holds_shared_lock_through_approval_commit(ready_batch, monkeypatch):
+    from newsroom.batch_release import BatchReleaseWorkflow
+    f = ready_batch
+    release = BatchReleaseWorkflow(f.room)
+    release.review(f.batch_id, 'editor', 'reviewed')
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    waiting, resume = Event(), Event()
+    real_approve = BatchReleaseWorkflow.approve
+
+    def paused_approve(self, *args):
+        waiting.set()
+        assert resume.wait(10)
+        return real_approve(self, *args)
+
+    monkeypatch.setattr(BatchReleaseWorkflow, 'approve', paused_approve)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        action = pool.submit(CliRunner().invoke, app, ['--root', str(f.room.root), 'batch', 'approve', f.batch_id, '--actor', 'editor', '--reason', 'approved'])
+        try:
+            assert waiting.wait(10)
+            with pytest.raises(WorkflowError, match='active.*retry migration'):
+                service.execute(plan, backup)
+            assert not (f.room.root / 'data/workspace-migration-lock.json').exists()
+        finally:
+            resume.set()
+        result = action.result(timeout=10)
+        assert result.exit_code == 0, result.output
+    assert all(f.room.get_article(article)['status'] == 'APPROVED' for article in f.article_ids)
+
+
+def test_unverifiable_committed_receipt_reinstates_barrier_without_rollback(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    real_release = service._release_barrier
+    original = KeyboardInterrupt('receipt damaged during final barrier removal')
+    committed = {}
+
+    def unlink_then_damage():
+        committed['database'] = f.room.db_path.read_bytes()
+        committed['artifacts'] = artifact_snapshot(f.room)
+        real_release()
+        service.receipt_path.write_bytes(b'{')
+        raise original
+
+    monkeypatch.setattr(service, '_release_barrier', unlink_then_damage)
+    with pytest.raises(WorkflowError, match='committed.*finalization.*recovery') as captured:
+        service.execute(plan, backup)
+    assert original in list(exception_tree(captured.value.__cause__))
+    assert f.room.db_path.read_bytes() == committed['database']
+    assert artifact_snapshot(f.room) == committed['artifacts']
+    assert (f.room.root / 'data/workspace-migration-lock.json').is_file()
+    journal = json.loads(next((f.room.root / 'data/workspace-migration-journals').glob('*.json')).read_bytes())
+    assert journal['stage'] == 'CLEANED' and journal['finalization_status'] == 'RECOVERY_REQUIRED'
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'recovery' in result.output.lower()

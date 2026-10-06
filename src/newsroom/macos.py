@@ -15,6 +15,7 @@ from .batch_models import (
     BatchRevisionResult,
 )
 from .batch_release import BatchReleaseWorkflow
+from .coordination import operation_lock
 from .service import Newsroom, WorkflowError
 from .workspace import BatchWorkspace, BatchWorkspacePaths
 
@@ -114,6 +115,13 @@ class MacOSBatchController:
     def run(self, batch_id: str, action: str) -> int:
         """Return zero on success/cancellation and two on expected user errors."""
         try:
+            with operation_lock(self.room.root):
+                return self._run(batch_id, action)
+        except (WorkflowError, ValidationError, OSError) as error:
+            return self._report_error(error)
+
+    def _run(self, batch_id: str, action: str) -> int:
+        try:
             from .migration import assert_migration_access
             assert_migration_access(self.room.root)
             if action not in ALLOWED_ACTIONS:
@@ -153,13 +161,15 @@ class MacOSBatchController:
                 self._show_status(self.workspace.refresh(batch_id))
             return 0
         except (WorkflowError, ValidationError, OSError) as error:
-            message = self._error_message(error)
-            try:
-                self.dialogs.alert("操作未完成", message, error=True)
-            except OSError as dialog_error:
-                # Preserve a deterministic exit when macOS itself cannot show UI.
-                print(f"操作未完成：{message}\n无法显示对话框：{dialog_error}", file=sys.stderr)
-            return 2
+            return self._report_error(error)
+
+    def _report_error(self, error: WorkflowError | ValidationError | OSError) -> int:
+        message = self._error_message(error)
+        try:
+            self.dialogs.alert("操作未完成", message, error=True)
+        except OSError as dialog_error:
+            print(f"操作未完成：{message}\n无法显示对话框：{dialog_error}", file=sys.stderr)
+        return 2
 
     def _pending_request(self, batch_id: str) -> dict | None:
         rows = self.room.db.all(

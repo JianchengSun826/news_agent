@@ -8,6 +8,8 @@ data/backups/
 data/workspace-migration-preflight.json
 data/workspace-migration-journals/
 data/workspace-migration-lock.json
+data/workspace-operation.lock
+data/workspace-migration-recovery/
 data/workspace-migration-receipt.json
 data/*.migration-restore
 articles/

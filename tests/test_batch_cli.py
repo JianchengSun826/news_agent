@@ -61,7 +61,7 @@ def write_candidate_csv(path: Path) -> Path:
     return path
 
 
-def test_cli_exposes_only_batch_post_selection_workflow():
+def test_cli_exposes_only_batch_post_selection_workflow(tmp_path):
     help_result = runner.invoke(app, ["--help"])
     assert help_result.exit_code == 0, help_result.output
     commands = {name for name, command in get_command(app).commands.items() if not command.hidden}
@@ -70,7 +70,7 @@ def test_cli_exposes_only_batch_post_selection_workflow():
         "image-plan", "review", "approve", "publish-packages",
         "publish-register", "refresh-workspace",
     ):
-        result = runner.invoke(app, ["batch", command, "--help"])
+        result = runner.invoke(app, ['--root', str(tmp_path), "batch", command, "--help"])
         assert result.exit_code == 0, result.output
 
 
@@ -306,7 +306,7 @@ def test_cli_batch_release_rejects_invalid_confirmation_without_mutation(release
     assert workspace_snapshot(batch) == before
 
 
-def test_typer_exposes_batch_commands():
+def test_typer_exposes_batch_commands(tmp_path):
     for command in (
         "prepare",
         "status",
@@ -316,7 +316,7 @@ def test_typer_exposes_batch_commands():
         "revision-request",
         "revision-import",
     ):
-        result = runner.invoke(app, ["batch", command, "--help"])
+        result = runner.invoke(app, ['--root', str(tmp_path), "batch", command, "--help"])
         assert result.exit_code == 0, result.output
 
 

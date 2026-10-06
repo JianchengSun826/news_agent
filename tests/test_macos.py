@@ -66,6 +66,17 @@ def db_snapshot(batch):
     )}
 
 
+def test_blocked_controller_still_returns_two_when_error_dialog_fails(prepared_batch, capsys):
+    (prepared_batch.room.root / 'data/workspace-migration-lock.json').write_text('{}')
+
+    class BrokenDialogs(FakeDialogs):
+        def alert(self, *args, **kwargs):
+            raise OSError('dialog unavailable')
+
+    assert MacOSBatchController(prepared_batch.room, BrokenDialogs()).run(prepared_batch.batch_id, 'approve') == 2
+    assert 'dialog unavailable' in capsys.readouterr().err
+
+
 @pytest.mark.parametrize('mutation', ['batch', 'request', 'output', 'schema', 'membership', 'malformed'])
 def test_import_rejects_invalid_result_without_mutation(prepared_batch, tmp_path, mutation):
     path = write_content_result(prepared_batch, tmp_path / 'result.json')

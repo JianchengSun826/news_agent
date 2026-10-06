@@ -25,8 +25,10 @@ class Newsroom:
         self.db = Database(self.db_path)
 
     def init(self) -> None:
+        from .coordination import initialize_operation_lock
         for name in ("data", "research", "articles", "images", "output"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
+        initialize_operation_lock(self.root)
         self.db.initialize(utc_now())
         self._seed_sources()
 

@@ -194,6 +194,8 @@ uv run newsroom workspace migrate --execute --plan data/workspace-migration-pref
 
 数据库提交前创建持久访问屏障 `data/workspace-migration-lock.json`，绑定本次 journal、manifest 与唯一 owner；提交结果尚不确定时也按可能已提交处理并验证恢复。屏障持续到目录替换、验证及清理完成，或 journal 已记录完整回滚；只有持有相同 owner 与原文件身份的执行者可删除屏障。普通 CLI 和批次 Finder 操作发现屏障后，在访问 Newsroom 路径前返回退出码 2 与恢复指引；迁移预检、备份和迁移控制器保留检查入口，执行仍拒绝未恢复的屏障。崩溃、恢复失败或屏障 owner 改变时保留屏障和诊断。原目录改名为 retained 后与删除前都会复查文件哈希和目录清单；新增文件、目录或修改会中止清理。回滚优先整体移回 retained 原目录，保留人工新增和修改；仅缺失素材从验证归档补回。无法验证原快照时保留素材、暂存和屏障，标记需要人工恢复，不记录成功清理。
 
+`data/workspace-operation.lock` 使用本地 `flock` 协调完整操作生命周期。普通 CLI 和批次 Finder 操作持有共享锁直到命令、确认对话框和写入全部结束；迁移执行在任何暂存或屏障创建前取得非阻塞独占锁，并持有至最终成功或回滚。若操作仍在等待确认，迁移返回退出码 2，要求先完成或取消操作再重试；迁移期间新操作同样拒绝。进程退出会释放操作锁，持久 JSON 屏障继续保护崩溃后的工作区。回滚会重新核对已替换目录的文件哈希和目录清单；发现编辑、新增文件、符号链接或空目录时，整体原子移到 journal 指定的 `data/workspace-migration-recovery/`，保留全部内容，再恢复原目录与数据库，标记 `RECOVERY_REQUIRED` 并保留屏障。隔离内容永不自动删除。验证 receipt 与 `CLEANED` journal 持久写入后即为最终提交点；此后屏障删除或收尾中断不会回滚数据库和目录。独占锁内再次核验 receipt、目录和屏障，确认屏障已删除时返回成功并记录警告；屏障仍在或无法验证时报告迁移已提交但收尾需要恢复，并继续阻止普通访问。
+
 刷新批次工作区会在 `workspace/README.md` 旁安装可执行、可搬迁的 `workspace/Migrate Newsroom.command`。Finder 启动器仅分派隐藏 CLI 控制器；控制器先预检、保存并打开报告，存在阻塞时拒绝继续，再要求编辑明确确认，之后才创建验证备份并执行迁移。取消只保留报告，不移动文件、不更改数据库。
 
 ## 9. 验证与离线 Demo
