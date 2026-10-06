@@ -905,8 +905,9 @@ def test_execute_hash_race_stops_before_database_update(legacy_workspace, monkey
             (f.room.root / f.draft).write_bytes(b'changed')
             return result
         monkeypatch.setattr(service, '_stage_workspace', change_after_staging)
-    with pytest.raises(WorkflowError, match='changed after preflight'):
+    with pytest.raises((WorkflowError, BaseExceptionGroup)) as captured:
         service.execute(plan, backup)
+    assert any('changed after preflight' in str(error) for error in exception_tree(captured.value))
     assert f.room.get_article(f.article_id) == before
     assert not (f.room.root / 'workspace/batches').exists()
 
@@ -1040,8 +1041,9 @@ def test_execute_new_untracked_file_before_switch_stops_without_deleting_it(lega
         real_stage(*args)
         extra.write_bytes(b'editor added this')
     monkeypatch.setattr(service, '_stage_workspace', add_after_staging)
-    with pytest.raises(WorkflowError, match='changed after preflight'):
+    with pytest.raises(BaseExceptionGroup) as captured:
         service.execute(plan, backup)
+    assert any('changed after preflight' in str(error) for error in exception_tree(captured.value))
     assert extra.read_bytes() == b'editor added this'
     assert f.room.get_article(f.article_id)['draft_path'] == f.draft.as_posix()
 
@@ -1164,8 +1166,9 @@ def test_execute_rechecks_verified_backup_before_database_switch(legacy_workspac
         real_stage(*args)
         (backup / 'newsroom.db').write_bytes(b'corrupt backup')
     monkeypatch.setattr(service, '_stage_workspace', corrupt_backup)
-    with pytest.raises(WorkflowError, match='backup'):
+    with pytest.raises(BaseExceptionGroup) as captured:
         service.execute(plan, backup)
+    assert any('backup verification' in str(error) for error in exception_tree(captured.value))
     assert f.room.db_path.read_bytes() == database
 
 
@@ -1560,8 +1563,9 @@ def test_unmanifested_retained_empty_directory_is_preserved(legacy_workspace, mo
         real_promote(stage)
 
     monkeypatch.setattr(service, '_promote_workspace', add_then_promote)
-    with pytest.raises(WorkflowError, match='retained originals changed'):
+    with pytest.raises(BaseExceptionGroup) as captured:
         service.execute(plan, backup)
+    assert any('retained originals changed' in str(error) for error in exception_tree(captured.value))
     assert (f.room.root / relative).is_dir()
     assert f.room.db_path.read_bytes() == (backup / 'newsroom.db').read_bytes()
     journal = json.loads(next((f.room.root / 'data/workspace-migration-journals').glob('*.json')).read_bytes())
@@ -1591,12 +1595,13 @@ def test_retained_recovery_moves_original_inodes_back_and_repairs_only_missing_f
         raise KeyboardInterrupt('verification interrupted after retained file disappeared')
 
     monkeypatch.setattr(service, '_verify_workspace', damage_then_verify)
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(BaseExceptionGroup) as captured:
         service.execute(plan, backup)
+    assert any(isinstance(error, KeyboardInterrupt) for error in exception_tree(captured.value))
     assert (root.stat().st_ino, kept.stat().st_ino) == original_inodes
     assert artifact_snapshot(f.room) == {**before, addition.relative_to(f.room.root).as_posix(): b'preserve editor addition'}
     assert f.room.db_path.read_bytes() == (backup / 'newsroom.db').read_bytes()
-    assert not (f.room.root / 'data/workspace-migration-lock.json').exists()
+    assert (f.room.root / 'data/workspace-migration-lock.json').exists()
 
 
 def test_migration_preflight_and_backup_deliberately_bypass_stale_barrier(legacy_workspace):
@@ -2407,3 +2412,227 @@ def test_terminal_migration_rejects_symlinked_publish_tree(approved_batch, tmp_p
     publish.symlink_to(outside, target_is_directory=True)
     result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
     assert result.exit_code == 2 and 'unsafe' in result.output.lower(), result.output
+
+
+def rolled_back_migration(f, monkeypatch):
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    with monkeypatch.context() as patch:
+        def stop(*args):
+            raise KeyboardInterrupt('test verified rollback')
+        patch.setattr(service, '_verify_workspace', stop)
+        with pytest.raises(KeyboardInterrupt):
+            service.execute(plan, backup)
+    journal = next((f.room.root / 'data/workspace-migration-journals').glob('*.json'))
+    return journal, backup
+
+
+@pytest.mark.parametrize('stage', ['DATABASE_UPDATED', 'ROLLED_BACK'])
+def test_forged_rollback_flags_do_not_admit_unverified_journal(legacy_workspace, stage):
+    f = legacy_workspace
+    directory = f.room.root / 'data/workspace-migration-journals'
+    directory.mkdir()
+    path = directory / 'forged.json'
+    path.write_text(json.dumps({'schema_version': 1, 'journal_path': str(path), 'stage': stage,
+                               'history': [{'stage': stage}], 'recovery_status': 'ROLLED_BACK',
+                               'failure': {'message': 'forged failure'}, 'barrier_acquired': False,
+                               'rollback_verified': True, 'access_released': True}))
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'recovery' in result.output.lower(), result.output
+
+
+@pytest.mark.parametrize('damage', ['database', 'corrupt_database', 'schema', 'artifact', 'artifact_symlink', 'missing_artifact', 'added_file', 'empty_directory',
+                                  'backup_corrupt', 'backup_missing', 'backup_foreign', 'backup_traversal', 'backup_symlink', 'history', 'rollback_receipt'])
+def test_rollback_terminal_revalidates_restored_state_and_backup(legacy_workspace, monkeypatch, damage):
+    f = legacy_workspace
+    path, backup = rolled_back_migration(f, monkeypatch)
+    journal = json.loads(path.read_bytes())
+    if damage == 'database':
+        with f.room.db.connect() as connection:
+            connection.execute("UPDATE articles SET draft_path='articles/missing/article-v2.md' WHERE article_id=?", (f.article_id,))
+    elif damage == 'corrupt_database':
+        f.room.db_path.write_bytes(b'corrupt restored database')
+    elif damage == 'schema':
+        with f.room.db.connect() as connection:
+            connection.execute('DELETE FROM schema_version WHERE version=4')
+    elif damage == 'artifact':
+        (f.room.root / f.draft).write_bytes(b'altered restored artifact')
+    elif damage == 'artifact_symlink':
+        source = f.room.root / f.draft
+        moved = source.with_name('moved-original.md')
+        source.rename(moved)
+        source.symlink_to(moved)
+    elif damage == 'missing_artifact':
+        (f.room.root / f.draft).unlink()
+    elif damage == 'added_file':
+        (f.room.root / 'articles/new-file.md').write_bytes(b'added restored artifact')
+    elif damage == 'empty_directory':
+        (f.room.root / 'articles/new-empty-directory').mkdir()
+    elif damage == 'backup_corrupt':
+        (backup / 'artifacts.tar.gz').write_bytes(b'corrupt')
+    elif damage == 'backup_missing':
+        backup.rename(backup.with_name('removed-backup'))
+    elif damage == 'backup_foreign':
+        journal['backup_path'] = '/foreign/data/backups/backup'
+    elif damage == 'backup_traversal':
+        journal['backup_path'] = str(f.room.root / 'data/backups/../backups' / backup.name)
+    elif damage == 'backup_symlink':
+        moved = backup.with_name('moved-backup')
+        backup.rename(moved)
+        backup.symlink_to(moved, target_is_directory=True)
+    elif damage == 'rollback_receipt':
+        Path(journal['rollback_receipt_path']).write_bytes(b'{')
+    else:
+        journal['history'] = []
+    path.write_text(json.dumps(journal))
+    before = snapshot(f.room.root)
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'recovery' in result.output.lower(), result.output
+    assert snapshot(f.room.root) == before
+
+
+@pytest.mark.parametrize('tree', ['retired', 'legacy'])
+@pytest.mark.parametrize('damage', ['changed_file', 'missing_file', 'added_file', 'added_empty_directory', 'missing_empty_directory', 'symlink'])
+def test_cleaned_terminal_revalidates_preserved_recovery_inventory(legacy_workspace, tree, damage):
+    f = legacy_workspace
+    batch = prepare_existing_canonical(f)
+    empty = f.room.root / ('workspace/batches' if tree == 'retired' else 'articles') / 'original-empty-directory'
+    empty.mkdir()
+    result = execute_clean_migration(f)
+    journal = json.loads(Path(result['journal_path']).read_bytes())
+    root = Path(journal['retired_stages'][0]['path']) if tree == 'retired' else next(Path(record['path']) for record in journal['legacy_originals'] if Path(record['source']).name == 'articles')
+    target = root / 'retained/batches' / batch / 'README.md' if tree == 'retired' else root / f.draft.relative_to('articles')
+    if damage == 'changed_file':
+        target.write_bytes(b'changed preserved material')
+    elif damage == 'missing_file':
+        target.unlink()
+    elif damage == 'added_file':
+        (root / 'extra.md').write_bytes(b'added retained bytes')
+    elif damage == 'added_empty_directory':
+        (root / 'extra-empty').mkdir()
+    elif damage == 'missing_empty_directory':
+        (root / ('retained/batches/original-empty-directory' if tree == 'retired' else 'original-empty-directory')).rmdir()
+    else:
+        target.unlink()
+        target.symlink_to(f.room.root / f.room.get_article(f.article_id)['draft_path'])
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'recovery' in result.output.lower(), result.output
+    assert root.is_dir()
+
+
+def test_valid_rollback_terminal_is_read_only_relocatable_and_can_be_superseded(legacy_workspace, monkeypatch, tmp_path):
+    from newsroom.migration import assert_migration_access
+    f = legacy_workspace
+    rolled_back_migration(f, monkeypatch)
+    before = filesystem_details(f.room.root)
+    assert_migration_access(f.room.root)
+    assert filesystem_details(f.room.root) == before
+    moved = tmp_path.parent / (tmp_path.name + ' valid rollback relocation')
+    shutil.copytree(f.room.root, moved)
+    shutil.rmtree(f.room.root)
+    room = Newsroom(moved)
+    assert_migration_access(moved)
+    result = CliRunner().invoke(app, ['--root', str(moved), 'stats'])
+    assert result.exit_code == 0, result.output
+    service = migrator(room)
+    plan = service.preflight()
+    service.execute(plan, service.backup(plan))
+    result = CliRunner().invoke(app, ['--root', str(moved), 'batch', 'refresh-workspace', f.batch_id])
+    assert result.exit_code == 0, result.output
+    article = room.get_article(f.article_id)
+    (moved / article['draft_path']).write_text('legitimate active human edit')
+    assert_migration_access(moved)
+
+
+@pytest.mark.parametrize('boundary', ['relocation', 'after_inventory'])
+def test_retained_open_handle_writes_survive_and_block_admission(legacy_workspace, monkeypatch, boundary):
+    f = legacy_workspace
+    batch = prepare_existing_canonical(f)
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    real_replace, real_release = os.replace, service._release_barrier
+    captured = {}
+    def edit_through_handle(path, move=None):
+        captured['inode'] = path.stat().st_ino
+        captured['bytes'] = path.read_bytes() + b'\neditor open-handle write\n'
+        with path.open('ab') as editor:
+            if move:
+                move()
+            editor.write(b'\neditor open-handle write\n')
+            editor.flush()
+            os.fsync(editor.fileno())
+    def replace(source, destination):
+        if boundary == 'relocation' and Path(source).name.startswith('.migration-staging-') and Path(destination).is_relative_to(f.room.root / 'data/workspace-migration-recovery'):
+            target = Path(source) / 'retained/batches' / batch / 'README.md'
+            edit_through_handle(target, lambda: real_replace(source, destination))
+            return
+        return real_replace(source, destination)
+    def release():
+        if boundary == 'after_inventory':
+            path = Path(service._execution['retired_stages'][0]['path']) / 'retained/batches' / batch / 'README.md'
+            edit_through_handle(path)
+        return real_release()
+    monkeypatch.setattr('newsroom.migration.os.replace', replace)
+    monkeypatch.setattr(service, '_release_barrier', release)
+    try:
+        service.execute(plan, backup)
+    except BaseException:
+        pass
+    assert captured
+    originals = [path for path in f.room.root.rglob('*') if path.is_file() and path.stat().st_ino == captured['inode']]
+    assert originals and originals[0].read_bytes() == captured['bytes']
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'recovery' in result.output.lower(), result.output
+
+
+def test_final_recovery_inventory_rechecks_legacy_bytes_after_all_moves(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    real_verify = service._verify_retained
+    changed = False
+    def edit_before_final_inventory(plan, stage):
+        nonlocal changed
+        real_verify(plan, stage)
+        if Path(stage).is_relative_to(f.room.root / 'data/workspace-migration-recovery') and not changed:
+            record = next(record for record in service._execution['legacy_originals'] if Path(record['source']).name == 'articles')
+            with (Path(record['path']) / f.draft.relative_to('articles')).open('ab') as handle:
+                handle.write(b'late editor bytes before final inventory')
+            changed = True
+    monkeypatch.setattr(service, '_verify_retained', edit_before_final_inventory)
+    try:
+        service.execute(plan, backup)
+    except BaseException:
+        pass
+    assert changed
+    assert not service.receipt_path.exists()
+    assert any(path.read_bytes().endswith(b'late editor bytes before final inventory') for path in f.room.root.rglob('article-v2.md'))
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2, result.output
+
+
+def test_final_inventory_cannot_accept_changed_bytes_between_verification_and_scan(legacy_workspace, monkeypatch):
+    import newsroom.migration as migration
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    scan = migration._confirmed_inventory
+    changed = False
+    def edit_then_scan(path):
+        nonlocal changed
+        if Path(path).name == 'articles' and Path(path).is_relative_to(f.room.root / 'data/workspace-migration-recovery') and not changed:
+            (Path(path) / f.draft.relative_to('articles')).write_bytes(b'editor write immediately before inventory')
+            changed = True
+        return scan(path)
+    monkeypatch.setattr(migration, '_confirmed_inventory', edit_then_scan)
+    try:
+        service.execute(plan, backup)
+    except BaseException:
+        pass
+    assert changed
+    assert not service.receipt_path.exists()
+    assert any(path.read_bytes() == b'editor write immediately before inventory' for path in f.room.root.rglob('article-v2.md'))

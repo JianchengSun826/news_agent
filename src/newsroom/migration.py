@@ -68,6 +68,7 @@ def assert_migration_access(root: Path | str) -> None:
                     and journal.get('access_released') is True
                     and not journal.get('recovery_failures')
                     and journal.get('finalization_status') in {None, 'COMMITTED'}):
+                WorkspaceMigrator(Newsroom(root))._validate_rollback(journal, path)
                 continue
             if journal.get('recovery_status') or journal['stage'] != 'CLEANED' or journal.get('finalization_status') != 'COMMITTED' or journal.get('access_released') is not True:
                 raise ValueError('migration is unresolved')
@@ -147,6 +148,38 @@ def _record_root(record: dict[str, Any]) -> str | None:
             raise WorkflowError('unsafe historical migration journal reference')
         return str(journal.parents[2])
     return None
+
+
+def _tree_inventory(root: Path) -> dict[str, Any]:
+    """Portable identities, exact bytes, permissions and empty directories."""
+    _no_symlinks(root)
+    paths = [root]
+    if root.is_dir():
+        for directory, dirs, files in os.walk(root, followlinks=False, onerror=_walk_error):
+            paths.extend(Path(directory) / name for name in sorted(dirs + files))
+    inventory = {}
+    for path in paths:
+        before = path.lstat()
+        key = path.relative_to(root).as_posix()
+        mode = stat.S_IMODE(before.st_mode)
+        if stat.S_ISDIR(before.st_mode):
+            inventory[key] = {'kind': 'directory', 'mode': mode}
+        elif stat.S_ISREG(before.st_mode):
+            sha, size = _digest(path)
+            after = path.lstat()
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_mode) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_mode):
+                raise WorkflowError('snapshot changed during verification; recovery required')
+            inventory[key] = {'kind': 'file', 'mode': mode, 'sha256': sha, 'size': size}
+        else:
+            raise WorkflowError('unsafe snapshot object; recovery required')
+    return dict(sorted(inventory.items()))
+
+
+def _confirmed_inventory(root: Path) -> dict[str, Any]:
+    first = _tree_inventory(root)
+    if _tree_inventory(root) != first:
+        raise WorkflowError('snapshot changed during final inventory; recovery required')
+    return first
 
 
 def _walk_error(error: OSError) -> None:
@@ -1347,6 +1380,147 @@ class WorkspaceMigrator:
             if _database(connection)[1] != plan.database_snapshot_sha256:
                 raise WorkflowError('recovery database does not match original snapshot')
 
+    def _artifact_inventory(self) -> dict[str, Any]:
+        result = {}
+        for name in ('research', 'articles', 'images', 'output', 'workspace'):
+            path = self.room.root / name
+            result[name] = _confirmed_inventory(path) if path.exists() or path.is_symlink() else None
+        return result
+
+    @staticmethod
+    def _inventory_matches_originals(inventory: dict[str, Any], plan: MigrationPlan, directories: list[dict[str, Any]]) -> None:
+        files, actual_directories = {}, {}
+        if set(inventory) != {'research', 'articles', 'images', 'output', 'workspace'}:
+            raise WorkflowError('rollback root inventory mismatch')
+        for name, tree in inventory.items():
+            if tree is None:
+                continue
+            for relative, record in tree.items():
+                path = Path(name) if relative == '.' else Path(name) / relative
+                _safe_relative(path)
+                if record['kind'] == 'file':
+                    files[path.as_posix()] = (record['sha256'], record['size'])
+                elif record['kind'] == 'directory':
+                    actual_directories[path.as_posix()] = record['mode']
+                else:
+                    raise WorkflowError('unsafe rollback inventory object')
+        expected = {entry.source.as_posix(): (entry.sha256, entry.size) for entry in plan.entries
+                    if not entry.source.is_absolute() and entry.source.parts[0] in inventory}
+        expected_directories = {record['path']: record['mode'] for record in directories}
+        if files != expected or actual_directories != expected_directories:
+            raise WorkflowError('restored original artifact inventory mismatch; recovery required')
+
+    def _record_rollback(self, plan: MigrationPlan, backup: Path) -> None:
+        self.verify_backup(backup)
+        self._verify_originals(plan)
+        inventory = self._artifact_inventory()
+        self._inventory_matches_originals(inventory, plan, self._execution['directories'])
+        receipt = {'schema_version': 1, 'repository_root': str(self.room.root),
+                   'journal_path': self._execution['journal_path'], 'backup_path': str(backup),
+                   'manifest_sha256': self._execution['manifest_sha256'],
+                   'database_snapshot_sha256': plan.database_snapshot_sha256,
+                   'original_inventory': inventory, 'history': deepcopy(self._execution['history'])}
+        path = self._recovery_root() / 'rollback-receipt.json'
+        _durable_json(path, receipt)
+        self._execution['rollback_receipt_path'] = str(path)
+        self._execution['rollback_receipt_sha256'] = _digest(path)[0]
+
+    def _validate_rollback(self, journal: dict[str, Any], path: Path) -> None:
+        origin = _record_root(journal)
+        if (journal['stage'] != 'ROLLED_BACK' or not journal.get('failure') or journal.get('barrier_acquired')
+                or journal.get('finalization_failures') or not journal['history'] or journal['history'][-1]['stage'] != 'ROLLED_BACK'):
+            raise WorkflowError('rollback terminal invariants missing')
+        phases = [record['stage'] for record in journal['history'][:-1]]
+        if phases != ['BACKED_UP', 'STAGED', 'DATABASE_UPDATED', 'PROMOTED', 'VERIFIED'][:len(phases)]:
+            raise WorkflowError('rollback history invalid')
+        backup = _repository_reference(self.room.root, journal['backup_path'], Path('data/backups'), origin)
+        self.verify_backup(backup)
+        if _digest(backup / 'manifest.json')[0] != journal['manifest_sha256']:
+            raise WorkflowError('rollback manifest binding mismatch')
+        plan = MigrationPlan.from_dict(json.loads((backup / 'manifest.json').read_bytes())['plan'])
+        recovery = Path('data/workspace-migration-recovery') / path.stem
+        receipt_path = _repository_reference(self.room.root, journal['rollback_receipt_path'], recovery, origin)
+        if _digest(receipt_path)[0] != journal['rollback_receipt_sha256']:
+            raise WorkflowError('rollback receipt binding mismatch')
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt_origin = _record_root(receipt)
+        if (receipt['schema_version'] != 1
+                or _repository_reference(self.room.root, receipt['journal_path'], Path('data/workspace-migration-journals'), receipt_origin) != path
+                or _repository_reference(self.room.root, receipt['backup_path'], Path('data/backups'), receipt_origin) != backup
+                or receipt['manifest_sha256'] != journal['manifest_sha256']
+                or receipt['history'] != journal['history'][:-1]
+                or receipt['database_snapshot_sha256'] != plan.database_snapshot_sha256):
+            raise WorkflowError('rollback receipt identity/history mismatch')
+        self._inventory_matches_originals(receipt['original_inventory'], plan, journal['directories'])
+        if self.receipt_path.exists():
+            completed = self._validate_completed_receipt()
+            current_receipt = json.loads(self.receipt_path.read_bytes())
+            bound = any(_repository_reference(self.room.root, record['journal_path'], Path('data/workspace-migration-journals'), _record_root(current_receipt)) == path
+                        and record['rollback_receipt_sha256'] == journal['rollback_receipt_sha256']
+                        for record in current_receipt['superseded_rollbacks'])
+            if not bound:
+                raise WorkflowError('rollback is not bound to completed successor migration')
+            with self._connect_readonly(Path(completed['backup_path']) / 'newsroom.db') as connection:
+                if _database(connection)[1] != plan.database_snapshot_sha256:
+                    raise WorkflowError('rollback successor original database mismatch')
+            return
+        with self._connect_readonly() as connection:
+            tables, fingerprint = _database(connection)
+            if fingerprint != plan.database_snapshot_sha256 or max(row['version'] for row in tables['schema_version']) != 4:
+                raise WorkflowError('rollback restored database identity/schema mismatch')
+            for rows in tables.values():
+                for row in rows:
+                    for column, value in row.items():
+                        if column.endswith('_path') and value:
+                            relative = Path(value)
+                            _safe_relative(relative)
+                            artifact = self.room.root / relative
+                            _no_symlinks(artifact)
+                            if not artifact.is_file():
+                                raise WorkflowError('rollback database material path missing')
+        if self._artifact_inventory() != receipt['original_inventory']:
+            raise WorkflowError('rollback restored artifact inventory mismatch')
+
+    def _validate_recovery_snapshots(self, journal: dict[str, Any], receipt: dict[str, Any]) -> None:
+        snapshots = journal['recovery_snapshots']
+        if hashlib.sha256(_json_bytes(snapshots)).hexdigest() != receipt['recovery_inventory_sha256']:
+            raise WorkflowError('recovery snapshot journal/receipt binding mismatch')
+        origin = _record_root(journal)
+        recovery = Path('data/workspace-migration-recovery') / Path(journal['journal_path']).stem
+        expected = [record['path'] for record in [*journal['retired_stages'], *journal.get('legacy_originals', [])]
+                    if record['status'] == 'PRESERVED']
+        if [record['path'] for record in snapshots] != expected or not expected:
+            raise WorkflowError('recovery snapshot path inventory mismatch')
+        for record in snapshots:
+            path = _repository_reference(self.room.root, record['path'], recovery, origin)
+            if _confirmed_inventory(path) != record['inventory']:
+                raise WorkflowError('preserved recovery snapshot integrity mismatch')
+        backup = _repository_reference(self.room.root, journal['backup_path'], Path('data/backups'), origin)
+        plan = MigrationPlan.from_dict(json.loads((backup / 'manifest.json').read_bytes())['plan'])
+        self._validate_snapshot_origins(journal, plan)
+
+    @staticmethod
+    def _validate_snapshot_origins(journal: dict[str, Any], plan: MigrationPlan) -> None:
+        snapshots = {record['path']: record['inventory'] for record in journal['recovery_snapshots']}
+        originals = [(Path(record['source']).name, snapshots[record['path']]) for record in journal.get('legacy_originals', [])]
+        for record in journal['retired_stages']:
+            tree = snapshots[record['path']]
+            for operation in journal['promotions']:
+                if operation['had_original']:
+                    prefix = Path('retained') / operation['name']
+                    inventory = {Path(key).relative_to(prefix).as_posix(): value for key, value in tree.items() if Path(key).is_relative_to(prefix)}
+                    originals.append((str(Path('workspace') / operation['name']), inventory))
+        for name, inventory in originals:
+            relative = Path(name)
+            expected = {entry.source.relative_to(relative).as_posix(): (entry.sha256, entry.size)
+                        for entry in plan.entries if not entry.source.is_absolute() and entry.source.is_relative_to(relative)}
+            directories = {Path(record['path']).relative_to(relative).as_posix(): record['mode']
+                           for record in journal['directories'] if Path(record['path']).is_relative_to(relative)}
+            files = {key: (record['sha256'], record['size']) for key, record in inventory.items() if record['kind'] == 'file'}
+            actual_directories = {key: record['mode'] for key, record in inventory.items() if record['kind'] == 'directory'}
+            if files != expected or actual_directories != directories:
+                raise WorkflowError('final preserved original inventory differs from verified backup')
+
     def execute(self, plan: MigrationPlan, backup_dir: Path) -> dict[str, Any]:
         with operation_lock(self.room.root, exclusive=True):
             return self._execute_locked(plan, backup_dir)
@@ -1386,6 +1560,11 @@ class WorkspaceMigrator:
                            'database_updated': False, 'database_update_attempted': False,
                            'barrier_acquired': False, 'promotions': [], 'removed_sources': [],
                            'directories': directories, 'source_stats': stats, 'promoted_files': {}}
+        self._execution['superseded_rollbacks'] = [
+            {'journal_path': str(path), 'rollback_receipt_sha256': record['rollback_receipt_sha256']}
+            for path in sorted(journal.parent.glob('*.json'))
+            if (record := json.loads(path.read_bytes())).get('recovery_status') == 'ROLLED_BACK'
+        ]
         self._active_plan = plan
         try:
             self._journal('BACKED_UP')
@@ -1406,10 +1585,20 @@ class WorkspaceMigrator:
             self._verify_retained(plan, stage)
             retired = self._preserve_tree(stage, 'retired_stages', 'retired')
             self._verify_retained(plan, Path(retired['path']))
+            for record in self._execution.get('legacy_originals', []):
+                self._verify_legacy_original(plan, Path(record['source']).name, Path(record['path']))
+            self._execution['recovery_snapshots'] = [
+                {'path': record['path'], 'inventory': _confirmed_inventory(Path(record['path']))}
+                for record in [*self._execution['retired_stages'], *self._execution.get('legacy_originals', [])]
+            ]
+            self._validate_snapshot_origins(self._execution, plan)
+            self._journal()  # Inventory is durable before receipt/CLEANED commit.
             receipt = {'schema_version': 1, 'manifest_sha256': manifest_sha, 'repository_root': str(self.room.root),
                        'backup_path': str(backup), 'journal_path': str(journal),
                        'retired_paths': [record['path'] for record in self._execution['retired_stages']],
-                       'legacy_paths': [record['path'] for record in self._execution.get('legacy_originals', [])]}
+                       'legacy_paths': [record['path'] for record in self._execution.get('legacy_originals', [])],
+                       'superseded_rollbacks': self._execution['superseded_rollbacks'],
+                       'recovery_inventory_sha256': hashlib.sha256(_json_bytes(self._execution['recovery_snapshots'])).hexdigest()}
             _durable_json(self.receipt_path, receipt)
             self._journal('CLEANED')
             self._release_barrier()
@@ -1455,11 +1644,16 @@ class WorkspaceMigrator:
                     failures.append(error)
             if any(record.get('changed') for record in self._execution.get('quarantined_promotions', [])):
                 failures.append(WorkflowError('changed promoted content preserved in migration recovery quarantine; recovery required'))
+            if len(failures) == 1:
+                try:
+                    self._record_rollback(plan, backup)
+                except BaseException as error:
+                    failures.append(error)
             self._execution['recovery_status'] = 'ROLLED_BACK' if len(failures) == 1 else 'RECOVERY_REQUIRED'
             self._execution['rollback_verified'] = len(failures) == 1
             self._execution['recovery_failures'] = [{'type': type(error).__name__, 'message': str(error)} for error in failures[1:]]
             try:
-                self._journal()
+                self._journal('ROLLED_BACK' if len(failures) == 1 else None)
                 if len(failures) == 1:
                     self._release_barrier()  # Only after a recorded completed rollback.
                     self._execution['access_released'] = True
@@ -1488,6 +1682,7 @@ class WorkspaceMigrator:
             current = json.loads(Path(state['journal_path']).read_bytes())
             if json.loads(self.receipt_path.read_bytes()) != receipt or current['stage'] != 'CLEANED' or current['manifest_sha256'] != state['manifest_sha256']:
                 raise WorkflowError('committed receipt or journal cannot be verified')
+            self._validate_recovery_snapshots(current, receipt)
             self._verify_workspace(plan)
             verified = True
         except BaseException as error:
@@ -1549,6 +1744,8 @@ class WorkspaceMigrator:
                 raise ValueError('journal/receipt identity mismatch')
             if journal['stage'] != 'CLEANED' or journal['manifest_sha256'] != receipt['manifest_sha256'] or journal.get('recovery_status') or journal.get('access_released') is not True or journal.get('finalization_status') != 'COMMITTED':
                 raise ValueError('unfinished journal')
+            if journal['superseded_rollbacks'] != receipt['superseded_rollbacks']:
+                raise ValueError('successor rollback linkage mismatch')
             recovery = Path('data/workspace-migration-recovery') / journal_path.stem
             retired = [_repository_reference(self.room.root, record['path'], recovery, journal_origin)
                        for record in journal['retired_stages'] if record['status'] == 'PRESERVED']
@@ -1561,6 +1758,7 @@ class WorkspaceMigrator:
             for path in [*retired, *legacy]:
                 if not path.is_dir():
                     raise ValueError('receipt retired tree unavailable or unsafe')
+            self._validate_recovery_snapshots(journal, receipt)
             plan = MigrationPlan.from_dict(json.loads((backup / 'manifest.json').read_bytes())['plan'])
         except (KeyError, ValueError, OSError) as error:
             raise WorkflowError(f'invalid migration receipt; recovery required: {error}') from error
