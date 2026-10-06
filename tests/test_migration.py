@@ -15,7 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 from newsroom.cli import app
-from newsroom.migration import WorkspaceMigrator
+from newsroom.migration import MigrationEntry, MigrationPlan, WorkspaceMigrator
 from newsroom.service import Newsroom, WorkflowError
 from test_batch import candidate_row, write_batch_csv, newsroom, prepared_batch, content_batch
 from test_batch_release import all_pass_batch, ready_batch, approved_batch
@@ -165,6 +165,177 @@ def test_preflight_casefold_destinations_block(legacy_workspace):
     path.parent.mkdir(parents=True)
     path.write_text('case collision')
     assert any('collision' in e for e in migrator(f.room).preflight().blocking_errors)
+
+
+def _add_legacy_image_collision(f, extras):
+    bound = Path('images') / f.single_id / 'hero-v2.png'
+    (f.room.root / bound).parent.mkdir(parents=True, exist_ok=True)
+    (f.room.root / bound).write_bytes(b'database-bound image')
+    with f.room.db.connect() as connection:
+        connection.execute(
+            'INSERT INTO images(image_id,article_id,image_type,image_path) VALUES (?,?,?,?)',
+            ('img-legacy-bound', f.single_id, 'LICENSED', bound.as_posix()),
+        )
+    for source, content in extras:
+        path = f.room.root / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    return bound
+
+
+def test_preflight_preserves_bound_hero_and_routes_unbound_hero_to_legacy_files(legacy_workspace):
+    f = legacy_workspace
+    extra = Path('images') / f.single_id / 'hero.png'
+    bound = _add_legacy_image_collision(f, [(extra, b'unbound original hero')])
+
+    plan = migrator(f.room).preflight()
+
+    assert plan.blocking_errors == []
+    by_source = {entry.source: entry for entry in plan.entries}
+    article_root = Path('workspace/archive/legacy-single-articles') / f.single_id
+    assert by_source[bound].target == article_root / 'hero.png'
+    assert by_source[extra].target.parent == article_root / 'legacy-files/images' / f.single_id
+    assert by_source[extra].target.name.startswith('hero--')
+    assert by_source[extra].target.suffix == '.png'
+    assert by_source[extra].target != by_source[bound].target
+    assert by_source[extra].sha256 == hashlib.sha256(b'unbound original hero').hexdigest()
+
+
+def test_preflight_routes_multiple_casefolding_extras_from_distinct_roots(legacy_workspace):
+    f = legacy_workspace
+    extras = [
+        (Path('images') / f.single_id / 'hero.png', b'images extra'),
+        (Path('articles') / f.single_id / 'hero.png', b'articles extra'),
+        (Path('research') / f.single_id / 'HERO.PNG', b'research case extra'),
+    ]
+    bound = _add_legacy_image_collision(f, extras)
+
+    plan = migrator(f.room).preflight()
+
+    assert plan.blocking_errors == []
+    selected = [entry for entry in plan.entries if entry.source in {bound, *(source for source, _ in extras)}]
+    assert len(selected) == 4
+    assert len({entry.target.as_posix().casefold() for entry in selected}) == 4
+    for source, content in extras:
+        entry = next(entry for entry in selected if entry.source == source)
+        assert '/legacy-files/' in '/' + entry.target.as_posix()
+        assert source.parts[0] in entry.target.parts
+        assert entry.sha256 == hashlib.sha256(content).hexdigest()
+
+
+def test_archive_extra_resolution_is_deterministic_independent_of_plan_order(legacy_workspace):
+    f = legacy_workspace
+    article_root = Path('workspace/archive/legacy-single-articles') / f.single_id
+    preferred = MigrationEntry(
+        Path('images') / f.single_id / 'hero-v2.png', article_root / 'hero.png',
+        'a' * 64, 1, article_id=f.single_id, database_table='images', database_field='image_path',
+    )
+    extras = [
+        MigrationEntry(Path('images') / f.single_id / name, article_root / name.lower(), digest * 64, 1, article_id=f.single_id)
+        for name, digest in [('hero.png', 'b'), ('HERO.PNG', 'c')]
+    ]
+    service = migrator(f.room)
+    first = MigrationPlan(legacy=[preferred, *extras])
+    second = MigrationPlan(legacy=[*reversed(extras), preferred])
+
+    service._resolve_archive_extra_collisions(first)
+    service._resolve_archive_extra_collisions(second)
+
+    assert {entry.source: entry.target for entry in first.entries} == {
+        entry.source: entry.target for entry in second.entries
+    }
+    assert len({entry.target.as_posix().casefold() for entry in first.entries}) == 3
+
+
+def test_canonical_archive_file_keeps_preferred_target_over_unbound_extra(legacy_workspace):
+    f = legacy_workspace
+    target = Path('workspace/archive/legacy-single-articles') / f.single_id / 'hero.png'
+    canonical = MigrationEntry(target, target, 'a' * 64, 1, article_id=f.single_id)
+    extra = MigrationEntry(
+        Path('images') / f.single_id / 'hero.png', target, 'b' * 64, 1, article_id=f.single_id,
+    )
+    plan = MigrationPlan(legacy=[extra, canonical])
+
+    migrator(f.room)._resolve_archive_extra_collisions(plan)
+
+    by_source = {entry.source: entry for entry in plan.entries}
+    assert by_source[canonical.source].target == target
+    assert by_source[extra.source].target.is_relative_to(target.parent / 'legacy-files')
+
+
+def test_preflight_two_database_bound_images_still_block(legacy_workspace):
+    f = legacy_workspace
+    first = Path('images') / f.single_id / 'hero-v2.png'
+    second = Path('images') / f.single_id / 'hero-v3.png'
+    for path in (first, second):
+        (f.room.root / path).parent.mkdir(parents=True, exist_ok=True)
+        (f.room.root / path).write_bytes(path.name.encode())
+    with f.room.db.connect() as connection:
+        connection.executemany(
+            'INSERT INTO images(image_id,article_id,image_type,image_path) VALUES (?,?,?,?)',
+            [
+                ('img-bound-one', f.single_id, 'LICENSED', first.as_posix()),
+                ('img-bound-two', f.single_id, 'LICENSED', second.as_posix()),
+            ],
+        )
+
+    assert any('target collision' in error for error in migrator(f.room).preflight().blocking_errors)
+
+
+def test_archive_extra_resolution_does_not_hide_ambiguous_ownership(legacy_workspace):
+    f = legacy_workspace
+    target = Path('workspace/archive/legacy-single-articles') / f.single_id / 'hero.png'
+    plan = MigrationPlan(legacy=[
+        MigrationEntry(Path('images/one/hero-v2.png'), target, 'a' * 64, 1,
+                       article_id=f.single_id, database_table='images', database_field='image_path'),
+        MigrationEntry(Path('images/two/hero.png'), target, 'b' * 64, 1,
+                       article_id='art-different'),
+    ])
+    service = migrator(f.room)
+
+    service._resolve_archive_extra_collisions(plan)
+    service._collisions(plan)
+
+    assert any('ambiguous ownership' in error for error in plan.blocking_errors)
+    assert any('target collision' in error for error in plan.blocking_errors)
+
+
+def test_archive_extra_target_rejects_traversal_and_symlink_ancestor(legacy_workspace, tmp_path):
+    f = legacy_workspace
+    service = migrator(f.room)
+    target = Path('workspace/archive/legacy-single-articles') / f.single_id / 'hero.png'
+    unsafe = MigrationEntry(Path('../hero.png'), target, 'a' * 64, 1, article_id=f.single_id)
+    with pytest.raises(WorkflowError, match='unsafe'):
+        service._archive_extra_target(unsafe)
+
+    extra = Path('images') / f.single_id / 'hero.png'
+    _add_legacy_image_collision(f, [(extra, b'extra')])
+    legacy_files = f.room.root / 'workspace/archive/legacy-single-articles' / f.single_id / 'legacy-files'
+    legacy_files.parent.mkdir(parents=True, exist_ok=True)
+    legacy_files.symlink_to(tmp_path / 'outside', target_is_directory=True)
+
+    errors = migrator(f.room).preflight().blocking_errors
+    assert any('symlink' in error and 'legacy-files' in error for error in errors)
+    assert any('target collision' in error for error in errors)
+
+
+def test_execute_preserves_bound_and_unbound_colliding_images_separately(legacy_workspace):
+    f = legacy_workspace
+    extra = Path('images') / f.single_id / 'hero.png'
+    bound = _add_legacy_image_collision(f, [(extra, b'unbound original hero')])
+    service = migrator(f.room)
+    plan = service.preflight()
+    by_source = {entry.source: entry for entry in plan.entries}
+
+    service.execute(plan, service.backup(plan))
+
+    assert (f.room.root / by_source[bound].target).read_bytes() == b'database-bound image'
+    assert (f.room.root / by_source[extra].target).read_bytes() == b'unbound original hero'
+    with f.room.db.connect() as connection:
+        image = connection.execute(
+            'SELECT image_path FROM images WHERE image_id=?', ('img-legacy-bound',),
+        ).fetchone()
+    assert image['image_path'] == by_source[bound].target.as_posix()
 
 
 def test_preflight_inventories_images_prompts_packages_and_history(legacy_workspace):

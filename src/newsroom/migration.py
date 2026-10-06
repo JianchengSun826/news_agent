@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextlib import closing, contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import gzip
 import hashlib
@@ -472,6 +472,7 @@ class WorkspaceMigrator:
             if any(e.sha256 != batch["source_sha256"] for e in entries):
                 plan.blocking_errors.append(f"source CSV hash mismatch: {target.as_posix()}")
             plan.source_metadata[batch_id] = {"source_filename": Path(batch["source_filename"]).name, "source_sha256": batch["source_sha256"], "available": available}
+        self._resolve_archive_extra_collisions(plan)
         self._collisions(plan)
         plan.blocking_errors = sorted({error.replace(self.room.root.as_posix() + "/", "") for error in plan.blocking_errors})
         return plan
@@ -537,6 +538,79 @@ class WorkspaceMigrator:
             if batch in source.parts:
                 return root / "claude" / "archive" / "legacy" / Path(*source.parts[source.parts.index(batch) + 1:])
         return source
+
+    def _archive_extra_target(self, entry: MigrationEntry) -> Path:
+        """Return a stable, readable archive path for one unbound legacy extra."""
+        _safe_relative(entry.source)
+        if entry.batch_id is not None or not entry.article_id:
+            raise WorkflowError("archive extra must have one unambiguous legacy article owner")
+        if entry.database_table is not None or entry.database_field is not None:
+            raise WorkflowError("database-bound artifacts cannot be rerouted as archive extras")
+        article_root = Path("workspace/archive/legacy-single-articles") / entry.article_id
+        if not entry.target.is_relative_to(article_root) or entry.target == article_root:
+            raise WorkflowError("archive extra target is outside its legacy article archive")
+        name = entry.source.name
+        suffix = "".join(entry.source.suffixes)
+        stem = name[:-len(suffix)] if suffix else name
+        source_identity = unicodedata.normalize("NFC", entry.source.as_posix()).encode("utf-8")
+        discriminator = hashlib.sha256(source_identity).hexdigest()[:12]
+        target = article_root / "legacy-files" / entry.source.parent / f"{stem}--{discriminator}{suffix}"
+        _safe_relative(target)
+        if not target.is_relative_to(article_root / "legacy-files"):
+            raise WorkflowError("archive extra target escapes legacy-files")
+        self._validate_target_ancestors(target)
+        return target
+
+    def _resolve_archive_extra_collisions(self, plan: MigrationPlan) -> None:
+        """Preserve unbound legacy extras when one canonical artifact owns a target.
+
+        This deliberately handles only one narrow, safe case. All ambiguous,
+        active-workspace, database/database, ancestor and destination collisions
+        remain for ``_collisions`` to report as blocking errors.
+        """
+        grouped: dict[str, list[MigrationEntry]] = {}
+        for entry in plan.entries:
+            grouped.setdefault(_key(entry.target), []).append(entry)
+        replacements: dict[MigrationEntry, MigrationEntry] = {}
+        legacy_entries = {id(entry) for entry in plan.legacy}
+        for entries in grouped.values():
+            if len({entry.source for entry in entries}) < 2:
+                continue
+            preferred = [
+                entry for entry in entries
+                if (entry.database_table is not None and entry.database_field is not None)
+                or entry.source == entry.target
+            ]
+            if len(preferred) != 1:
+                continue
+            owner = preferred[0]
+            article_root = (
+                Path("workspace/archive/legacy-single-articles") / owner.article_id
+                if owner.article_id and owner.batch_id is None else None
+            )
+            extras = [entry for entry in entries if entry is not owner]
+            if (
+                article_root is None
+                or any(id(entry) not in legacy_entries for entry in entries)
+                or not owner.target.is_relative_to(article_root)
+                or owner.target == article_root
+                or any((entry.batch_id, entry.article_id) != (owner.batch_id, owner.article_id) for entry in extras)
+                or any(entry.database_table is not None or entry.database_field is not None or entry.source == entry.target for entry in extras)
+            ):
+                continue
+            proposed: dict[MigrationEntry, MigrationEntry] = {}
+            try:
+                for entry in sorted(extras, key=lambda item: item.source.as_posix()):
+                    proposed[entry] = replace(entry, target=self._archive_extra_target(entry))
+            except (OSError, WorkflowError) as error:
+                plan.blocking_errors.append(
+                    f"archive collision resolution {owner.target.as_posix()}: {error}"
+                )
+                continue
+            replacements.update(proposed)
+        if replacements:
+            for group in ("claimed", "legacy", "unclaimed"):
+                setattr(plan, group, [replacements.get(entry, entry) for entry in getattr(plan, group)])
 
     def _collisions(self, plan: MigrationPlan) -> None:
         targets: dict[str, MigrationEntry] = {}
