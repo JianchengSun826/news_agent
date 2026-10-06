@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from .batch import BatchWorkflow
 from .batch_release import BatchReleaseWorkflow
+from .macos import MacOSBatchController, OsaScriptDialogs
 from .service import Newsroom, WorkflowError
 from .workspace import BatchWorkspace
 
@@ -283,6 +284,17 @@ def published_list(ctx: typer.Context) -> None:
 @app.command("stats")
 def stats(ctx: typer.Context) -> None:
     _json(_run(_room(ctx).stats))
+
+
+@app.command("macos-action", hidden=True)
+def macos_action(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    action: Annotated[str, typer.Argument(metavar="ACTION")],
+) -> None:
+    """Dispatch the fixed local Finder actions."""
+    code = MacOSBatchController(_room(ctx), OsaScriptDialogs()).run(batch_id, action)
+    raise typer.Exit(code=code)
 
 
 if __name__ == "__main__":
