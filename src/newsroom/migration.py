@@ -600,10 +600,22 @@ class WorkspaceMigrator:
         article_root = Path("workspace/archive/legacy-single-articles") / entry.article_id
         if not entry.target.is_relative_to(article_root) or entry.target == article_root:
             raise WorkflowError("archive extra target is outside its legacy article archive")
+        parent_components: list[tuple[str, int]] = []
+        for component in entry.source.parent.parts:
+            try:
+                parent_components.append((component, self._utf8_size(component)))
+            except WorkflowError as error:
+                raise WorkflowError("archive parent component is not valid UTF-8") from error
         target_parent = article_root / "legacy-files" / entry.source.parent
         _safe_relative(target_parent)
-        self._validate_target_ancestors(target_parent / "archive-extra")
         name_max = self._destination_name_max(target_parent)
+        for component, size in parent_components:
+            if size > name_max:
+                raise WorkflowError(
+                    "archive parent component exceeds destination name limit: "
+                    f"{component} ({size} UTF-8 bytes > {name_max})"
+                )
+        self._validate_target_ancestors(target_parent / "archive-extra")
         name = entry.source.name
         suffix = "".join(entry.source.suffixes)
         stem = name[:-len(suffix)] if suffix else name
@@ -755,7 +767,7 @@ class WorkspaceMigrator:
             if any(_key(parent) in targets for parent in entry.target.parents):
                 plan.blocking_errors.append(f"target collision with file ancestor: {entry.target.as_posix()}")
             destination = self.room.root / entry.target
-            if destination.exists() and entry.target not in sources:
+            if destination.exists() and entry.source != entry.target:
                 plan.blocking_errors.append(f"target collision with existing destination: {entry.target.as_posix()}")
 
     def save_report(self, plan: MigrationPlan) -> Path:

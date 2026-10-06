@@ -473,7 +473,7 @@ def test_archive_extra_drops_extension_punctuation_when_no_extension_character_f
     monkeypatch.setattr(os, 'pathconf', lambda *_args: 15)
 
     target = migrator(f.room)._archive_extra_target(
-        _unbound_archive_entry(f.single_id, 'hero.png')
+        _unbound_archive_entry('art-a', 'hero.png')
     )
 
     assert len(target.name.encode('utf-8')) == 15
@@ -639,6 +639,108 @@ def test_archive_extra_existing_generated_destination_remains_blocking(legacy_wo
 
     assert next(entry for entry in plan.entries if entry.source == extra.source).target == occupied
     assert any('existing destination' in error for error in plan.blocking_errors)
+
+
+def test_preflight_blocks_reroute_into_database_source_that_moves_elsewhere(legacy_workspace):
+    f = legacy_workspace
+    service = migrator(f.room)
+    article_root = Path('workspace/archive/legacy-single-articles') / f.single_id
+    extra = Path('images') / f.single_id / 'hero.png'
+    occupied = service._archive_extra_target(
+        MigrationEntry(extra, article_root / 'hero.png', 'a' * 64, 1, article_id=f.single_id)
+    )
+    for source, content in ((occupied, b'bound source bytes'), (extra, b'unbound extra bytes')):
+        path = f.room.root / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    with f.room.db.connect() as connection:
+        connection.execute(
+            'INSERT INTO images(image_id,article_id,image_type,image_path) VALUES (?,?,?,?)',
+            ('img-moving-source', f.single_id, 'LICENSED', occupied.as_posix()),
+        )
+
+    plan = service.preflight()
+    by_source = {entry.source: entry for entry in plan.entries}
+
+    assert by_source[occupied].target == article_root / 'hero.png'
+    assert by_source[extra].target == occupied
+    assert any('existing destination' in error and occupied.as_posix() in error
+               for error in plan.blocking_errors)
+    with pytest.raises(WorkflowError, match='blocking'):
+        service.backup(plan)
+    assert (f.room.root / occupied).read_bytes() == b'bound source bytes'
+    assert (f.room.root / extra).read_bytes() == b'unbound extra bytes'
+
+
+def test_collision_check_allows_existing_destination_for_same_in_place_entry(legacy_workspace):
+    f = legacy_workspace
+    source = Path('workspace/archive/legacy-single-articles') / f.single_id / 'notes.md'
+    path = f.room.root / source
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'canonical in-place bytes')
+    plan = MigrationPlan(legacy=[MigrationEntry(
+        source, source, hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_size,
+        article_id=f.single_id,
+    )])
+
+    migrator(f.room)._collisions(plan)
+
+    assert plan.blocking_errors == []
+
+
+def test_archive_extra_parent_component_over_destination_name_max_blocks_preflight(
+    legacy_workspace, monkeypatch,
+):
+    f = legacy_workspace
+    extra = Path('images') / f.single_id / 'hero.png'
+    _add_legacy_image_collision(f, [(extra, b'extra')])
+    assert len(f.single_id.encode('utf-8')) > 15
+    monkeypatch.setattr(os, 'pathconf', lambda *_args: 15)
+
+    plan = migrator(f.room).preflight()
+
+    assert any('archive parent component exceeds destination name limit' in error
+               and f.single_id in error for error in plan.blocking_errors)
+    assert any('target collision' in error for error in plan.blocking_errors)
+    with pytest.raises(WorkflowError, match='blocking'):
+        migrator(f.room).backup(plan)
+
+
+def test_archive_extra_parent_component_at_real_destination_limit_is_safe(legacy_workspace):
+    f = legacy_workspace
+    name_max = os.pathconf(f.room.root, 'PC_NAME_MAX')
+    component = 'd' * name_max
+    source = Path('images') / f.single_id / component / 'hero.png'
+    path = f.room.root / source
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'safe source')
+    article_root = Path('workspace/archive/legacy-single-articles') / f.single_id
+    entry = MigrationEntry(
+        source, article_root / 'hero.png', hashlib.sha256(path.read_bytes()).hexdigest(),
+        path.stat().st_size, article_id=f.single_id,
+    )
+
+    target = migrator(f.room)._archive_extra_target(entry)
+
+    assert component in target.parts
+    assert all(len(part.encode('utf-8')) <= name_max for part in entry.source.parent.parts)
+
+
+def test_archive_extra_invalid_utf8_parent_component_blocks_without_filesystem_access(
+    legacy_workspace,
+):
+    f = legacy_workspace
+    article_root = Path('workspace/archive/legacy-single-articles') / f.single_id
+    entry = MigrationEntry(
+        Path('images') / f.single_id / 'invalid\udcff' / 'hero.png',
+        article_root / 'hero.png',
+        'a' * 64,
+        1,
+        article_id=f.single_id,
+    )
+
+    with pytest.raises(WorkflowError, match='archive parent component is not valid UTF-8'):
+        migrator(f.room)._archive_extra_target(entry)
 
 
 def test_execute_copies_rerouted_extra_with_near_limit_extension(legacy_workspace):
