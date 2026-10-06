@@ -867,12 +867,90 @@ def test_preflight_reused_complete_does_not_duplicate_article(legacy_workspace):
     assert not any('batch-later/articles' in e.target.as_posix() for e in plan.claimed)
 
 
+def test_preflight_projects_one_active_owner_and_ignores_inactive_memberships(legacy_workspace):
+    f = legacy_workspace
+    with f.room.db.connect() as connection:
+        connection.execute(
+            "UPDATE articles SET owning_batch_id=NULL WHERE article_id=?", (f.article_id,)
+        )
+        for batch_id, status in (
+            ('batch-reused', 'REUSED_COMPLETE'),
+            ('batch-excluded', 'EXCLUDED'),
+        ):
+            connection.execute(
+                "INSERT INTO batches(batch_id,source_filename,source_sha256,status,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (batch_id, f'{batch_id}.csv', batch_id, 'COMPLETE', 'now', 'now'),
+            )
+            connection.execute(
+                "INSERT INTO batch_items "
+                "SELECT ?,candidate_id,article_id,?,duplicate_classification,content_version,error_message,created_at,updated_at "
+                "FROM batch_items WHERE batch_id=?",
+                (batch_id, status, f.batch_id),
+            )
+
+    plan = migrator(f.room).preflight()
+
+    assert plan.blocking_errors == []
+    assert plan.ownership_projection == {
+        f.article_id: f.batch_id,
+        f.single_id: None,
+    }
+    assert next(e for e in plan.claimed if e.database_field == 'draft_path').target == Path(
+        f'workspace/batches/{f.batch_id}/articles/{f.article_id}/article-v2.md'
+    )
+    assert all(f'batches/{f.batch_id}/articles/{f.single_id}' not in e.target.as_posix()
+               for e in plan.entries)
+    assert MigrationPlan.from_dict(plan.to_dict()).ownership_projection == plan.ownership_projection
+
+
 def test_preflight_ambiguous_article_membership_blocks(legacy_workspace):
     f = legacy_workspace
     with f.room.db.connect() as connection:
+        connection.execute(
+            'UPDATE articles SET owning_batch_id=NULL WHERE article_id=?', (f.article_id,)
+        )
         connection.execute("INSERT INTO batches(batch_id,source_filename,source_sha256,status,created_at,updated_at) VALUES ('batch-later','later.csv','later','COMPLETE','now','now')")
         connection.execute("INSERT INTO batch_items SELECT 'batch-later',candidate_id,article_id,'READY_FOR_CONTENT',duplicate_classification,content_version,error_message,created_at,updated_at FROM batch_items WHERE batch_id=?", (f.batch_id,))
-    assert any('ambiguous ownership' in e for e in migrator(f.room).preflight().blocking_errors)
+    plan = migrator(f.room).preflight()
+    assert any('ambiguous ownership' in e for e in plan.blocking_errors)
+    assert plan.ownership_projection[f.article_id] is None
+
+
+def test_preflight_existing_owner_must_match_active_membership(legacy_workspace):
+    f = legacy_workspace
+    with f.room.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO batches(batch_id,source_filename,source_sha256,status,created_at,updated_at) "
+            "VALUES ('batch-other','other.csv','other','READY_FOR_CONTENT','now','now')"
+        )
+        connection.execute(
+            "UPDATE batch_items SET batch_id='batch-other' WHERE batch_id=? AND article_id=?",
+            (f.batch_id, f.article_id),
+        )
+
+    plan = migrator(f.room).preflight()
+
+    assert any(f'ownership mismatch: {f.article_id}' in error for error in plan.blocking_errors)
+
+
+def test_preflight_existing_owner_blocks_competing_active_membership(legacy_workspace):
+    f = legacy_workspace
+    with f.room.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO batches(batch_id,source_filename,source_sha256,status,created_at,updated_at) "
+            "VALUES ('batch-other','other.csv','other','READY_FOR_CONTENT','now','now')"
+        )
+        connection.execute(
+            "INSERT INTO batch_items "
+            "SELECT 'batch-other',candidate_id,article_id,'READY_FOR_CONTENT',duplicate_classification,content_version,error_message,created_at,updated_at "
+            "FROM batch_items WHERE batch_id=? AND article_id=?",
+            (f.batch_id, f.article_id),
+        )
+
+    plan = migrator(f.room).preflight()
+
+    assert any(f'ambiguous ownership: {f.article_id}' in error for error in plan.blocking_errors)
 
 
 def test_preflight_unreadable_database_is_blocking_and_does_not_initialize(tmp_path):
@@ -1527,10 +1605,171 @@ def execute_clean_migration(f):
     return service.execute(plan, service.backup(plan))
 
 
+def convert_completed_batch_to_v3_upgraded_layout(batch: SimpleNamespace) -> str:
+    """Recreate the legacy paths left immediately after an additive v3->v4 init."""
+    room = batch.room
+    reused_values = candidate_row(
+        candidate_title='Legacy completed story',
+        core_fact='Legacy completed a separate story.',
+        company='Legacy',
+        product='Archive',
+        primary_source='https://legacy.example/archive',
+    )
+    reused = room.add_candidate(
+        **{
+            **reused_values,
+            'keywords': reused_values['keywords'].split('|'),
+            'secondary_sources': [],
+            'priority': int(reused_values['priority']),
+        }
+    )
+    room.check_duplicate(reused['candidate_id'])
+    room.select_candidate(reused['candidate_id'], 'editor', 'legacy completed story')
+    reused_article = room.create_brief(reused['candidate_id'])
+    with room.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO batch_items(batch_id,candidate_id,article_id,item_status,duplicate_classification,content_version,created_at,updated_at) "
+            "VALUES (?,?,?,'REUSED_COMPLETE','EXACT_DUPLICATE',1,'now','now')",
+            (batch.batch_id, reused['candidate_id'], reused_article['article_id']),
+        )
+
+    content_request = room.db.one(
+        "SELECT * FROM batch_requests WHERE batch_id=? AND request_type='CONTENT'",
+        (batch.batch_id,),
+    )
+    superseded_id = 'req-superseded1'
+    superseded_output = 'superseded-content-result.json'
+    superseded_request = json.loads(
+        (room.root / content_request['request_path']).read_bytes()
+    )
+    superseded_request['request_id'] = superseded_id
+    superseded_request['output_file'] = superseded_output
+    old_request = room.root / 'output' / f'{superseded_id}-request.json'
+    old_request.parent.mkdir(exist_ok=True)
+    old_request.write_text(json.dumps(superseded_request, ensure_ascii=False, indent=2))
+    with room.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO batch_requests(request_id,batch_id,request_type,revision_number,request_path,expected_result_filename,status,created_at) "
+            "VALUES (?,?, 'CONTENT',1,?,?, 'SUPERSEDED','now')",
+            (
+                superseded_id,
+                batch.batch_id,
+                old_request.relative_to(room.root).as_posix(),
+                superseded_output,
+            ),
+        )
+
+    article_updates = []
+    for article in room.db.all('SELECT * FROM articles ORDER BY article_id'):
+        for field, parent in (
+            ('research_brief_path', 'research'),
+            ('draft_path', 'articles'),
+            ('fact_check_path', 'articles'),
+        ):
+            if not article[field] or article['article_id'] == reused_article['article_id']:
+                continue
+            source = room.root / article[field]
+            target = room.root / parent / article['article_id'] / source.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(source, target)
+            article_updates.append((field, target.relative_to(room.root).as_posix(), article['article_id']))
+
+    request_updates = []
+    for request in room.db.all('SELECT * FROM batch_requests ORDER BY request_id'):
+        for field, suffix in (('request_path', 'request'), ('result_path', 'result')):
+            if not request[field]:
+                continue
+            source = room.root / request[field]
+            target = room.root / 'output' / 'batches' / batch.batch_id / f"{request['request_id']}-{suffix}.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(source, target)
+            request_updates.append((field, target.relative_to(room.root).as_posix(), request['request_id']))
+
+    shutil.rmtree(room.root / 'workspace')
+    with room.db.connect() as connection:
+        for field, path, article_id in article_updates:
+            connection.execute(
+                f'UPDATE articles SET "{field}"=? WHERE article_id=?', (path, article_id)
+            )
+        for field, path, request_id in request_updates:
+            connection.execute(
+                f'UPDATE batch_requests SET "{field}"=? WHERE request_id=?', (path, request_id)
+            )
+        connection.execute('UPDATE articles SET owning_batch_id=NULL')
+        connection.execute('UPDATE batches SET workspace_version=0')
+    return reused_article['article_id']
+
+
 def artifact_snapshot(room):
     return {name: data for name, data in snapshot(room.root).items()
             if name.startswith(('research/', 'articles/', 'images/', 'output/', 'workspace/'))
             and '/.migration-staging-' not in name}
+
+
+def test_execute_backfills_v3_batch_owner_and_validates_completed_handoffs(all_pass_batch):
+    f = all_pass_batch
+    reused_article_id = convert_completed_batch_to_v3_upgraded_layout(f)
+    service = migrator(f.room)
+    plan = service.preflight()
+
+    assert plan.blocking_errors == []
+    assert plan.ownership_projection == {
+        **{article_id: f.batch_id for article_id in f.article_ids},
+        reused_article_id: None,
+    }
+
+    result = service.execute(plan, service.backup(plan))
+
+    assert result['status'] == 'PASS'
+    for article_id in f.article_ids:
+        article = f.room.get_article(article_id)
+        assert article['owning_batch_id'] == f.batch_id
+        for field in ('research_brief_path', 'draft_path', 'fact_check_path'):
+            assert article[field].startswith(f'workspace/batches/{f.batch_id}/articles/{article_id}/')
+            assert (f.room.root / article[field]).is_file()
+    reused = f.room.get_article(reused_article_id)
+    assert reused['owning_batch_id'] is None
+    assert reused['research_brief_path'].startswith(
+        f'workspace/archive/legacy-single-articles/{reused_article_id}/'
+    )
+    for request in f.room.db.all('SELECT * FROM batch_requests ORDER BY request_id'):
+        assert request['request_path'].startswith(f'workspace/batches/{f.batch_id}/claude/')
+        assert (f.room.root / request['request_path']).is_file()
+        if request['result_path']:
+            assert request['result_path'].startswith(f'workspace/batches/{f.batch_id}/claude/')
+            assert (f.room.root / request['result_path']).is_file()
+    receipt = json.loads((f.room.root / 'data/workspace-migration-receipt.json').read_text())
+    assert receipt['ownership_projection_sha256'] == hashlib.sha256(
+        (json.dumps(plan.ownership_projection, ensure_ascii=False, sort_keys=True, indent=2) + '\n').encode()
+    ).hexdigest()
+    receipt['ownership_projection_sha256'] = '0' * 64
+    (f.room.root / 'data/workspace-migration-receipt.json').write_text(
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + '\n'
+    )
+    with pytest.raises(WorkflowError, match='ownership projection receipt mismatch'):
+        service.execute_from_current_state()
+
+
+def test_execute_rejects_batch_membership_change_after_owner_plan(legacy_workspace):
+    f = legacy_workspace
+    with f.room.db.connect() as connection:
+        connection.execute(
+            'UPDATE articles SET owning_batch_id=NULL WHERE article_id=?', (f.article_id,)
+        )
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    assert plan.ownership_projection[f.article_id] == f.batch_id
+    with f.room.db.connect() as connection:
+        connection.execute(
+            "UPDATE batch_items SET item_status='EXCLUDED' WHERE batch_id=? AND article_id=?",
+            (f.batch_id, f.article_id),
+        )
+
+    with pytest.raises(WorkflowError, match='database changed after preflight'):
+        service.execute(plan, backup)
+
+    assert f.room.get_article(f.article_id)['owning_batch_id'] is None
 
 
 def test_execute_archives_and_preserves_exact_artifacts(legacy_workspace):

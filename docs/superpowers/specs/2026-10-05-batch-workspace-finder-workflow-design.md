@@ -210,6 +210,8 @@ Preflight inventories:
 
 Any missing referenced file, conflicting destination, ambiguous ownership, or unreadable database blocks migration. Ownership inference collects every article and batch identifier matched structurally, by path component, and by the applicable filename stem or prefix, using Unicode-normalized case-insensitive comparison for macOS. More than one article or batch candidate, or a batch candidate inconsistent with the matched article's recorded owner, is blocking and is reported deterministically before collision handling.
 
+The v3-to-v4 schema upgrade deliberately leaves `articles.owning_batch_id` null. Migration preflight projects an owner from `batch_items`: exactly one relationship whose status is neither `REUSED_COMPLETE` nor `EXCLUDED` claims a null article; zero leaves a true legacy single article unowned; multiple eligible batches block. A recorded non-null owner must be the sole eligible relationship or preflight blocks. Inactive reused/excluded relationships never acquire or transfer ownership. The complete projection, including explicit nulls, is saved in the deterministic plan and backup manifest. Any relationship change alters the database snapshot and invalidates execute. Current and superseded request/result documents are routed and validated with the projection.
+
 All destination conflicts block except one narrow archive-only case: a uniquely owned legacy article has exactly one database-bound artifact assigned to the preferred archive target and one or more unbound legacy extras project to that same target. The database-bound artifact keeps the canonical name. Every extra is preserved separately beneath that article's `legacy-files/` hierarchy using its original relative directory and a deterministic suffix derived from the exact UTF-8 source path, so casefolding and NFC-equivalent spellings still receive distinct target leaves on macOS. The destination leaf is bounded by the actual destination filesystem's `PC_NAME_MAX`, measured in UTF-8 bytes; overlong stems and pathological extensions are truncated only at valid UTF-8 boundaries while retaining the discriminator and a useful extension when feasible. Every copied source-parent component must already be valid UTF-8 and fit the same destination limit; parent directories are never silently renamed. An unavailable/unusable limit or a limit too small for the mandatory discriminator or a copied parent component blocks preflight. Two database-bound entries remain blocking even when both database rows reference the identical source, target and field; conflicts containing only unbound files, ambiguous ownership, file/ancestor conflicts, symlinks, traversal, and existing destination conflicts also block. An existing destination is exempt only for the same validated entry whose source and target are identical; another planned source moving away from that path does not make it available for reuse. No source is overwritten, deleted, or content-deduplicated; all safely mapped sources remain in the manifest and verified backup, while SQLite path projection still applies only to database-bound entries. The report is saved for review.
 
 The original CSV is supporting input rather than a current database path. Migration copies it only when the user selects a file whose SHA-256 matches `batches.source_sha256`. A missing original CSV does not block migration; `input/source-metadata.json` preserves its recorded filename and hash, and the README marks the source copy unavailable.
@@ -233,12 +235,12 @@ The manifest records original path, target path, size, SHA-256, owning batch/art
 2. Compare every staged SHA-256 with the migration manifest.
 3. Generate dashboards and action scripts in staging.
 4. Validate article version sets, current database pointers, request/result identities, images, and existing packages.
-5. In one SQLite transaction, update canonical artifact and request/result paths and record the workspace migration version.
+5. In one SQLite transaction, backfill projected null owners, update canonical artifact and request/result paths, and record the workspace migration version.
 6. Atomically promote staging to `workspace/`.
 7. Reopen SQLite and verify every new reference.
 8. Generate publication packages from migrated data in a disposable validation location.
 9. Move unclaimed but nonempty files to `workspace/archive/unclaimed-files/`.
-10. Remove obsolete claimed files and empty legacy directories only after all checks pass.
+10. Atomically retain complete obsolete trees in journal-bound local recovery storage after all checks pass.
 
 Failure before database commit leaves the original database and directories untouched. Failure after database commit triggers restoration from the verified backup and records a failure report. Re-running a completed migration is idempotent.
 
@@ -246,7 +248,7 @@ Legacy single-article artifacts with no batch ownership move to `workspace/archi
 
 ## Data Model Changes
 
-Add a workspace migration version to metadata and a nullable, immutable `owning_batch_id` on articles. Articles created through a batch receive that batch ID. Pre-batch legacy articles retain `NULL` and move to the read-only legacy archive. Existing path columns remain relative to the repository root but point beneath `workspace/batches/BATCH_ID/` after migration.
+Add a workspace migration version to metadata and a nullable, immutable `owning_batch_id` on articles. Articles created through a batch receive that batch ID. Pre-batch legacy articles with no eligible active batch relation retain `NULL` and move to the read-only legacy archive. A unique eligible historical relation is backfilled only by verified workspace migration; the saved plan, manifest, journal, and receipt bind that projection. Existing path columns remain relative to the repository root but point beneath `workspace/batches/BATCH_ID/` after migration.
 
 Batch aggregate status becomes an enforced lifecycle rather than a loose summary. Batch operations validate all participating item/article states and record one batch-level audit event plus the necessary article transitions.
 
@@ -282,7 +284,7 @@ Implementation follows TDD with temporary directories and real SQLite databases.
 - aggregate fact-check, image, review, approval, package, and publication gates;
 - resumable image-selection drafts without partial registration;
 - atomic multi-article transitions and package staging;
-- migration preflight, hash mismatch, missing file, collision, rollback, idempotency, and cleanup;
+- migration preflight, ownership projection, relationship-change rejection, hash mismatch, missing file, collision, rollback, idempotency, and cleanup;
 - `REUSED_COMPLETE` owner links;
 - legacy single-article archival;
 - derived dashboard rebuilds;

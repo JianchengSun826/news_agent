@@ -241,6 +241,7 @@ class MigrationPlan:
     database_snapshot_sha256: str = ""
     database_size: int = 0
     selected_source_csvs: list[Path] = field(default_factory=list)
+    ownership_projection: dict[str, str | None] = field(default_factory=dict)
 
     @property
     def entries(self) -> list[MigrationEntry]:
@@ -270,6 +271,7 @@ class MigrationPlan:
             "database_snapshot_sha256": self.database_snapshot_sha256,
             "database_size": self.database_size,
             "selected_source_csvs": sorted(p.as_posix() for p in self.selected_source_csvs),
+            "ownership_projection": dict(sorted(self.ownership_projection.items())),
             "expected_backup_size": self.expected_backup_size,
         }
 
@@ -349,8 +351,28 @@ class WorkspaceMigrator:
             message = str(error).replace(self.room.root.as_posix() + "/", "")
             plan.blocking_errors.append(f"unreadable database: {message}")
             return plan
-        articles = {a["article_id"]: a for a in tables["articles"]}
+        recorded_articles = {a["article_id"]: a for a in tables["articles"]}
         batches = {b["batch_id"]: b for b in tables["batches"]}
+        for article_id, article in sorted(recorded_articles.items()):
+            memberships = {
+                item["batch_id"] for item in tables["batch_items"]
+                if item["article_id"] == article_id
+                and item["item_status"] not in {"REUSED_COMPLETE", "EXCLUDED"}
+            }
+            owner = article["owning_batch_id"]
+            if len(memberships) > 1:
+                plan.blocking_errors.append(f"ambiguous ownership: {article_id}")
+                plan.ownership_projection[article_id] = owner
+            elif owner is not None:
+                if owner not in batches or memberships != {owner}:
+                    plan.blocking_errors.append(f"ownership mismatch: {article_id}")
+                plan.ownership_projection[article_id] = owner
+            else:
+                plan.ownership_projection[article_id] = next(iter(memberships), None)
+        articles = {
+            article_id: {**article, "owning_batch_id": plan.ownership_projection[article_id]}
+            for article_id, article in recorded_articles.items()
+        }
         inventory_roots = ("research", "articles", "images", "output", "workspace")
         expected_roots = {Path(root) for root in (*inventory_roots, "output/batches", "output/prompts", "workspace/batches", "workspace/archive", "workspace/archive/legacy-single-articles", "workspace/archive/unclaimed-files")}
         for article_id, article in articles.items():
@@ -372,11 +394,6 @@ class WorkspaceMigrator:
             except (OSError, WorkflowError) as error:
                 display = "<invalid absolute root>" if root.is_absolute() else root.as_posix()
                 plan.blocking_errors.append(f"inventory root {display}: {error}")
-        for article_id, article in articles.items():
-            memberships = {i["batch_id"] for i in tables["batch_items"] if i["article_id"] == article_id and i["item_status"] not in {"REUSED_COMPLETE", "EXCLUDED"}}
-            owner = article["owning_batch_id"]
-            if len(memberships) > 1 or (owner and (owner not in batches or memberships - {owner})):
-                plan.blocking_errors.append(f"ambiguous ownership: {article_id}")
         seen: set[Path] = set()
         database_sources: set[Path] = set()
 
@@ -1090,6 +1107,27 @@ class WorkspaceMigrator:
                     )
                     if not cursor.rowcount:
                         raise WorkflowError('migration database source no longer matches plan')
+                current_articles = {
+                    row['article_id']: row['owning_batch_id']
+                    for row in connection.execute(
+                        'SELECT article_id,owning_batch_id FROM articles ORDER BY article_id'
+                    )
+                }
+                if set(current_articles) != set(plan.ownership_projection):
+                    raise WorkflowError('migration ownership projection no longer matches articles')
+                for article_id, projected_owner in sorted(plan.ownership_projection.items()):
+                    current_owner = current_articles[article_id]
+                    if current_owner == projected_owner:
+                        continue
+                    if current_owner is not None or projected_owner is None:
+                        raise WorkflowError('migration refuses to overwrite article ownership')
+                    cursor = connection.execute(
+                        'UPDATE articles SET owning_batch_id=? '
+                        'WHERE article_id=? AND owning_batch_id IS NULL',
+                        (projected_owner, article_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise WorkflowError('migration article ownership changed after preflight')
                 connection.execute('UPDATE batches SET workspace_version=?', (1,))
                 if room is None:
                     self._execution['database_update_attempted'] = True
@@ -1784,6 +1822,9 @@ class WorkspaceMigrator:
         if manifest['plan'] != plan.to_dict():
             raise WorkflowError('verified backup does not match migration plan')
         manifest_sha = _digest(backup / 'manifest.json')[0]
+        ownership_projection_sha256 = hashlib.sha256(
+            _json_bytes(plan.ownership_projection)
+        ).hexdigest()
         if self.receipt_path.exists():
             return self.execute_from_current_state()
         directories = []
@@ -1803,6 +1844,7 @@ class WorkspaceMigrator:
         stage = Path(tempfile.mkdtemp(prefix=f'.migration-staging-{stamp}-', dir=self.workspace.root))
         journal = self.room.root / 'data/workspace-migration-journals' / (stage.name + '.json')
         self._execution = {'schema_version': 1, 'stage': None, 'history': [], 'manifest_sha256': manifest_sha,
+                           'ownership_projection_sha256': ownership_projection_sha256,
                            'repository_root': str(self.room.root),
                            'backup_path': str(backup), 'journal_path': str(journal), 'staging_path': str(stage),
                            'database_updated': False, 'database_update_attempted': False,
@@ -1842,6 +1884,7 @@ class WorkspaceMigrator:
             self._validate_snapshot_origins(self._execution, plan)
             self._journal()  # Inventory is durable before receipt/CLEANED commit.
             receipt = {'schema_version': 1, 'manifest_sha256': manifest_sha, 'repository_root': str(self.room.root),
+                       'ownership_projection_sha256': ownership_projection_sha256,
                        'backup_path': str(backup), 'journal_path': str(journal),
                        'retired_paths': [record['path'] for record in self._execution['retired_stages']],
                        'legacy_paths': [record['path'] for record in self._execution.get('legacy_originals', [])],
@@ -1978,6 +2021,13 @@ class WorkspaceMigrator:
             self.verify_backup(backup)
             if receipt['schema_version'] != 1 or _digest(backup / 'manifest.json')[0] != receipt['manifest_sha256']:
                 raise ValueError('manifest mismatch')
+            manifest = json.loads((backup / 'manifest.json').read_bytes())
+            plan = MigrationPlan.from_dict(manifest['plan'])
+            ownership_projection_sha256 = hashlib.sha256(
+                _json_bytes(plan.ownership_projection)
+            ).hexdigest()
+            if receipt['ownership_projection_sha256'] != ownership_projection_sha256:
+                raise ValueError('ownership projection receipt mismatch')
             journal_path = _repository_reference(self.room.root, receipt['journal_path'], Path('data/workspace-migration-journals'), origin)
             if expected_journal is not None and journal_path != expected_journal:
                 raise ValueError('receipt/journal mismatch')
@@ -1992,6 +2042,8 @@ class WorkspaceMigrator:
                 raise ValueError('journal/receipt identity mismatch')
             if journal['stage'] != 'CLEANED' or journal['manifest_sha256'] != receipt['manifest_sha256'] or journal.get('recovery_status') or journal.get('access_released') is not True or journal.get('finalization_status') != 'COMMITTED':
                 raise ValueError('unfinished journal')
+            if journal.get('ownership_projection_sha256') != ownership_projection_sha256:
+                raise ValueError('ownership projection journal mismatch')
             if journal['superseded_rollbacks'] != receipt['superseded_rollbacks']:
                 raise ValueError('successor rollback linkage mismatch')
             recovery = Path('data/workspace-migration-recovery') / journal_path.stem
@@ -2007,7 +2059,6 @@ class WorkspaceMigrator:
                 if not path.is_dir():
                     raise ValueError('receipt retired tree unavailable or unsafe')
             self._validate_recovery_snapshots(journal, receipt)
-            plan = MigrationPlan.from_dict(json.loads((backup / 'manifest.json').read_bytes())['plan'])
         except (KeyError, ValueError, OSError) as error:
             raise WorkflowError(f'invalid migration receipt; recovery required: {error}') from error
         # Archive destinations are immutable historical reference material.
@@ -2025,13 +2076,19 @@ class WorkspaceMigrator:
             # while article versions, states, paths and content may evolve.
             for table, key, fields in (
                 ('batches', 'batch_id', ('source_sha256',)),
-                ('articles', 'article_id', ('owning_batch_id', 'candidate_id')),
+                ('articles', 'article_id', ('candidate_id',)),
                 ('batch_requests', 'request_id', ('batch_id', 'request_type', 'revision_number')),
             ):
                 present = {row[key]: row for row in current[table]}
                 for row in original[table]:
                     if row[key] not in present or any(row[field] != present[row[key]][field] for field in fields):
                         raise WorkflowError(f'migration database identity mismatch: {table}')
+            present_articles = {row['article_id']: row for row in current['articles']}
+            if any(
+                present_articles.get(article_id, {}).get('owning_batch_id') != projected_owner
+                for article_id, projected_owner in plan.ownership_projection.items()
+            ):
+                raise WorkflowError('migration database ownership projection mismatch')
         for entry in plan.entries:
             if not entry.source.is_absolute() and entry.source != entry.target and entry.source.parts[0] in {'research', 'articles', 'images', 'output'} and (self.room.root / entry.source).exists():
                 raise WorkflowError('migration recovery required; original cleanup remains pending')
