@@ -123,27 +123,33 @@ class WorkspaceMigrator:
     @contextmanager
     def _connect_readonly(self, path: Path | None = None) -> Iterator[sqlite3.Connection]:
         path = path or self.room.db_path
-        _no_symlinks(path)
-        wal = Path(str(path) + "-wal")
-        _no_symlinks(wal)
-        if wal.exists():
-            # A mode=ro WAL reader still writes read marks in canonical -shm.
-            # Replay a stable DB/WAL copy only in a disposable external directory.
-            with tempfile.TemporaryDirectory(prefix="newsroom-readonly-database-") as temporary:
-                copied = Path(temporary) / "newsroom.db"
-                originals = (path, wal)
-                before = [_digest(source) for source in originals]
-                for source, destination in zip(originals, (copied, Path(str(copied) + "-wal"))):
-                    shutil.copyfile(source, destination)
-                if before != [_digest(source) for source in originals]:
-                    raise WorkflowError("database changed while reading WAL snapshot")
-                with closing(sqlite3.connect(copied)) as connection:
-                    connection.row_factory = sqlite3.Row
-                    connection.execute("PRAGMA query_only=ON")
-                    yield connection
-        else:
-            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as connection:
+        sources = {suffix: Path(str(path) + suffix) for suffix in ("", "-wal", "-shm")}
+
+        def signature() -> dict[str, tuple[tuple[str, int], int, int]]:
+            files = {}
+            for suffix, source in sources.items():
+                _no_symlinks(source)
+                if suffix and not source.exists():
+                    continue
+                metadata = source.stat()
+                files[suffix] = (_digest(source), metadata.st_mode, metadata.st_mtime_ns)
+            return files
+
+        # Even a WAL-mode main DB with no sidecars can create canonical WAL/SHM
+        # on a mode=ro open. Every SQLite open uses a stable disposable copy.
+        before = signature()
+        with tempfile.TemporaryDirectory(prefix="newsroom-readonly-database-") as temporary:
+            copied = Path(temporary) / "newsroom.db"
+            for suffix, (digest, _, _) in before.items():
+                destination = Path(str(copied) + suffix)
+                shutil.copyfile(sources[suffix], destination)
+                if _digest(destination) != digest:
+                    raise WorkflowError("database changed while copying snapshot")
+            if signature() != before:
+                raise WorkflowError("database changed while reading snapshot")
+            with closing(sqlite3.connect(copied)) as connection:
                 connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
                 yield connection
 
     def _source(self, source: Path, external: bool = False) -> Path:
@@ -182,8 +188,9 @@ class WorkspaceMigrator:
             if len(memberships) > 1 or (owner and (owner not in batches or memberships - {owner})):
                 plan.blocking_errors.append(f"ambiguous ownership: {article_id}")
         seen: set[Path] = set()
+        database_sources: set[Path] = set()
 
-        def add(source: Path, target: Path, batch: str | None = None, article: str | None = None, table: str | None = None, db_field: str | None = None, group: str = "claimed", external: bool = False) -> None:
+        def add(source: Path, target: Path, batch: str | None = None, article: str | None = None, table: str | None = None, db_field: str | None = None, group: str = "claimed", external: bool = False) -> MigrationEntry | None:
             try:
                 path = self._source(source, external)
                 _safe_relative(target)
@@ -192,6 +199,7 @@ class WorkspaceMigrator:
                 entry = MigrationEntry(source, target, sha, size, batch, article, table, db_field)
                 getattr(plan, group).append(entry)
                 seen.add(source)
+                return entry
             except (OSError, WorkflowError) as error:
                 plan.blocking_errors.append(f"{table or 'inventory'}.{db_field or 'file'} {source.as_posix()}: {error}")
 
@@ -201,6 +209,7 @@ class WorkspaceMigrator:
                     if not db_field.endswith("_path") or not value:
                         continue
                     source = Path(value)
+                    database_sources.add(source)
                     article_id = row.get("article_id")
                     article = articles.get(article_id)
                     batch = article["owning_batch_id"] if article else row.get("batch_id")
@@ -255,8 +264,16 @@ class WorkspaceMigrator:
                     raise WorkflowError("selected CSV does not match any recorded batch SHA-256")
                 batch = matching[0]["batch_id"]
                 target = self.workspace.source_csv_path(batch).relative_to(self.room.root)
-                if not any(e.source == source and e.target == target for e in plan.entries):
-                    add(source, target, batch, external=True)
+                existing = [entry for entry in plan.entries if entry.source == source]
+                if source in database_sources:
+                    raise WorkflowError("selected CSV source is already claimed by a database artifact")
+                if len(existing) == 1 and existing[0].target == target and existing[0].article_id is None:
+                    continue  # Already inventoried canonical supporting CSV.
+                if existing and (len(existing) != 1 or existing[0] not in plan.unclaimed):
+                    raise WorkflowError("selected CSV source is already claimed or has ambiguous destinations")
+                promoted = add(source, target, batch, external=True)
+                if promoted is not None and existing:
+                    plan.unclaimed.remove(existing[0])
             except (OSError, WorkflowError) as error:
                 plan.blocking_errors.append(f"selected CSV {source.as_posix()}: {error}")
         for batch_id, batch in sorted(batches.items()):
@@ -285,6 +302,21 @@ class WorkspaceMigrator:
         if source.parts[:2] == ("workspace", "batches"):
             if len(source.parts) < 3 or (batch and source.parts[2] != batch):
                 raise WorkflowError(f"ambiguous ownership of canonical source: {source.as_posix()}")
+            if article and db_field:
+                expected_root = self.workspace.article_root(batch, article["article_id"]).relative_to(self.room.root) if batch else Path("workspace/batches") / source.parts[2] / "articles" / article["article_id"]
+                if not source.is_relative_to(expected_root):
+                    raise WorkflowError(f"canonical article path does not match database article: {source.as_posix()}")
+                relative = source.relative_to(expected_root)
+                kind = {"draft_path": "article", "research_brief_path": "research-brief", "fact_check_path": "fact-check"}.get(db_field)
+                if kind:
+                    current = article["revision_number"]
+                    match = re.fullmatch(kind + r"-v([1-9][0-9]*)\.md", relative.as_posix())
+                    version = int(match[1]) if match else 0
+                    prior_check = db_field == "fact_check_path" and article["fact_check_outcome"] is None and 1 <= version <= current
+                    if not match or (version != current and not prior_check):
+                        raise WorkflowError(f"canonical filename or revision does not match {db_field}: {source.as_posix()}")
+                elif db_field == "image_path" and relative.as_posix() != "hero" + source.suffix.lower():
+                    raise WorkflowError(f"canonical filename does not match image_path: {source.as_posix()}")
             if not article or batch:
                 return source
         if request:

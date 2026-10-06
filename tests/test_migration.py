@@ -491,3 +491,109 @@ def test_backup_cleanup_failure_marks_incomplete(legacy_workspace, monkeypatch):
     assert len(incomplete) == 1
     assert (incomplete[0] / 'INCOMPLETE').is_file()
     assert not (f.room.root / 'workspace').exists()
+
+
+def test_preflight_canonical_database_path_cannot_belong_to_another_article(legacy_workspace):
+    f = legacy_workspace
+    source = Path(f'workspace/batches/{f.batch_id}/articles/{f.single_id}/article-v2.md')
+    (f.room.root / source).parent.mkdir(parents=True)
+    (f.room.root / source).write_bytes(b'B file with no B database reference')
+    with f.room.db.connect() as connection:
+        connection.execute('UPDATE articles SET owning_batch_id=? WHERE article_id=?', (f.batch_id, f.single_id))
+        connection.execute('UPDATE articles SET draft_path=? WHERE article_id=?', (source.as_posix(), f.article_id))
+    plan = migrator(f.room).preflight()
+    assert any('canonical article' in error and source.as_posix() in error for error in plan.blocking_errors)
+    assert str(f.room.root) not in json.dumps(plan.to_dict())
+
+
+@pytest.mark.parametrize('filename', ['article.md', 'article-v1.md', 'research-brief-v2.md'])
+def test_preflight_canonical_draft_filename_and_revision_must_match(legacy_workspace, filename):
+    f = legacy_workspace
+    source = Path(f'workspace/batches/{f.batch_id}/articles/{f.article_id}/{filename}')
+    (f.room.root / source).parent.mkdir(parents=True)
+    (f.room.root / source).write_bytes(b'wrong current draft name')
+    with f.room.db.connect() as connection:
+        connection.execute('UPDATE articles SET draft_path=? WHERE article_id=?', (source.as_posix(), f.article_id))
+    plan = migrator(f.room).preflight()
+    assert any('canonical filename' in error for error in plan.blocking_errors)
+    assert str(f.room.root) not in json.dumps(plan.to_dict())
+
+
+def test_preflight_retains_previous_fact_check_during_revision(legacy_workspace):
+    f = legacy_workspace
+    source = Path(f'workspace/batches/{f.batch_id}/articles/{f.article_id}/fact-check-v1.md')
+    (f.room.root / source).parent.mkdir(parents=True)
+    (f.room.root / source).write_bytes(b'previous failed check')
+    with f.room.db.connect() as connection:
+        connection.execute('UPDATE articles SET fact_check_path=?,fact_check_outcome=NULL WHERE article_id=?', (source.as_posix(), f.article_id))
+    assert migrator(f.room).preflight().blocking_errors == []
+
+
+def test_preflight_promotes_selected_csv_from_unclaimed_inventory(legacy_workspace):
+    f = legacy_workspace
+    source = Path('research/original.csv')
+    (f.room.root / source).write_bytes((f.room.root / 'selected.csv').read_bytes())
+    service = migrator(f.room)
+    plan = service.preflight([f.room.root / source])
+    assert plan.blocking_errors == []
+    assert not any(entry.source == source for entry in plan.unclaimed)
+    entries = [entry for entry in plan.entries if entry.source == source]
+    assert len(entries) == 1
+    assert entries[0].target == Path(f'workspace/batches/{f.batch_id}/input/candidates.csv')
+    backup = service.backup(plan)
+    manifest = json.loads((backup / 'manifest.json').read_text())
+    assert len([record for record in manifest['artifacts'] if record['source'] == source.as_posix()]) == 1
+    assert len([record for group in ('claimed', 'legacy', 'unclaimed') for record in manifest['plan'][group] if record['source'] == source.as_posix()]) == 1
+    with tarfile.open(backup / 'artifacts.tar.gz') as archive:
+        assert len([member for member in archive if member.name == 'repository/research/original.csv']) == 1
+    service.verify_backup(backup)
+
+
+@pytest.mark.parametrize('article_kind', ['owned', 'legacy'])
+def test_preflight_csv_selection_cannot_repurpose_article_claim(legacy_workspace, article_kind):
+    f = legacy_workspace
+    source = Path('research/original.csv')
+    (f.room.root / source).write_bytes((f.room.root / 'selected.csv').read_bytes())
+    article_id = f.article_id if article_kind == 'owned' else f.single_id
+    with f.room.db.connect() as connection:
+        connection.execute('UPDATE articles SET research_brief_path=? WHERE article_id=?', (source.as_posix(), article_id))
+    plan = migrator(f.room).preflight([f.room.root / source])
+    assert any('already claimed' in error for error in plan.blocking_errors)
+    assert not any(entry.source == source and entry.target.name == 'candidates.csv' for entry in plan.entries)
+
+
+def filesystem_details(root):
+    details = {}
+    for path in [root, *root.rglob('*')]:
+        metadata = path.stat()
+        details[path.relative_to(root).as_posix()] = (
+            path.read_bytes() if path.is_file() else None,
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+        )
+    return details
+
+
+@pytest.mark.parametrize('journal_mode', ['DELETE', 'WAL'])
+def test_preflight_database_isolation_preserves_closed_repository(journal_mode, legacy_workspace):
+    f = legacy_workspace
+    connection = sqlite3.connect(f.room.db_path)
+    connection.execute(f'PRAGMA journal_mode={journal_mode}')
+    connection.close()
+    assert not Path(str(f.room.db_path) + '-wal').exists()
+    assert not Path(str(f.room.db_path) + '-shm').exists()
+    before = filesystem_details(f.room.root)
+    assert migrator(f.room).preflight().blocking_errors == []
+    assert filesystem_details(f.room.root) == before
+
+
+def test_preflight_database_isolation_preserves_live_sidecars(legacy_workspace):
+    f = legacy_workspace
+    with sqlite3.connect(f.room.db_path) as writer:
+        writer.execute('PRAGMA journal_mode=WAL')
+        writer.execute("UPDATE batches SET status='WAL-STATE' WHERE batch_id=?", (f.batch_id,))
+        writer.commit()
+        before = filesystem_details(f.room.root)
+        plan = migrator(f.room).preflight()
+        assert plan.blocking_errors == []
+        assert filesystem_details(f.room.root) == before
