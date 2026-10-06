@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import errno
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,6 +183,59 @@ def test_cli_batch_release_sequence_and_workspace_refresh(release_batch: SimpleN
     assert state["status"] == "PUBLISHED"
     assert all(item["approval_state"] == "PUBLISHED" for item in state["items"])
     assert json.loads((root / "batch-state.json").read_text()) == state
+    assert workspace_snapshot(batch) == before
+
+
+def test_cli_publish_packages_oserror_restores_packages_and_database(release_batch, monkeypatch):
+    import newsroom.batch_release as release
+
+    batch = release_batch
+    for command, args in release_steps(batch)[:4]:
+        result = invoke_batch(batch, command, *args)
+        assert result.exit_code == 0, result.output
+    publish = batch.room.root / "workspace/batches" / batch.batch_id / "publish"
+    before = workspace_snapshot(batch)
+    original_replace = release.os.replace
+
+    def fail_package_promotion(source, destination):
+        if Path(destination) == publish and Path(source).name.startswith(".staging-publish-"):
+            raise PermissionError(errno.EACCES, "Permission denied", str(publish))
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(release.os, "replace", fail_package_promotion)
+
+    result = invoke_batch(batch, "publish-packages")
+
+    assert result.exit_code == 2, result.output
+    assert "error:" in result.output
+    assert "Permission denied" in result.output
+    assert str(publish) in result.output
+    assert workspace_snapshot(batch) == before
+    assert not list(publish.parent.glob(".staging-publish-*"))
+    assert not list(publish.parent.glob(".previous-publish-*"))
+
+
+def test_cli_refresh_workspace_oserror_preserves_database_and_files(release_batch, monkeypatch):
+    import newsroom.workspace as workspace
+
+    batch = release_batch
+    state_path = batch.room.root / "workspace/batches" / batch.batch_id / "batch-state.json"
+    before = workspace_snapshot(batch)
+    original_replace = workspace.os.replace
+
+    def fail_state_write(source, destination):
+        if Path(destination) == state_path:
+            raise OSError(errno.ENOSPC, "No space left on device", str(state_path))
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(workspace.os, "replace", fail_state_write)
+
+    result = invoke_batch(batch, "refresh-workspace")
+
+    assert result.exit_code == 2, result.output
+    assert "error:" in result.output
+    assert "No space left on device" in result.output
+    assert str(state_path) in result.output
     assert workspace_snapshot(batch) == before
 
 

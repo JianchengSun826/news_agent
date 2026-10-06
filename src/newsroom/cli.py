@@ -45,7 +45,7 @@ def _json(value: object) -> None:
 def _run(action: Callable[[], T]) -> T:
     try:
         return action()
-    except (WorkflowError, ValidationError, ValueError, FileExistsError) as error:
+    except (WorkflowError, ValidationError, ValueError, OSError) as error:
         typer.echo(f"error: {error}", err=True)
         raise typer.Exit(code=2) from error
 
