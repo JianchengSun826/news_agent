@@ -3,7 +3,12 @@ from __future__ import annotations
 import csv
 import errno
 import json
+import os
 from pathlib import Path
+import shutil
+import sqlite3
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +25,60 @@ from test_batch import (
 
 
 runner = CliRunner()
+
+
+def test_offline_demo_publishes_complete_batch_without_legacy_roots(tmp_path: Path):
+    """Run the shipped demo; removed single-article calls cannot finish it."""
+    repository = Path(__file__).resolve().parents[1]
+    sandbox = tmp_path / "demo repository"
+    (sandbox / "scripts").mkdir(parents=True)
+    (sandbox / "examples").mkdir()
+    shutil.copy2(repository / "scripts/demo.sh", sandbox / "scripts/demo.sh")
+    shutil.copy2(repository / "examples/hero.svg", sandbox / "examples/hero.svg")
+    # Replace only uv environment setup; every newsroom command uses the real CLI
+    # and real SQLite in the temporary demo root, without installing dependencies.
+    bin_path = tmp_path / "bin"
+    bin_path.mkdir()
+    launcher = bin_path / "uv"
+    launcher.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "assert sys.argv[1:3] == ['run', '--project']\n"
+        "assert sys.argv[4] == 'newsroom'\n"
+        "os.execv(sys.executable, [sys.executable, '-m', 'newsroom.cli', *sys.argv[5:]])\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    environment = {**os.environ, "PATH": f"{bin_path}{os.pathsep}{os.environ['PATH']}",
+                   "PYTHONPATH": str(repository / "src")}
+
+    result = subprocess.run(
+        ["bash", str(sandbox / "scripts/demo.sh")], cwd=sandbox,
+        env=environment, capture_output=True, text=True, timeout=120,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    root = sandbox / "demo-workspace"
+    with sqlite3.connect(root / "data/newsroom.db") as connection:
+        batches = connection.execute("SELECT batch_id,status FROM batches").fetchall()
+        articles = connection.execute("SELECT article_id,status,image_id FROM articles").fetchall()
+        requests = connection.execute("SELECT request_type,status,result_path FROM batch_requests").fetchall()
+    assert len(batches) == 1
+    batch_id, batch_status = batches[0]
+    assert batch_status == "PUBLISHED"
+    assert len(articles) == 2
+    assert all(status == "PUBLISHED" and image_id for _, status, image_id in articles)
+    batch_root = root / "workspace/batches" / batch_id
+    assert (batch_root / "README.md").is_file()
+    manifest = json.loads((batch_root / "publish/batch-manifest.json").read_text())
+    assert {item["article_id"] for item in manifest["items"]} == {row[0] for row in articles}
+    for article_id, _, _ in articles:
+        assert (batch_root / "articles" / article_id / "hero.svg").is_file()
+        assert (batch_root / "publish" / article_id / "article.md").is_file()
+        assert (batch_root / "publish" / article_id / "hero.svg").is_file()
+    assert {kind for kind, _, _ in requests} == {"CONTENT", "FACT_CHECK"}
+    assert all(status == "COMPLETED" and (root / path).is_file() for _, status, path in requests)
+    assert all(not (root / name).exists() for name in ("research", "articles", "images"))
 
 
 def write_candidate_csv(path: Path) -> Path:

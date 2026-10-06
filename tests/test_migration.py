@@ -29,6 +29,9 @@ def migrator(room):
 def legacy_workspace(tmp_path):
     room = Newsroom(tmp_path)
     room.init()
+    # This fixture represents the old layout; fresh init now creates only data.
+    for directory in ("research", "articles", "images", "output"):
+        (tmp_path / directory).mkdir()
     from newsroom.batch import BatchWorkflow
     csv = write_batch_csv(tmp_path / 'original.csv', [candidate_row()])
     batch_id = BatchWorkflow(room).prepare(csv)['batch_id']

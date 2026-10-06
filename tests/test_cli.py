@@ -98,3 +98,11 @@ def test_typer_exposes_required_nested_commands(tmp_path):
     for command in (["duplicate-check", "--help"], ["published", "list", "--help"], ["stats", "--help"]):
         result = runner.invoke(app, ['--root', str(tmp_path), *command])
         assert result.exit_code == 0, result.output
+
+
+def test_fresh_init_does_not_create_legacy_artifact_roots(tmp_path):
+    result = CliRunner().invoke(app, ["--root", str(tmp_path), "init"])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "data/newsroom.db").is_file()
+    assert all(not (tmp_path / name).exists() for name in ("research", "articles", "images", "output"))

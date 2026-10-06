@@ -26,8 +26,7 @@ class Newsroom:
 
     def init(self) -> None:
         from .coordination import initialize_operation_lock
-        for name in ("data", "research", "articles", "images", "output"):
-            (self.root / name).mkdir(parents=True, exist_ok=True)
+        (self.root / "data").mkdir(parents=True, exist_ok=True)
         initialize_operation_lock(self.root)
         self.db.initialize(utc_now())
         self._seed_sources()
@@ -180,6 +179,7 @@ class Newsroom:
         path = None
         if owning_batch_id is None:
             path = self.root / "research" / f"{article_id}.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(self._brief_template(candidate), encoding="utf-8")
         with self.db.connect() as connection:
             connection.execute(

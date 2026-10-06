@@ -1,21 +1,20 @@
-# Phase 1.1 批处理操作流程
+# Phase 1.1 Finder-first 批处理操作流程
 
-本流程的边界固定：Gemini 只负责定时发现、整理 Google Sheet 和生成 CSV；CSV 之后的研究、写作与图片搜索在第一个 Claude App 对话完成，事实核验在一个全新的 Claude 对话完成。CLI 不调用任何模型 API，不自动下载图片，也不自动发布。
+当前支持 macOS Finder 操作：候选选择后，内容、核验、图片登记、审核、批准及发布登记均以整批为单位。Gemini 只负责发现、整理 Google Sheet 和审核后的 CSV；CSV 导入后，Claude App 承担全部研究、写作、图片搜索和修订，一个全新 Claude 对话承担一次独立的整批事实核验。程序不调用模型 API、不联网下载图片、不自动发布。
+
+`.command` 启动器仅支持 macOS；Terminal 可能短暂出现，选择文件、确认和取消通过原生对话框完成。初始化、CSV 导入、重复项歧义处理和人工发布后的 URL 登记保留明确 CLI 入口。SQLite 是状态来源，README 和 `batch-state.json` 是可重建视图。
 
 ## 1. 从 Gemini 获得 CSV
 
-在 Google Sheet 的 `Inbox` 审核 Gemini 发现的新闻。确认 primary URL 支持 `core_fact`，移除错误 secondary URL，核对事件日期，并把通过项标为 `READY_TO_IMPORT`。从保留表头的 `Ready to Import` worksheet 下载 CSV。
-
-CSV 至少需要以下列；额外审核列可以保留，CLI 会忽略它们：
+在 Google Sheet 的 `Inbox` 审核发现的新闻，确认 primary URL 支持 `core_fact`，移除错误 secondary URL，核对事件日期，把通过项标为 `READY_TO_IMPORT`。从保留表头的 `Ready to Import` worksheet 下载 CSV，至少包含：
 
 ```text
 candidate_title,core_fact,event_date,company,product,topic,subtopic,event_type,keywords,primary_source,secondary_sources,discovered_from,priority
 ```
 
-`keywords` 和多个 `secondary_sources` 使用 `|` 分隔。只有 primary 可靠时，把 `secondary_sources` 留空。
-导出的尾部空行或仅含空白字符的整行会被 CLI 自动忽略；含有部分数据但缺少必填字段的行仍会拒绝整批导入并报告行号。
+`keywords` 和多个 `secondary_sources` 用 `|` 分隔；只有 primary 可靠时可留空 secondary。全空或仅空白的行会忽略，部分填写但缺少必填字段的行会拒绝整批并报告行号。Gemini 不参与导入后的内容工作。
 
-## 2. 初始化并准备整批文章
+## 2. 初始化、导入和选题
 
 ```bash
 cd /Users/jianchengsun/agent/news_agent
@@ -24,160 +23,141 @@ uv run newsroom init
 uv run newsroom batch prepare ~/Downloads/tech-newsroom-candidates.csv
 ```
 
-`init` 会幂等升级数据库；从旧 schema 升级前，备份写入 `data/backups/`。`batch prepare` 会验证整份 CSV、复用此前导入的候选、自动处理 `NEW`、创建文章记录，并返回：
+`init` 幂等升级 schema，升级旧数据库前备份到 `data/backups/`；全新根目录只创建 `data/` 与数据库/协调文件，不创建旧运行目录。`batch prepare` 验证整份 CSV、按指纹复用候选、自动选择确定性的 `NEW` 并创建文章及工作区。相同 CSV 字节返回原批次；以前执行过 `candidate import` 也可复用。结果包含 `batch_id`、`content_request_path`、`counts` 和 `items`。
 
-- `batch_id`：后续命令使用的 `batch-...`；
-- `content_request_path`：第一个 Claude 窗口要上传的 JSON；
-- `counts` 和 `items`：批次状态。
+`WAITING_DUPLICATE` 需要编辑 include 或 exclude，命令见第 8 节。全部歧义解决前不会生成 content request。候选级发现、来源审核、去重覆盖和选题仍是形成完整文章批次之前的输入步骤，之后只有整批操作。旧批次若已导入内容而仍有歧义，会在修改前拒绝继续 resolve，需要恢复。
 
-同一文件重复执行会返回原批次。即使以前运行过 `candidate import`，也可以直接执行 `batch prepare`；系统按候选指纹复用数据。
+## 3. 在 Finder 打开批次
 
-查看进度：
+打开 `workspace/README.md`，找到批次的相对链接，进入 `workspace/batches/BATCH_ID/` 并双击 `OPEN_BATCH.command`。它打开目录与 README，并在存在任务时定位当前 Claude request。README 列出下一步、条目状态、版本、核验结果、图片、审批、发布包与历史交接。
 
-```bash
-uv run newsroom batch status BATCH_ID
+所有批次操作文件均位于 `actions/`；文章目录没有单篇操作脚本：
+
+| 文件名 | 人工操作与效果 |
+| --- | --- |
+| `01-打开下一个Claude任务.command` | 定位当前待处理 content、fact-check 或 revision request，提示固定指令与预期返回文件。打开本身不创建任务或改变状态。 |
+| `02-导入Claude返回文件.command` | 从 inbox 或文件选择器选择当前结果，验证整份文档，明确确认后整批导入并归档。 |
+| `03-打开整批审核材料.command` | 打开全部文章目录和批次 README，不改变状态。 |
+| `04-登记整批图片.command` | 全部 PASS 后逐篇确认候选、权利页及本地原图，完整计划一次登记。 |
+| `05-完成整批审核.command` | 全部 IMAGE_READY 后确认整批检查，统一记录审核理由与状态。 |
+| `06-批准整个批次.command` | 全部 REVIEWED 后确认整个批次的当前版本和素材。 |
+| `07-生成全部发布包.command` | 全部 APPROVED 后确认、暂存验证并生成整批发布包，打开 publish 目录。 |
+| `08-刷新批次视图.command` | 从 SQLite 重建 README、状态和图片候选视图，不推进流程。 |
+
+工作区根目录另有 `workspace/Migrate Newsroom.command`，用于第 9 节的预检、报告、明确确认及验证备份/迁移。启动器通过向上查找 `pyproject.toml` 定位仓库，支持整个仓库搬迁；不要单独移动启动器到仓库之外。新批次准备/刷新会安装根启动器；尚未生成工作区的旧仓库可使用迁移 CLI。
+
+批次素材集中在以下目录，当前 request/result 路径以 README 和 SQLite 为准：
+
+```text
+workspace/batches/BATCH_ID/
+  README.md, OPEN_BATCH.command, batch-state.json
+  actions/                         八个批次启动器
+  input/candidates.csv             原始 CSV 副本
+  input/source-metadata.json       原始文件名与 SHA-256
+  claude/requests/                 content-request.json、fact-check-request-vN.json、revision-request-vN.json
+  claude/inbox/                    将Claude返回的JSON放在这里.txt 和人工下载结果
+  claude/archive/                  已导入原始结果、历史交接
+  articles/ARTICLE_ID/             research-brief-vN.md、article-vN.md、fact-check-vN.md、image-candidates.json、hero.EXT
+  image-selections.json            可恢复的图片选择草稿
+  publish/ARTICLE_ID/              各篇完整发布包
+  publish/batch-manifest.json      整批发布包索引
 ```
 
-状态输出始终包含 `content_request_path`；内容导入完成后还会包含当前版本的 `fact_check_request_path`，可直接用于定位要上传到 Claude 的文件。
+`REUSED_COMPLETE` 链接到原拥有批次，不复制为本批次待编辑文章；`EXCLUDED` 不参与后续闸门。历史单篇及未归属文件迁移为 `workspace/archive/` 下只读参考。
 
-## 3. 只处理有歧义的重复项
+## 4. 第一个 Claude 窗口：整批研究、写作与图片搜索
 
-`NEW` 已自动进入写作。`WAITING_DUPLICATE` 才需要人工操作。
-
-排除：
-
-```bash
-uv run newsroom batch resolve BATCH_ID CANDIDATE_ID \
-  --decision exclude --actor editor --reason "与已选事件重复"
-```
-
-`FOLLOW_UP` 或 `RELATED` 可直接 include：
-
-```bash
-uv run newsroom batch resolve BATCH_ID CANDIDATE_ID \
-  --decision include --actor editor --reason "属于有独立新闻价值的后续事件"
-```
-
-`POSSIBLE_DUPLICATE` 或 `DUPLICATE` 必须先记录人工覆盖，再 include：
-
-```bash
-uv run newsroom duplicate-check CANDIDATE_ID \
-  --override NEW --actor editor --reason "来源与事件日期证明是独立事件"
-
-uv run newsroom batch resolve BATCH_ID CANDIDATE_ID \
-  --decision include --actor editor --reason "已完成重复项覆盖"
-```
-
-所有 `WAITING_DUPLICATE` 都完成 include 或 exclude 后，才会生成包含整批已选文章的 content request；此前 `content_request_path` 为空。以最新 `batch status` 返回的路径为准。旧批次若已导入部分内容却仍有未解决重复项，CLI 会在任何修改前拒绝继续 resolve；需人工恢复旧批次或在新批次导入内容前先完成重复项审核。
-
-## 4. 第一个 Claude 窗口：整批研究、写作和图片搜索
-
-新建一个 Claude App 对话，上传 `content_request_path` 指向的一个 JSON 文件，只发送一次：
+双击操作 01，新建 Claude App 对话，上传当前 `content-request.json`，只发送：
 
 ```text
 严格执行文件中的 instructions，完成全部条目，并生成其中指定的 output_file。
 ```
 
-Claude 应返回一个可下载 JSON，包含整批 Research Brief、完整 Markdown 文章，以及每篇最多三个图片候选。图片必须有原始落地页和原始权利页面；不接受搜索缩略图、版权不明的媒体图片或仅以 fair use 为依据的图片。
+Claude 返回一个可下载 JSON，包含整批 Research Brief、完整 Markdown 文章和每篇最多三个图片候选。候选必须包含原始落地页、原始权利页、作者、许可/权利声明及署名，不能使用缩略图、版权不明的媒体图片或仅 fair use 的图片。
 
-下载后一次性导入：
+把结果下载到当前批次 `claude/inbox/`，阅读其中 `将Claude返回的JSON放在这里.txt`，再双击操作 02。一个身份匹配的 JSON 会等待确认；多个匹配文件显示选择器；没有匹配文件显示本地文件选择器。匹配依据是 JSON 的 `batch_id`、当前 `request_id` 与声明的 `output_file`。按 request 的预期输出名下载；改本地文件名不会修复错误身份。
 
-```bash
-uv run newsroom batch content-import BATCH_ID \
-  ~/Downloads/BATCH_ID-content-result.json
-```
+完整 schema、文章集合、slug 和权利元数据先验证，缺少、额外或重复文章与旧任务结果均拒绝，不部分写入。成功后原始字节归档到 `claude/archive/`，研究与稿件写入各文章目录，生成 fact-check request 并刷新视图。inbox 没有自动监听器，必须人工启动导入；取消不导入。
 
-CLI 会先验证整个 JSON。缺少文章、出现额外文章、slug 冲突或图片权利字段不完整时，整批不写入。成功后自动返回 `fact_check_request_path`。
+## 5. 第二个 Claude 窗口：一次独立整批核验
 
-## 5. 第二个 Claude 窗口：一次独立核验
+内容导入后双击操作 01，必须新建独立 Claude 对话，上传当前 `fact-check-request-v1.json`，发送同一句固定指令。一次交接核验全部文章，各篇返回 PASS/FAIL 和 claim-level 报告；无需逐篇开窗口。下载 JSON 放入 inbox，再用操作 02 导入。
 
-必须新建 Claude 对话，上传 `fact_check_request_path`，仍只发送同一句固定指令。下载结果后运行：
+PASS 文章为 `FACT_CHECKED`，FAIL 为 `NEEDS_REVISION`。已通过文章保留结果，但只要还有 FAIL，整个批次不能登记图片、审核、批准或打包。Finder 导入失败核验结果后会生成只包含失败文章的 revision request；操作 01 打开该任务。在 Claude 修订后用操作 02 导入，保留 v1 并新增 `research-brief-vN.md` 与 `article-vN.md`。新 request 再交给全新 Claude 窗口独立核验，旧 request 的结果不能用于新版本。
 
-```bash
-uv run newsroom batch fact-check-import BATCH_ID \
-  ~/Downloads/BATCH_ID-fact-check-result-v1.json
-```
+若采用 CLI 导入事实核验，编辑需显式运行 `batch revision-request` 创建修订任务；打开操作本身不会创建请求。没有 FAIL 时只需一个独立整批核验窗口，不增加额外检查流程。
 
-- `PASS` → `FACT_CHECKED`，进入图片人工确认；
-- `FAIL` → `NEEDS_REVISION`，不会阻塞同批其他文章。
+## 6. 每篇一张图片，完整计划一次登记
 
-核验只做一次整批交接；每篇文章仍分别获得 PASS/FAIL 和 claim-level 报告。
+全部有效文章 PASS 后，双击操作 04。逐篇从 `image-candidates.json` 选择一项，打开原始落地页和权利页，确认作者、许可及署名；人工下载原图并检查画面、格式和分辨率，然后选择本地文件并明确确认使用权利。
 
-## 6. 仅在 FAIL 时修订
+已确认选择保存在 `image-selections.json`。中途取消保留草稿，不部分登记；重启操作可继续未完成项。完整集合验证通过后才暂存复制每篇一张图、在一个事务内登记，文章统一进入 `IMAGE_READY`。缺少/重复/额外文章、跨文章候选、缺少原图或 `rights_confirmed` 不是显式 `true` 时整批拒绝。旧状态若混合已登记与未登记图片，需恢复或管理员修复，不能用此操作继续部分登记。图片规则见 [IMAGE_POLICY.md](IMAGE_POLICY.md)。
 
-```bash
-uv run newsroom batch revision-request BATCH_ID
-```
+## 7. 整批审核、批准、发布包与登记
 
-把返回的 revision request 上传到一个 Claude 对话，发送固定指令，下载后导入：
+用操作 03 检查当前文章、研究简报、事实核验、图片和版权记录；用操作 05 完成整批审核，操作 06 批准整个批次，操作 07 生成全部发布包。审核要求全部有效文章 `IMAGE_READY`，批准要求全部 `REVIEWED`，发布包要求全部 `APPROVED`。先验证全部成员，再统一记录状态和相同 actor/reason 的审计；任何一篇不满足都不能部分通过。`EXCLUDED` 与 `REUSED_COMPLETE` 不阻塞，也不接收本批次包或 URL。
 
-```bash
-uv run newsroom batch revision-import BATCH_ID \
-  ~/Downloads/BATCH_ID-revision-result-v2.json
-```
+发布包先暂存并验证当前 article、Research Brief、fact-check、原图、metadata、来源、许可、checklist 和 manifest，再整体替换 `publish/`。失败/中断保留原发布目录并回滚；成功后批次 `PACKAGED`，文章仍 `APPROVED`。成功提交和刷新后，旧包备份清理失败不改变成功结果；残留 `.previous-publish-*` 仅为恢复数据。
 
-CLI 保留 v1，写入 `research-brief-v2.md` 和 `article-v2.md`，并自动生成新的 fact-check request。使用新的 Claude 对话核验，再运行 `fact-check-import`。旧 request 的结果不能用于新一轮。
-
-## 7. 人工确认并登记图片
-
-在批次目录的 `articles/ARTICLE_ID/image-candidates.json` 查看图片候选。对每篇有效文章选中的 `image_candidate_id`：
-
-1. 打开 `landing_page_url` 和 `rights_url`；
-2. 确认作者、许可、署名要求与记录一致；
-3. 人工下载原图并检查画面、格式和分辨率；
-4. 把全部选择写入一个 JSON，其中 `image_file` 为人工下载文件的本地路径，`rights_confirmed` 必须显式为 `true`：
+人工把 `publish/ARTICLE_ID/` 上传 CMS。八个 Finder 操作没有发布登记启动器；取得真实 URL 后用下面一个 JSON 与一条批次命令登记全部结果：
 
 ```json
 {
   "schema_version": 1,
   "batch_id": "BATCH_ID",
   "items": [
-    {
-      "article_id": "ARTICLE_ID",
-      "image_candidate_id": "IMAGE_CANDIDATE_ID",
-      "image_file": "/absolute/path/to/hero.jpg",
-      "rights_confirmed": true
-    }
+    {"article_id": "ARTICLE_ID", "article_url": "https://news.example/article"}
   ]
 }
 ```
 
-```bash
-uv run newsroom batch image-plan BATCH_ID ~/Downloads/BATCH_ID-image-plan.json
-```
-
-CLI 不下载图片，也不替编辑判断版权。缺少有效文章、候选属于另一篇文章、缺少本地文件或未显式确认权利时，整批拒绝登记。
-
-## 8. 审核、批准、发布包和发布登记
-
-整批发布闸门以 SQLite 中的有效条目为准：`EXCLUDED` 与 `REUSED_COMPLETE` 不阻塞操作、不改变文章状态，也不接收当前批次的发布包或要求发布 URL。整批审核要求全部有效文章为 `IMAGE_READY`；整批批准要求全部为 `REVIEWED`。先验证整批，再在一个事务内记录相同审核人及理由的文章状态转换。
-
-整批发布包要求全部有效文章为 `APPROVED`。系统先暂存并验证各篇当前版本的文章、研究简报、事实核验、图片、metadata、许可、来源及 checklist，以及 `batch-manifest.json`，再替换 `workspace/batches/BATCH_ID/publish/`。失败或中断会保留之前的发布目录并回滚数据库；成功后批次为 `PACKAGED`，文章仍为 `APPROVED`。数据库提交和工作区刷新成功后，旧包备份清理若失败，命令仍返回成功；残留的 `.previous-publish-*` 只是不作为当前发布包的恢复数据。人工上传后，以包含 `schema_version: 1`、正确 `batch_id` 和 `items`（每项为 `article_id`、HTTP(S) `article_url`）的 JSON 登记整批发布结果；文章集合必须恰好对应全部有效文章，缺失、额外或重复项均整批拒绝。成功登记在一个事务内更新文章 URL、时间、审计及 `PUBLISHED` 状态。
+`items` 必须恰好覆盖全部有效文章，每篇一个 HTTP(S) URL；占位例子需替换并补齐。缺失、额外或重复项整批拒绝。一次事务更新全部 URL、UTC 发布时间和审计，批次及文章到达 `PUBLISHED`：
 
 ```bash
-uv run newsroom batch review BATCH_ID \
-  --actor editor --reason "已检查文章、核验报告、图片与权利页面"
-
-uv run newsroom batch approve BATCH_ID \
-  --actor editor --reason "当前版本及发布素材已确认"
-
-uv run newsroom batch publish-packages BATCH_ID
-```
-
-发布包位于 `workspace/batches/BATCH_ID/publish/ARTICLE_ID/`，包含当前版本的 `article.md`、Research Brief、fact-check、图片、来源、metadata、图片权利记录和 checklist。人工上传到 CMS 后，用真实 URL 登记：
-
-```bash
-uv run newsroom batch publish-register BATCH_ID \
-  ~/Downloads/BATCH_ID-publication-result.json --actor editor
-
+uv run newsroom batch publish-register BATCH_ID ~/Downloads/BATCH_ID-publication-result.json --actor editor
 uv run newsroom published list
-uv run newsroom stats
 uv run newsroom batch refresh-workspace BATCH_ID
 ```
 
-选择后的受支持 CLI 操作统一使用 `batch`；单篇文章服务仅保留为内部恢复和构建辅助，不再注册为用户命令。`refresh-workspace` 从 SQLite 重建工作区视图，不改变流程状态。
+## 8. 候选歧义与备用批次 CLI
 
-仍需人工完成的步骤只有：Sheet 来源审核、重复项歧义判断、两个 Claude 文件交接、图片权利页与文件检查、最终编辑批准、CMS 上传和真实 URL 登记。
+排除或包含 `FOLLOW_UP`/`RELATED`：
+
+```bash
+uv run newsroom batch resolve BATCH_ID CANDIDATE_ID --decision exclude --actor editor --reason "与已选事件重复"
+uv run newsroom batch resolve BATCH_ID CANDIDATE_ID --decision include --actor editor --reason "有独立新闻价值的后续事件"
+```
+
+`POSSIBLE_DUPLICATE`/`DUPLICATE` 必须先记录人工覆盖再 include：
+
+```bash
+uv run newsroom duplicate-check CANDIDATE_ID --override NEW --actor editor --reason "来源与日期证明为独立事件"
+uv run newsroom batch resolve BATCH_ID CANDIDATE_ID --decision include --actor editor --reason "已完成覆盖审核"
+```
+
+选择后备用入口全部为整批操作。路径以当前 `batch status`、README/request 的输出名为准：
+
+```bash
+uv run newsroom batch status BATCH_ID
+uv run newsroom batch content-import BATCH_ID RESULT_JSON
+uv run newsroom batch fact-check-import BATCH_ID RESULT_JSON
+uv run newsroom batch revision-request BATCH_ID
+uv run newsroom batch revision-import BATCH_ID RESULT_JSON
+uv run newsroom batch image-plan BATCH_ID PLAN_JSON
+uv run newsroom batch review BATCH_ID --actor editor --reason "检查整批素材和权利"
+uv run newsroom batch approve BATCH_ID --actor editor --reason "批准整批当前版本"
+uv run newsroom batch publish-packages BATCH_ID
+uv run newsroom batch publish-register BATCH_ID URLS_JSON --actor editor
+uv run newsroom batch refresh-workspace BATCH_ID
+```
+
+图片计划 `PLAN_JSON` 为 `schema_version: 1`、`batch_id` 和完整 `items`，每项包含 `article_id`、所属 `image_candidate_id`、本地 `image_file` 路径及 `rights_confirmed: true`。Finder 自动准备的 `image-selections.json` 使用同一格式。
+
+旧的 `brief create`、`prompt create`、`research register`、`article register`、`fact-check register`、`image register`、顶层 `review`、`approve`、`publish-package` 和 `publish` 不再注册为受支持命令。内部单篇服务仅用于恢复和批次构建，不能绕过整批闸门；历史手册仅留在 archive。
+
+## 9. 旧工作区迁移与恢复
+
+先复制数据库和全部素材到独立目录演练并核对恢复证据，再使用真实工作区的 `workspace/Migrate Newsroom.command`。启动器保存并打开只读预检报告，有阻塞就拒绝继续；编辑明确确认后才创建验证备份和执行。取消只留下报告，不移动素材、不改变数据库。没有生成启动器时可用以下 CLI。迁移不是发布，也不推进文章状态。
 
 迁移旧工作区前，可运行 `uv run newsroom workspace migrate --preflight`。此命令只读取数据库与文件，并把确定性的 JSON 清单保存到 `data/workspace-migration-preflight.json`；它不会更新流程状态、移动素材或创建迁移暂存目录。缺失的数据库引用、路径逃逸、符号链接、归属歧义或目标冲突会阻塞迁移并返回非零状态。可重复使用 `--source-csv PATH` 指定原始 CSV，只有字节级 SHA-256 与已记录批次一致时才会列为可复制输入；缺失原始 CSV 不会阻塞。
 
@@ -198,11 +178,11 @@ uv run newsroom workspace migrate --execute --plan data/workspace-migration-pref
 
 刷新批次工作区会在 `workspace/README.md` 旁安装可执行、可搬迁的 `workspace/Migrate Newsroom.command`。Finder 启动器仅分派隐藏 CLI 控制器；控制器先预检、保存并打开报告，存在阻塞时拒绝继续，再要求编辑明确确认，之后才创建验证备份并执行迁移。取消只保留报告，不移动文件、不更改数据库。
 
-## 9. 验证与离线 Demo
+## 10. 验证与离线 Demo
 
 ```bash
 uv run pytest -q
 bash scripts/demo.sh
 ```
 
-Demo 在 `demo-workspace/` 内生成合成 Claude JSON，完整走通批次准备、内容导入、独立核验、图片登记、批准、发布包和发布登记，不访问网络或模型服务。
+Demo 重建独立 `demo-workspace/`，准备两个候选，按当前 request 生成并导入合成 content 和独立 fact-check JSON，用一个完整图片计划，再依次整批 review、approve、publish-packages、publish-register。脚本断言两篇及批次均为 `PUBLISHED`、批次 README 和 publish manifest 存在，且没有顶层 `research/`、`articles/`、`images/`。发布包位于 `demo-workspace/workspace/batches/BATCH_ID/publish/`。整个 demo 使用本地 SVG、合成权利记录和示例 URL，不访问网络或模型、不打开原生对话框、不迁移真实数据。

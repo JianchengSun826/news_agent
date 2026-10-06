@@ -25,7 +25,14 @@ CSV
 prepare_json="$(run batch prepare "$demo_root/candidates.csv")"
 batch_id="$(printf '%s' "$prepare_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["batch_id"])')"
 content_request="$(printf '%s' "$prepare_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["content_request_path"])')"
-content_result="$demo_root/content-result.json"
+batch_root="$demo_root/workspace/batches/$batch_id"
+content_result="$batch_root/claude/inbox/$(python3 - "$content_request" <<'PY'
+import json
+import sys
+from pathlib import Path
+print(json.loads(Path(sys.argv[1]).read_text())["output_file"])
+PY
+)"
 
 python3 - "$content_request" "$content_result" <<'PY'
 import json
@@ -66,7 +73,13 @@ PY
 
 content_import="$(run batch content-import "$batch_id" "$content_result")"
 fact_request="$(printf '%s' "$content_import" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fact_check_request_path"])')"
-fact_result="$demo_root/fact-check-result.json"
+fact_result="$batch_root/claude/inbox/$(python3 - "$fact_request" <<'PY'
+import json
+import sys
+from pathlib import Path
+print(json.loads(Path(sys.argv[1]).read_text())["output_file"])
+PY
+)"
 
 python3 - "$fact_request" "$fact_result" <<'PY'
 import json
@@ -90,33 +103,56 @@ Path(sys.argv[2]).write_text(json.dumps(result, ensure_ascii=False, indent=2), e
 PY
 
 run batch fact-check-import "$batch_id" "$fact_result" >/dev/null
-article_ids=()
-while IFS= read -r article_id; do
-  article_ids+=("$article_id")
-done < <(python3 - "$content_request" <<'PY'
+image_plan="$batch_root/image-selections.json"
+publication_result="$batch_root/publication-result.json"
+python3 - "$content_request" "$batch_root" "$repo_root/examples/hero.svg" "$image_plan" "$publication_result" <<'PY'
 import json
 import sys
 from pathlib import Path
 request = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(*(item["article_id"] for item in request["items"]), sep="\n")
+batch_root = Path(sys.argv[2])
+images = []
+publications = []
+for item in request["items"]:
+    article_id = item["article_id"]
+    candidates = json.loads((batch_root / "articles" / article_id / "image-candidates.json").read_text())
+    images.append({
+        "article_id": article_id,
+        "image_candidate_id": candidates[0]["image_candidate_id"],
+        "image_file": str(Path(sys.argv[3]).resolve()),
+        "rights_confirmed": True,
+    })
+    publications.append({"article_id": article_id, "article_url": f"https://example.com/demo/{article_id}"})
+for path, items in ((sys.argv[4], images), (sys.argv[5], publications)):
+    Path(path).write_text(json.dumps({
+        "schema_version": 1, "batch_id": request["batch_id"], "items": items,
+    }, indent=2), encoding="utf-8")
 PY
-)
 
-for article_id in "${article_ids[@]}"; do
-  image_candidates="$(run image candidates "$article_id")"
-  image_candidate_id="$(printf '%s' "$image_candidates" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["image_candidate_id"])')"
-  run image register "$article_id" \
-    --candidate "$image_candidate_id" \
-    --file "$repo_root/examples/hero.svg" \
-    --rights-confirmed >/dev/null
-  run review "$article_id" --actor demo-editor --reason "Checked article, fact-check, image file, and original rights metadata" >/dev/null
-  run approve "$article_id" --actor demo-editor --reason "Approved synthetic offline demo package" >/dev/null
-  run publish-package "$article_id" >/dev/null
-  run publish "$article_id" --actor demo-editor --url "https://example.com/demo/$article_id" >/dev/null
-done
+run batch image-plan "$batch_id" "$image_plan" >/dev/null
+run batch review "$batch_id" --actor demo-editor --reason "Checked all articles, fact-checks, image files, and original rights metadata" >/dev/null
+run batch approve "$batch_id" --actor demo-editor --reason "Approved whole synthetic offline demo batch" >/dev/null
+run batch publish-packages "$batch_id" >/dev/null
+run batch publish-register "$batch_id" "$publication_result" --actor demo-editor >/dev/null
+
+test -f "$demo_root/workspace/batches/$batch_id/README.md"
+test -f "$demo_root/workspace/batches/$batch_id/publish/batch-manifest.json"
+test ! -d "$demo_root/research"
+test ! -d "$demo_root/articles"
+test ! -d "$demo_root/images"
+python3 - "$demo_root" "$batch_id" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+with sqlite3.connect(Path(sys.argv[1]) / "data/newsroom.db") as connection:
+    articles = connection.execute("SELECT article_id,status FROM articles").fetchall()
+    batch_status = connection.execute("SELECT status FROM batches WHERE batch_id=?", (sys.argv[2],)).fetchone()[0]
+assert len(articles) == 2 and all(status == "PUBLISHED" for _, status in articles), articles
+assert batch_status == "PUBLISHED", batch_status
+print("Selected and published articles:", ", ".join(article_id for article_id, _ in articles))
+PY
 
 printf 'Demo batch: %s\n' "$batch_id"
-printf 'Selected and published articles: %s\n' "${article_ids[*]}"
 run batch status "$batch_id"
 run stats
 run published list
