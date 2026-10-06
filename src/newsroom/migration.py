@@ -61,7 +61,7 @@ def assert_migration_access(root: Path | str) -> None:
             if path.suffix != '.json' or not path.is_file():
                 raise ValueError('unexpected journal entry')
             journal = json.loads(path.read_bytes())
-            if journal['schema_version'] != 1 or Path(journal['journal_path']) != path or not isinstance(journal['history'], list):
+            if journal['schema_version'] != 1 or _repository_reference(root, journal['journal_path'], Path('data/workspace-migration-journals'), _record_root(journal)) != path or not isinstance(journal['history'], list):
                 raise ValueError('invalid journal identity')
             if (journal.get('recovery_status') == 'ROLLED_BACK'
                     and journal.get('rollback_verified') is True
@@ -113,6 +113,40 @@ def _no_symlinks(path: Path) -> None:
     for part in (path, *path.parents):
         if part.is_symlink():
             raise WorkflowError("unsafe symlink source or destination")
+
+
+def _repository_reference(root: Path, value: str, prefix: Path, stored_root: str | None = None) -> Path:
+    """Resolve a journal reference locally, rebasing only its recorded repository.
+
+    Absolute paths from older records are accepted only beneath the recorded
+    root. They never cause a read from that old location or a foreign tree.
+    """
+    path = Path(value)
+    if '..' in path.parts:
+        raise WorkflowError('unsafe migration reference traversal')
+    if path.is_absolute():
+        origin = Path(stored_root) if stored_root else root
+        if not origin.is_absolute() or '..' in origin.parts or not path.is_relative_to(origin):
+            raise WorkflowError('foreign migration reference')
+        path = path.relative_to(origin)
+    _safe_relative(path)
+    if not path.is_relative_to(prefix) or path == prefix:
+        raise WorkflowError('migration reference escapes required directory')
+    local = root / path
+    _no_symlinks(local)
+    return local
+
+
+def _record_root(record: dict[str, Any]) -> str | None:
+    """Recover the old local root from the fixed journal layout for v1 records."""
+    if 'repository_root' in record:
+        return record['repository_root']
+    journal = Path(record['journal_path'])
+    if journal.is_absolute():
+        if '..' in journal.parts or journal.parts[-3:-1] != ('data', 'workspace-migration-journals'):
+            raise WorkflowError('unsafe historical migration journal reference')
+        return str(journal.parents[2])
+    return None
 
 
 def _walk_error(error: OSError) -> None:
@@ -792,19 +826,8 @@ class WorkspaceMigrator:
                     raise BaseExceptionGroup('database switch and connection rollback failed', [original, rollback_error]) from None
                 raise
 
-    def _verify_hashes(self, plan: MigrationPlan, root: Path, *, current_views: bool = False) -> None:
+    def _verify_hashes(self, plan: MigrationPlan, root: Path) -> None:
         for entry in plan.entries:
-            # Receipt verification permits derived views to evolve with current
-            # SQLite state. Their identities/content are validated separately;
-            # canonical source artifacts remain bound to original manifest bytes.
-            parts = entry.target.parts
-            view = entry.target == Path('workspace/README.md') or entry.target == Path('workspace/Migrate Newsroom.command')
-            if parts[:2] == ('workspace', 'batches') and len(parts) >= 4:
-                view = view or parts[3:] in {('README.md',), ('batch-state.json',), ('OPEN_BATCH.command',), ('input', 'source-metadata.json')}
-                view = view or (len(parts) == 6 and parts[3] == 'articles' and parts[5] == 'image-candidates.json')
-                view = view or (len(parts) == 5 and parts[3] == 'actions' and parts[4] in {filename for filename, _ in BATCH_ACTIONS})
-            if current_views and entry.database_field is None and view:
-                continue
             _safe_relative(entry.target)
             path = root / entry.target
             _no_symlinks(path)
@@ -854,10 +877,19 @@ class WorkspaceMigrator:
         with closing(room.db.connect()) as connection:
             return _database(connection)[1]
 
-    def _validate_materials(self, room: Newsroom) -> None:
+    def _validate_materials(self, room: Newsroom, *, terminal: bool = False) -> None:
         """Reopen paths, typed handoffs, images, and packages without workflow writes."""
         from . import batch_models as models
         from .batch_release import BatchReleaseWorkflow
+        if terminal:
+            # Mutable/disposable content is allowed, filesystem escapes are not.
+            # This includes package trees not referenced by a database column.
+            for directory, dirs, files in os.walk(room.root / 'workspace', followlinks=False, onerror=_walk_error):
+                for name in dirs + files:
+                    path = Path(directory) / name
+                    _no_symlinks(path)
+                    if not (path.is_file() or path.is_dir()):
+                        raise WorkflowError('unsafe canonical filesystem object')
         with closing(room.db.connect()) as connection:
             tables, _ = _database(connection)
         articles = {row['article_id']: row for row in tables['articles']}
@@ -923,19 +955,22 @@ class WorkspaceMigrator:
                 except (OSError, ValueError) as error:
                     raise WorkflowError('missing or invalid batch launcher') from error
             try:
+                _no_symlinks(root / 'input/source-metadata.json')
                 metadata = json.loads((root / 'input/source-metadata.json').read_bytes())
                 source = workspace.source_csv_path(batch['batch_id'])
+                _no_symlinks(source)
                 expected = {'source_filename': Path(batch['source_filename']).name,
                             'source_sha256': batch['source_sha256'], 'available': source.is_file()}
                 if metadata != expected or (source.is_file() and _digest(source)[0] != batch['source_sha256']):
                     raise ValueError('source metadata does not match batch')
-                state = json.loads((root / 'batch-state.json').read_bytes())
-                expected_state = workspace.snapshot(batch['batch_id'])
-                if {key: value for key, value in state.items() if key != 'workspace_version'} != {key: value for key, value in expected_state.items() if key != 'workspace_version'} or batch['batch_id'] not in (root / 'README.md').read_text():
-                    raise ValueError('dashboard batch identity mismatch')
+                if not terminal:
+                    state = json.loads((root / 'batch-state.json').read_bytes())
+                    expected_state = workspace.snapshot(batch['batch_id'])
+                    if {key: value for key, value in state.items() if key != 'workspace_version'} != {key: value for key, value in expected_state.items() if key != 'workspace_version'} or batch['batch_id'] not in (root / 'README.md').read_text():
+                        raise ValueError('dashboard batch identity mismatch')
             except (OSError, ValueError, TypeError) as error:
-                raise WorkflowError(f'migrated source metadata or dashboard identity mismatch: {batch["batch_id"]}') from error
-            for article in room.db.all('SELECT article_id FROM articles WHERE owning_batch_id=?', (batch['batch_id'],)):
+                raise WorkflowError(f'migrated source metadata or dashboard identity mismatch: {batch["batch_id"]}: {error}') from error
+            for article in ([] if terminal else room.db.all('SELECT article_id FROM articles WHERE owning_batch_id=?', (batch['batch_id'],))):
                 candidate_view = workspace.article_root(batch['batch_id'], article['article_id']) / 'image-candidates.json'
                 if json.loads(candidate_view.read_bytes()) != room.list_image_candidates(article['article_id']):
                     raise WorkflowError('migrated image candidate view differs from current database')
@@ -972,6 +1007,11 @@ class WorkspaceMigrator:
                 candidate = next((row for row in tables['image_candidates'] if row['image_candidate_id'] == image['image_candidate_id']), None)
                 if candidate is None or candidate['article_id'] != image['article_id'] or candidate['batch_id'] != article['owning_batch_id']:
                     raise WorkflowError('migrated image candidate identity mismatch')
+        if terminal:
+            # Migration proves the historical snapshot, not frozen live bytes.
+            # Current canonical references and typed handoffs above stay safe;
+            # dashboards and packages can be absent/stale while being rebuilt.
+            return
         # Generate/read dashboards only in a disposable clone. Existing canonical
         # views remain byte-for-byte intact, and no states or publish trees advance.
         with tempfile.TemporaryDirectory(prefix='newsroom-migration-validation-') as temporary:
@@ -1098,19 +1138,38 @@ class WorkspaceMigrator:
     def _cleanup_originals(self, plan: MigrationPlan) -> None:
         if self._execution['stage'] != 'VERIFIED':
             raise WorkflowError('cleanup requires verified migration')
-        for entry in {entry.source: entry for entry in plan.entries}.values():
-            if entry.source.is_absolute() or entry.source == entry.target or entry.source.parts[0] not in {'research', 'articles', 'images', 'output'}:
+        for name in ('research', 'articles', 'images', 'output'):
+            path = self.room.root / name
+            if not path.exists():
                 continue
-            path = self._source(entry.source)
-            if _digest(path) != (entry.sha256, entry.size):
-                raise WorkflowError('migration original changed before cleanup')
-            self._execution['removed_sources'].append(entry.source.as_posix())
+            # Rename the complete tree before inspecting its final bytes. An
+            # editor's open handle continues to reference the preserved inode.
+            # Never unlink a source, even after a successful hash comparison.
+            record = self._preserve_tree(path, 'legacy_originals', 'legacy')
+            self._verify_legacy_original(plan, name, Path(record['path']))
+            self._execution['removed_sources'].extend(
+                entry.source.as_posix() for entry in plan.entries
+                if not entry.source.is_absolute() and entry.source.parts[0] == name
+            )
             self._journal()
-            path.unlink()
-        for record in sorted(self._execution['directories'], key=lambda item: len(Path(item['path']).parts), reverse=True):
-            path = self.room.root / record['path']
-            if Path(record['path']).parts[0] in {'research', 'articles', 'images', 'output'} and path.is_dir() and not any(path.iterdir()):
-                path.rmdir()
+
+    def _verify_legacy_original(self, plan: MigrationPlan, name: str, moved: Path) -> None:
+        expected = {entry.source.relative_to(name): (entry.sha256, entry.size)
+                    for entry in plan.entries if not entry.source.is_absolute() and entry.source.parts[0] == name}
+        directories = {Path(record['path']).relative_to(name) for record in self._execution['directories']
+                       if Path(record['path']).parts[0] == name}
+        actual, actual_directories = {}, set()
+        for path in [moved, *moved.rglob('*')]:
+            mode = path.lstat().st_mode
+            relative = path.relative_to(moved)
+            if stat.S_ISREG(mode):
+                actual[relative] = _digest(path)
+            elif stat.S_ISDIR(mode):
+                actual_directories.add(relative)
+            else:
+                raise WorkflowError('unsafe legacy original preserved; recovery required')
+        if actual != expected or actual_directories != directories:
+            raise WorkflowError('legacy originals changed at relocation; bytes preserved; recovery required')
 
     def _remove_promoted(self, path: Path) -> None:
         scan_error = None
@@ -1195,6 +1254,12 @@ class WorkspaceMigrator:
 
     def _restore_artifacts(self, plan: MigrationPlan, backup: Path, stage: Path) -> None:
         stage = self._retained_stage(stage)
+        for record in reversed(self._execution.get('legacy_originals', [])):
+            preserved, destination = Path(record['path']), Path(record['source'])
+            if preserved.exists():
+                if destination.exists() or destination.is_symlink():
+                    self._preserve_tree(destination, 'quarantined_legacy', 'legacy-conflict')
+                os.replace(preserved, destination)
         for operation in reversed(self._execution['promotions']):
             name = operation['name']
             destination, previous = self.workspace.root / name, stage / 'retained' / name
@@ -1291,7 +1356,7 @@ class WorkspaceMigrator:
         self._pending_journals()
         self._assert_unchanged(plan, inventory=True)
         _no_symlinks(Path(backup_dir).absolute())
-        backup = Path(backup_dir).resolve()
+        backup = _repository_reference(self.room.root, str(Path(backup_dir).resolve()), Path('data/backups'))
         self.verify_backup(backup)
         manifest = json.loads((backup / 'manifest.json').read_bytes())
         if manifest['plan'] != plan.to_dict():
@@ -1316,6 +1381,7 @@ class WorkspaceMigrator:
         stage = Path(tempfile.mkdtemp(prefix=f'.migration-staging-{stamp}-', dir=self.workspace.root))
         journal = self.room.root / 'data/workspace-migration-journals' / (stage.name + '.json')
         self._execution = {'schema_version': 1, 'stage': None, 'history': [], 'manifest_sha256': manifest_sha,
+                           'repository_root': str(self.room.root),
                            'backup_path': str(backup), 'journal_path': str(journal), 'staging_path': str(stage),
                            'database_updated': False, 'database_update_attempted': False,
                            'barrier_acquired': False, 'promotions': [], 'removed_sources': [],
@@ -1340,7 +1406,10 @@ class WorkspaceMigrator:
             self._verify_retained(plan, stage)
             retired = self._preserve_tree(stage, 'retired_stages', 'retired')
             self._verify_retained(plan, Path(retired['path']))
-            receipt = {'schema_version': 1, 'manifest_sha256': manifest_sha, 'backup_path': str(backup), 'journal_path': str(journal), 'retired_paths': [record['path'] for record in self._execution['retired_stages']]}
+            receipt = {'schema_version': 1, 'manifest_sha256': manifest_sha, 'repository_root': str(self.room.root),
+                       'backup_path': str(backup), 'journal_path': str(journal),
+                       'retired_paths': [record['path'] for record in self._execution['retired_stages']],
+                       'legacy_paths': [record['path'] for record in self._execution.get('legacy_originals', [])]}
             _durable_json(self.receipt_path, receipt)
             self._journal('CLEANED')
             self._release_barrier()
@@ -1461,35 +1530,62 @@ class WorkspaceMigrator:
         try:
             _no_symlinks(self.receipt_path)
             receipt = json.loads(self.receipt_path.read_bytes())
-            backup = Path(receipt['backup_path'])
+            origin = _record_root(receipt)
+            backup = _repository_reference(self.room.root, receipt['backup_path'], Path('data/backups'), origin)
             self.verify_backup(backup)
             if receipt['schema_version'] != 1 or _digest(backup / 'manifest.json')[0] != receipt['manifest_sha256']:
                 raise ValueError('manifest mismatch')
-            journal_path = Path(receipt['journal_path'])
+            journal_path = _repository_reference(self.room.root, receipt['journal_path'], Path('data/workspace-migration-journals'), origin)
             if expected_journal is not None and journal_path != expected_journal:
                 raise ValueError('receipt/journal mismatch')
             if not journal_path.resolve().is_relative_to(self.room.root / 'data/workspace-migration-journals'):
                 raise ValueError('journal escape')
             _no_symlinks(journal_path)
             journal = json.loads(journal_path.read_bytes())
+            journal_origin = _record_root(journal)
+            if (journal['schema_version'] != 1 or not isinstance(journal['history'], list)
+                    or _repository_reference(self.room.root, journal['journal_path'], Path('data/workspace-migration-journals'), journal_origin) != journal_path
+                    or _repository_reference(self.room.root, journal['backup_path'], Path('data/backups'), journal_origin) != backup):
+                raise ValueError('journal/receipt identity mismatch')
             if journal['stage'] != 'CLEANED' or journal['manifest_sha256'] != receipt['manifest_sha256'] or journal.get('recovery_status') or journal.get('access_released') is not True or journal.get('finalization_status') != 'COMMITTED':
                 raise ValueError('unfinished journal')
-            retired = [record['path'] for record in journal['retired_stages'] if record['status'] == 'PRESERVED']
-            if receipt['retired_paths'] != retired or not retired:
+            recovery = Path('data/workspace-migration-recovery') / journal_path.stem
+            retired = [_repository_reference(self.room.root, record['path'], recovery, journal_origin)
+                       for record in journal['retired_stages'] if record['status'] == 'PRESERVED']
+            if [_repository_reference(self.room.root, value, recovery, origin) for value in receipt['retired_paths']] != retired or not retired:
                 raise ValueError('receipt retired tree inventory mismatch')
-            recovery = self.room.root / 'data/workspace-migration-recovery' / journal_path.stem
-            for value in retired:
-                path = Path(value)
-                _no_symlinks(path)
-                if not path.is_relative_to(recovery) or not path.is_dir():
+            legacy = [_repository_reference(self.room.root, record['path'], recovery, journal_origin)
+                      for record in journal.get('legacy_originals', []) if record['status'] == 'PRESERVED']
+            if [_repository_reference(self.room.root, value, recovery, origin) for value in receipt.get('legacy_paths', [])] != legacy:
+                raise ValueError('receipt legacy tree inventory mismatch')
+            for path in [*retired, *legacy]:
+                if not path.is_dir():
                     raise ValueError('receipt retired tree unavailable or unsafe')
             plan = MigrationPlan.from_dict(json.loads((backup / 'manifest.json').read_bytes())['plan'])
         except (KeyError, ValueError, OSError) as error:
             raise WorkflowError(f'invalid migration receipt; recovery required: {error}') from error
-        self._verify_hashes(plan, self.room.root, current_views=True)
-        with self._connect_readonly() as connection:
-            if any(row['workspace_version'] != 1 for row in _database(connection)[0]['batches']):
+        # Archive destinations are immutable historical reference material.
+        # Active canonical artifacts belong to the ongoing human workflow and
+        # must never be compared to migration-time content hashes.
+        archived = MigrationPlan(claimed=[entry for entry in plan.entries
+                                         if entry.target.parts[:2] == ('workspace', 'archive')])
+        self._verify_hashes(archived, self.room.root)
+        with self._connect_readonly() as connection, self._connect_readonly(backup / 'newsroom.db') as historical:
+            current = _database(connection)[0]
+            original = _database(historical)[0]
+            if any(row['workspace_version'] != 1 for row in current['batches']):
                 raise WorkflowError('migration receipt workspace version mismatch')
+            # Stable identities prove that this is still the migrated database,
+            # while article versions, states, paths and content may evolve.
+            for table, key, fields in (
+                ('batches', 'batch_id', ('source_sha256',)),
+                ('articles', 'article_id', ('owning_batch_id', 'candidate_id')),
+                ('batch_requests', 'request_id', ('batch_id', 'request_type', 'revision_number')),
+            ):
+                present = {row[key]: row for row in current[table]}
+                for row in original[table]:
+                    if row[key] not in present or any(row[field] != present[row[key]][field] for field in fields):
+                        raise WorkflowError(f'migration database identity mismatch: {table}')
         for entry in plan.entries:
             if not entry.source.is_absolute() and entry.source != entry.target and entry.source.parts[0] in {'research', 'articles', 'images', 'output'} and (self.room.root / entry.source).exists():
                 raise WorkflowError('migration recovery required; original cleanup remains pending')
@@ -1502,5 +1598,5 @@ class WorkspaceMigrator:
                 source.backup(destination)
             room = Newsroom(self.room.root)
             room.db_path, room.db = copied, Database(copied)
-            self._validate_materials(room)
+            self._validate_materials(room, terminal=True)
         return {'status': 'ALREADY_MIGRATED', 'manifest_sha256': receipt['manifest_sha256'], 'journal_path': str(journal_path), 'backup_path': str(backup)}

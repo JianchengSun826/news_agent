@@ -870,6 +870,7 @@ def test_execute_archives_and_preserves_exact_artifacts(legacy_workspace):
     service = migrator(f.room)
     plan = service.preflight([f.room.root / 'selected.csv'])
     before_states = f.room.db.all('SELECT * FROM state_transitions')
+    original_inode = (f.room.root / f.draft).stat().st_ino
     result = service.execute(plan, service.backup(plan))
     assert result['status'] == 'PASS'
     for entry in plan.entries:
@@ -883,6 +884,9 @@ def test_execute_archives_and_preserves_exact_artifacts(legacy_workspace):
     assert not any((f.room.root / name).exists() for name in ('research', 'articles', 'images', 'output'))
     journal = json.loads(Path(result['journal_path']).read_text())
     assert [record['stage'] for record in journal['history']] == ['BACKED_UP', 'STAGED', 'DATABASE_UPDATED', 'PROMOTED', 'VERIFIED', 'CLEANED']
+    preserved = next(Path(record['path']) for record in journal['legacy_originals'] if Path(record['source']).name == 'articles') / f.draft.relative_to('articles')
+    assert preserved.stat().st_ino == original_inode
+    assert preserved.read_bytes() == b'draft\r\nexact bytes\n'
 
 
 @pytest.mark.parametrize('race', ['before_execute', 'after_staging'])
@@ -979,7 +983,10 @@ def test_idempotency_refuses_corrupt_workspace_and_partial_journal(legacy_worksp
     f = legacy_workspace
     result = execute_clean_migration(f)
     (f.room.root / f.room.get_article(f.article_id)['draft_path']).write_text('corrupt')
-    with pytest.raises(WorkflowError, match='hash'):
+    # Human article edits are legitimate; missing canonical references are not.
+    assert migrator(f.room).execute_from_current_state()['status'] == 'ALREADY_MIGRATED'
+    (f.room.root / f.room.get_article(f.article_id)['draft_path']).unlink()
+    with pytest.raises(WorkflowError, match='missing database reference'):
         migrator(f.room).execute_from_current_state()
     journal = Path(result['journal_path'])
     data = json.loads(journal.read_text())
@@ -2158,3 +2165,245 @@ def test_rollback_journal_with_pending_diagnostics_refuses_access(legacy_workspa
     path.write_text(json.dumps(journal))
     with pytest.raises(WorkflowError, match='recovery'):
         assert_migration_access(f.room.root)
+
+
+@pytest.mark.parametrize('write_when', ['before_move', 'after_move'])
+def test_legacy_cleanup_boundary_preserves_original_inode_and_editor_bytes(legacy_workspace, monkeypatch, write_when):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    source = f.room.root / f.draft
+    inode = source.stat().st_ino
+    original = source.read_bytes()
+    addition = b'editor wrote through the original open file handle\n'
+    real_replace, real_unlink = os.replace, Path.unlink
+    injected = False
+    with source.open('ab') as editor:
+        def write_edit():
+            nonlocal injected
+            editor.write(addition)
+            editor.flush()
+            os.fsync(editor.fileno())
+            injected = True
+        def replace(old, new):
+            if Path(old) == f.room.root / 'articles' and Path(new).is_relative_to(f.room.root / 'data/workspace-migration-recovery'):
+                if write_when == 'before_move':
+                    write_edit()
+                result = real_replace(old, new)
+                if write_when == 'after_move':
+                    write_edit()
+                return result
+            return real_replace(old, new)
+        def unlink(path, *args, **kwargs):
+            if path == source:
+                write_edit()
+            return real_unlink(path, *args, **kwargs)
+        monkeypatch.setattr('newsroom.migration.os.replace', replace)
+        monkeypatch.setattr(Path, 'unlink', unlink)
+        try:
+            service.execute(plan, backup)
+        except BaseException:
+            pass  # Changed originals may require human recovery; bytes must survive.
+    assert injected
+    originals = [path for path in f.room.root.rglob('*') if path.is_file() and path.stat().st_ino == inode]
+    assert originals and originals[0].read_bytes() == original + addition
+
+
+def test_terminal_migration_admits_resumed_image_workflow_and_publication(all_pass_batch, tmp_path):
+    from newsroom.batch_models import BatchImagePlan
+    from newsroom.batch_release import BatchReleaseWorkflow
+    from test_batch_release import image_plan, publication_payload, write_plan
+    from newsroom.macos import MacOSBatchController
+    from test_macos import FakeDialogs
+    f = all_pass_batch
+    release = BatchReleaseWorkflow(f.room)
+    payload = image_plan(f, tmp_path)
+    partial = {**payload, 'items': payload['items'][:1]}
+    release.save_image_draft(f.batch_id, BatchImagePlan.model_validate(partial))
+    service = migrator(f.room)
+    plan = service.preflight()
+    service.execute(plan, service.backup(plan))
+    release.save_image_draft(f.batch_id, BatchImagePlan.model_validate(payload))
+    for command in (
+        ['image-plan', f.batch_id, str(write_plan(tmp_path / 'complete-plan.json', payload))],
+        ['review', f.batch_id, '--actor', 'editor', '--reason', 'reviewed'],
+        ['approve', f.batch_id, '--actor', 'editor', '--reason', 'approved'],
+        ['publish-packages', f.batch_id],
+    ):
+        result = CliRunner().invoke(app, ['--root', str(f.room.root), 'batch', *command])
+        assert result.exit_code == 0, result.output
+    article = f.room.get_article(f.article_ids[0])
+    (f.room.root / article['draft_path']).write_text('Human approved edited article\n')
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'batch', 'publish-packages', f.batch_id])
+    assert result.exit_code == 0, result.output
+    assert MacOSBatchController(f.room, FakeDialogs()).run(f.batch_id, 'refresh') == 0
+    publications = write_plan(tmp_path / 'publications.json', publication_payload(f))
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'batch', 'publish-register', f.batch_id, str(publications), '--actor', 'editor'])
+    assert result.exit_code == 0, result.output
+    assert all(f.room.get_article(article_id)['status'] == 'PUBLISHED' for article_id in f.article_ids)
+    assert migrator(f.room).execute_from_current_state()['status'] == 'ALREADY_MIGRATED'
+
+
+@pytest.mark.parametrize('damage', ['missing', 'stale'])
+def test_terminal_migration_allows_refresh_to_repair_disposable_views(legacy_workspace, damage):
+    f = legacy_workspace
+    execute_clean_migration(f)
+    batch = f.room.root / 'workspace/batches' / f.batch_id
+    paths = [f.room.root / 'workspace/README.md', batch / 'README.md', batch / 'batch-state.json',
+             batch / 'articles' / f.article_id / 'image-candidates.json']
+    for path in paths:
+        if damage == 'missing':
+            path.unlink()
+        else:
+            path.write_text('stale view')
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'batch', 'refresh-workspace', f.batch_id])
+    assert result.exit_code == 0, result.output
+    assert f.batch_id in (batch / 'README.md').read_text()
+    assert json.loads((batch / 'batch-state.json').read_text())['batch_id'] == f.batch_id
+    assert f.batch_id in (f.room.root / 'workspace/README.md').read_text()
+    assert json.loads((batch / 'articles' / f.article_id / 'image-candidates.json').read_text()) == []
+
+
+@pytest.mark.parametrize('old_record', [False, True])
+def test_whole_migrated_repository_relocation_admits_cli_and_finder(legacy_workspace, tmp_path, old_record):
+    from newsroom.macos import MacOSBatchController, MacOSMigrationController
+    from test_macos import FakeDialogs
+    f = legacy_workspace
+    migration = execute_clean_migration(f)
+    if old_record:
+        for path in (Path(migration['journal_path']), migrator(f.room).receipt_path):
+            record = json.loads(path.read_bytes())
+            record.pop('repository_root')
+            path.write_text(json.dumps(record))
+    moved = tmp_path.parent / (tmp_path.name + f' moved repository {old_record}')
+    shutil.copytree(f.room.root, moved)
+    shutil.rmtree(f.room.root)
+    room = Newsroom(moved)
+    for command in (['stats'], ['batch', 'status', f.batch_id], ['batch', 'refresh-workspace', f.batch_id]):
+        result = CliRunner().invoke(app, ['--root', str(moved), *command])
+        assert result.exit_code == 0, result.output
+    assert MacOSBatchController(room, FakeDialogs()).run(f.batch_id, 'refresh') == 0
+    assert migrator(room).execute_from_current_state()['status'] == 'ALREADY_MIGRATED'
+    # The root controller remains relocatable without opening native dialogs.
+    assert MacOSMigrationController(room, FakeDialogs(confirms=[False])).run() == 0
+
+
+def test_terminal_migration_rejects_different_database_identity(legacy_workspace, tmp_path):
+    f = legacy_workspace
+    execute_clean_migration(f)
+    other = Newsroom(tmp_path / 'other-newsroom')
+    other.init()
+    shutil.copyfile(other.db_path, f.room.db_path)
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'identity' in result.output.lower(), result.output
+
+
+@pytest.mark.parametrize('artifact', ['source-metadata.json', 'candidates.csv'])
+def test_terminal_migration_rejects_symlinked_canonical_input(legacy_workspace, tmp_path, artifact):
+    f = legacy_workspace
+    execute_clean_migration(f)
+    source = f.room.root / 'workspace/batches' / f.batch_id / 'input' / artifact
+    outside = tmp_path / ('foreign-' + artifact)
+    outside.write_bytes(source.read_bytes())
+    source.unlink()
+    source.symlink_to(outside)
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'unsafe' in result.output.lower(), result.output
+
+
+@pytest.mark.parametrize('reference', ['journal_path', 'backup_path', 'retired_paths', 'legacy_paths'])
+@pytest.mark.parametrize('kind', ['traversal', 'foreign'])
+def test_terminal_migration_rejects_unsafe_receipt_references(legacy_workspace, reference, kind):
+    f = legacy_workspace
+    execute_clean_migration(f)
+    receipt_path = migrator(f.room).receipt_path
+    receipt = json.loads(receipt_path.read_bytes())
+    old = receipt[reference][0] if reference.endswith('_paths') else receipt[reference]
+    value = '/foreign-repository/' + Path(old).name if kind == 'foreign' else str(f.room.root / 'data/../data' / Path(old).name)
+    receipt[reference] = [value] if reference.endswith('_paths') else value
+    receipt_path.write_text(json.dumps(receipt))
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'recovery' in result.output.lower(), result.output
+
+
+@pytest.mark.parametrize('handoff', ['request_path', 'result_path'])
+def test_terminal_migration_accepts_current_handoff_bytes_without_historical_hash(content_batch, handoff):
+    f = content_batch
+    service = migrator(f.room)
+    plan = service.preflight()
+    service.execute(plan, service.backup(plan))
+    request = f.room.db.one("SELECT * FROM batch_requests WHERE batch_id=? AND request_type='CONTENT'", (f.batch_id,))
+    path = f.room.root / request[handoff]
+    document = json.loads(path.read_bytes())
+    if handoff == 'request_path':
+        document['instructions'] += '\nHuman editorial clarification for this batch.'
+    raw = json.dumps(document, ensure_ascii=False, separators=(',', ':')).encode()
+    path.write_bytes(raw)
+    if handoff == 'result_path':
+        # This is the current accepted content proof, distinct from the backup.
+        with f.room.db.connect() as connection:
+            connection.execute('UPDATE batch_requests SET result_sha256=? WHERE request_id=?', (hashlib.sha256(raw).hexdigest(), request['request_id']))
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'batch', 'status', f.batch_id])
+    assert result.exit_code == 0, result.output
+    if handoff == 'result_path':
+        path.write_bytes(raw + b' ')
+        result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+        assert result.exit_code == 2 and 'result hash' in result.output.lower(), result.output
+
+
+def test_terminal_migration_accepts_rebuilt_existing_packages_and_registration(approved_batch, tmp_path):
+    from newsroom.batch_release import BatchReleaseWorkflow
+    from test_batch_release import publication_payload, write_plan
+    from newsroom.macos import MacOSBatchController
+    from test_macos import FakeDialogs
+    f = approved_batch
+    release = BatchReleaseWorkflow(f.room)
+    publish = release.build_packages(f.batch_id)
+    service = migrator(f.room)
+    plan = service.preflight()
+    service.execute(plan, service.backup(plan))
+    article_id = f.article_ids[0]
+    with f.room.db.connect() as connection:
+        connection.execute('UPDATE articles SET title_cn=? WHERE article_id=?', ('Human approved title correction', article_id))
+    from newsroom.workspace import BatchWorkspace
+    BatchWorkspace(f.room).refresh(f.batch_id)
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'batch', 'publish-packages', f.batch_id])
+    assert result.exit_code == 0, result.output
+    assert json.loads((publish / article_id / 'metadata.json').read_bytes())['title_cn'] == 'Human approved title correction'
+    dialogs = FakeDialogs()
+    assert MacOSBatchController(f.room, dialogs).run(f.batch_id, 'refresh') == 0, dialogs.alerts
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'batch', 'publish-register', f.batch_id,
+                                    str(write_plan(tmp_path / 'published.json', publication_payload(f))), '--actor', 'editor'])
+    assert result.exit_code == 0, result.output
+
+
+def test_execute_rejects_foreign_backup_before_staging_or_database_switch(legacy_workspace, tmp_path):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    foreign = tmp_path.parent / (tmp_path.name + '-foreign-backup')
+    shutil.copytree(backup, foreign)
+    before = artifact_snapshot(f.room)
+    database = f.room.db_path.read_bytes()
+    with pytest.raises(WorkflowError, match='reference'):
+        service.execute(plan, foreign)
+    assert artifact_snapshot(f.room) == before
+    assert f.room.db_path.read_bytes() == database
+    assert not (f.room.root / 'data/workspace-migration-lock.json').exists()
+    assert not list((f.room.root / 'workspace').glob('.migration-staging-*'))
+
+
+def test_terminal_migration_rejects_symlinked_publish_tree(approved_batch, tmp_path):
+    from newsroom.batch_release import BatchReleaseWorkflow
+    f = approved_batch
+    publish = BatchReleaseWorkflow(f.room).build_packages(f.batch_id)
+    service = migrator(f.room)
+    plan = service.preflight()
+    service.execute(plan, service.backup(plan))
+    outside = tmp_path / 'foreign-publish'
+    publish.rename(outside)
+    publish.symlink_to(outside, target_is_directory=True)
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'unsafe' in result.output.lower(), result.output
