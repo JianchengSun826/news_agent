@@ -208,7 +208,9 @@ Preflight inventories:
 - batch ownership and `REUSED_COMPLETE` relationships;
 - missing references, unclaimed files, duplicate destinations, and expected backup size.
 
-Any missing referenced file, conflicting destination, ambiguous batch ownership, or unreadable database blocks migration. The report is saved for review.
+Any missing referenced file, conflicting destination, ambiguous ownership, or unreadable database blocks migration. Ownership inference collects every article and batch identifier matched structurally, by path component, and by the applicable filename stem or prefix, using Unicode-normalized case-insensitive comparison for macOS. More than one article or batch candidate, or a batch candidate inconsistent with the matched article's recorded owner, is blocking and is reported deterministically before collision handling.
+
+All destination conflicts block except one narrow archive-only case: a uniquely owned legacy article has exactly one database-bound artifact assigned to the preferred archive target and one or more unbound legacy extras project to that same target. The database-bound artifact keeps the canonical name. Every extra is preserved separately beneath that article's `legacy-files/` hierarchy using its original relative directory and a deterministic path-derived filename suffix that remains distinct on a case-insensitive macOS filesystem. Two database-bound entries, conflicts containing only unbound files, ambiguous ownership, file/ancestor conflicts, symlinks, traversal, and existing destination conflicts remain blocking. No source is overwritten, deleted, or content-deduplicated; all safely mapped sources remain in the manifest and verified backup, while SQLite path projection still applies only to database-bound entries. The report is saved for review.
 
 The original CSV is supporting input rather than a current database path. Migration copies it only when the user selects a file whose SHA-256 matches `batches.source_sha256`. A missing original CSV does not block migration; `input/source-metadata.json` preserves its recorded filename and hash, and the README marks the source copy unavailable.
 

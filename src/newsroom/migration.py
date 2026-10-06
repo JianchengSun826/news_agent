@@ -478,14 +478,65 @@ class WorkspaceMigrator:
         return plan
 
     def _infer_owner(self, source: Path, articles: dict, batches: dict) -> tuple[str | None, str | None]:
+        def normalized(value: str) -> str:
+            return unicodedata.normalize("NFC", value).casefold()
+
         parts = source.parts
-        if parts[:2] == ("workspace", "batches") and len(parts) > 2:
-            batch = parts[2] if parts[2] in batches else None
-            article = parts[4] if len(parts) > 4 and parts[3] in {"articles", "publish"} and parts[4] in articles else None
-            return article, articles[article]["owning_batch_id"] if article else batch
-        article = next((a for a in articles if a in parts or source.stem == a or source.name.startswith(a + "-")), None)
-        batch = next((b for b in batches if b in parts), None)
-        return article, articles[article]["owning_batch_id"] if article else batch
+        part_keys = {normalized(part) for part in parts}
+        name_key, stem_key = normalized(source.name), normalized(source.stem)
+        article_candidates = sorted(
+            {
+                article_id for article_id in articles
+                if normalized(article_id) in part_keys
+                or stem_key == normalized(article_id)
+                or name_key.startswith(normalized(article_id) + "-")
+            },
+            key=lambda value: (normalized(value), value),
+        )
+        batch_candidates = sorted(
+            {batch_id for batch_id in batches if normalized(batch_id) in part_keys},
+            key=lambda value: (normalized(value), value),
+        )
+        if len(article_candidates) > 1:
+            raise WorkflowError(
+                f"ambiguous inferred article ownership for {source.as_posix()}: "
+                + ", ".join(article_candidates)
+            )
+        if len(batch_candidates) > 1:
+            raise WorkflowError(
+                f"ambiguous inferred batch ownership for {source.as_posix()}: "
+                + ", ".join(batch_candidates)
+            )
+
+        canonical_batch_tree = (
+            len(parts) > 2
+            and tuple(normalized(part) for part in parts[:2]) == ("workspace", "batches")
+        )
+        if canonical_batch_tree:
+            batch = next(
+                (candidate for candidate in batch_candidates if normalized(candidate) == normalized(parts[2])),
+                None,
+            )
+            article = None
+            if len(parts) > 4 and normalized(parts[3]) in {"articles", "publish"}:
+                article = next(
+                    (candidate for candidate in article_candidates if normalized(candidate) == normalized(parts[4])),
+                    None,
+                )
+        else:
+            article = article_candidates[0] if article_candidates else None
+            batch = batch_candidates[0] if batch_candidates else None
+
+        if article:
+            owner = articles[article]["owning_batch_id"]
+            if batch is not None and batch != owner:
+                expected = owner or "legacy-unowned"
+                raise WorkflowError(
+                    f"ambiguous inferred article/batch ownership for {source.as_posix()}: "
+                    f"{article} belongs to {expected}, path also matches {batch}"
+                )
+            return article, owner
+        return None, batch
 
     def _target(self, source: Path, article: dict | None, batch: str | None, db_field: str | None = None, request: dict | None = None) -> Path:
         _safe_relative(source)
@@ -562,7 +613,7 @@ class WorkspaceMigrator:
         return target
 
     def _resolve_archive_extra_collisions(self, plan: MigrationPlan) -> None:
-        """Preserve unbound legacy extras when one canonical artifact owns a target.
+        """Preserve unbound legacy extras when one database artifact owns a target.
 
         This deliberately handles only one narrow, safe case. All ambiguous,
         active-workspace, database/database, ancestor and destination collisions
@@ -579,7 +630,6 @@ class WorkspaceMigrator:
             preferred = [
                 entry for entry in entries
                 if (entry.database_table is not None and entry.database_field is not None)
-                or entry.source == entry.target
             ]
             if len(preferred) != 1:
                 continue

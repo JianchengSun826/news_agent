@@ -223,6 +223,91 @@ def test_preflight_routes_multiple_casefolding_extras_from_distinct_roots(legacy
         assert entry.sha256 == hashlib.sha256(content).hexdigest()
 
 
+def test_preflight_blocks_nested_multiple_article_ids_before_archive_reroute(legacy_workspace):
+    f = legacy_workspace
+    ambiguous = Path('images') / f.single_id / f.article_id / 'hero.png'
+    _add_legacy_image_collision(f, [(ambiguous, b'ambiguous owner bytes')])
+
+    first = migrator(f.room).preflight()
+    second = migrator(f.room).preflight()
+
+    expected = (
+        f"ambiguous inferred article ownership for {ambiguous.as_posix()}: "
+        + ", ".join(sorted((f.article_id, f.single_id), key=lambda value: (value.casefold(), value)))
+    )
+    assert any(expected in error for error in first.blocking_errors)
+    assert first.to_dict() == second.to_dict()
+    assert not any(entry.source == ambiguous for entry in first.entries)
+    assert not any('legacy-files' in entry.target.parts for entry in first.entries if entry.source == ambiguous)
+
+
+def test_infer_owner_is_order_independent_for_nested_article_and_batch_ids(legacy_workspace):
+    service = migrator(legacy_workspace.room)
+    source = Path('images/art-b/art-a/hero.png')
+    articles = {
+        'art-a': {'owning_batch_id': None},
+        'art-b': {'owning_batch_id': None},
+    }
+    article_errors = []
+    for ordered in (articles, dict(reversed(tuple(articles.items())))):
+        with pytest.raises(WorkflowError) as captured:
+            service._infer_owner(source, ordered, {})
+        article_errors.append(str(captured.value))
+    assert article_errors == [
+        'ambiguous inferred article ownership for images/art-b/art-a/hero.png: art-a, art-b'
+    ] * 2
+
+    batches = {'batch-a': {}, 'batch-b': {}}
+    batch_errors = []
+    for ordered in (batches, dict(reversed(tuple(batches.items())))):
+        with pytest.raises(WorkflowError) as captured:
+            service._infer_owner(Path('output/batch-b/batch-a/result.json'), {}, ordered)
+        batch_errors.append(str(captured.value))
+    assert batch_errors == [
+        'ambiguous inferred batch ownership for output/batch-b/batch-a/result.json: batch-a, batch-b'
+    ] * 2
+
+    for matched in (
+        Path('images/art-b/art-a-draft.md'),
+        Path('images/art-b/art-a.md'),
+    ):
+        with pytest.raises(WorkflowError, match='ambiguous inferred article ownership'):
+            service._infer_owner(matched, articles, {})
+
+
+def test_infer_owner_uses_macos_casefolding_without_hiding_case_ambiguity(legacy_workspace):
+    service = migrator(legacy_workspace.room)
+    article_id = legacy_workspace.single_id
+    article = {'owning_batch_id': None}
+
+    assert service._infer_owner(
+        Path('images') / article_id.upper() / 'hero.png', {article_id: article}, {},
+    ) == (article_id, None)
+
+    with pytest.raises(WorkflowError, match='ambiguous inferred article ownership'):
+        service._infer_owner(
+            Path('images/Art-A/hero.png'),
+            {'art-a': article, 'ART-A': article},
+            {},
+        )
+    with pytest.raises(WorkflowError, match='ambiguous inferred batch ownership'):
+        service._infer_owner(
+            Path('output/Batch-A/result.json'),
+            {},
+            {'batch-a': {}, 'BATCH-A': {}},
+        )
+
+
+def test_infer_owner_blocks_article_and_conflicting_batch_candidates(legacy_workspace):
+    service = migrator(legacy_workspace.room)
+    with pytest.raises(WorkflowError, match='ambiguous inferred article/batch ownership'):
+        service._infer_owner(
+            Path('articles/art-a/batch-b/hero.png'),
+            {'art-a': {'owning_batch_id': 'batch-a'}},
+            {'batch-a': {}, 'batch-b': {}},
+        )
+
+
 def test_archive_extra_resolution_is_deterministic_independent_of_plan_order(legacy_workspace):
     f = legacy_workspace
     article_root = Path('workspace/archive/legacy-single-articles') / f.single_id
@@ -247,7 +332,7 @@ def test_archive_extra_resolution_is_deterministic_independent_of_plan_order(leg
     assert len({entry.target.as_posix().casefold() for entry in first.entries}) == 3
 
 
-def test_canonical_archive_file_keeps_preferred_target_over_unbound_extra(legacy_workspace):
+def test_unbound_canonical_archive_collision_remains_blocking(legacy_workspace):
     f = legacy_workspace
     target = Path('workspace/archive/legacy-single-articles') / f.single_id / 'hero.png'
     canonical = MigrationEntry(target, target, 'a' * 64, 1, article_id=f.single_id)
@@ -256,11 +341,14 @@ def test_canonical_archive_file_keeps_preferred_target_over_unbound_extra(legacy
     )
     plan = MigrationPlan(legacy=[extra, canonical])
 
-    migrator(f.room)._resolve_archive_extra_collisions(plan)
+    service = migrator(f.room)
+    service._resolve_archive_extra_collisions(plan)
+    service._collisions(plan)
 
     by_source = {entry.source: entry for entry in plan.entries}
     assert by_source[canonical.source].target == target
-    assert by_source[extra.source].target.is_relative_to(target.parent / 'legacy-files')
+    assert by_source[extra.source].target == target
+    assert any('target collision' in error for error in plan.blocking_errors)
 
 
 def test_preflight_two_database_bound_images_still_block(legacy_workspace):
