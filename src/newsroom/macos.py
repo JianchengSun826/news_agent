@@ -119,7 +119,7 @@ class MacOSBatchController:
             # Validate the identifier and existence even for read-only actions.
             self.workspace._batch(batch_id)
             if action == "open-batch":
-                state = self.workspace.refresh(batch_id)
+                state = self.workspace.snapshot(batch_id)
                 root = self.workspace.batch_root(batch_id)
                 self.dialogs.open_file(root)
                 self.dialogs.open_file(root / "README.md")
@@ -130,8 +130,10 @@ class MacOSBatchController:
             elif action == "open-next-request":
                 request = self._pending_request(batch_id)
                 if request is None and self.workflow.status(batch_id)["action_required"]["needs_revision_article_ids"]:
-                    self.workflow.create_revision_request(batch_id)
-                    request = self._pending_request(batch_id)
+                    raise WorkflowError(
+                        "当前文章需要修订，但没有待处理的修订任务。此打开操作不会创建任务。"
+                        f"请由编辑明确运行 newsroom batch revision-request {batch_id} 生成任务后再打开。"
+                    )
                 if request is None:
                     raise WorkflowError("当前没有待处理的 Claude 任务。请查看批次 README 并完成下一步。")
                 self._open_request(request)
@@ -225,6 +227,14 @@ class MacOSBatchController:
             "REVISION": self.workflow.import_revisions,
         }[request["request_type"]]
         importer(batch_id, Path(path))
+        if request["request_type"] == "FACT_CHECK":
+            status = self.workflow.status(batch_id)
+            revision = self.room.db.one(
+                "SELECT request_id FROM batch_requests WHERE batch_id=? AND request_type='REVISION' AND status='PENDING'",
+                (batch_id,),
+            )
+            if status["action_required"]["needs_revision_article_ids"] and revision is None:
+                self.workflow.create_revision_request(batch_id)
         self._show_status(self.workspace.refresh(batch_id))
 
     def _validate_result(self, path: Path, request: dict) -> None:
@@ -249,19 +259,24 @@ class MacOSBatchController:
             raise WorkflowError("返回文件的文章集合与当前任务不一致。请让 Claude 返回全部指定文章且移除额外文章。")
 
     def _register_images(self, batch_id: str) -> None:
-        if not self.dialogs.confirm("登记整批图片", "请逐篇检查原始落地页、权利页与本地原图，并明确确认使用权利。"):
-            return
         active = self.room.db.all(
             "SELECT a.*,bi.item_status FROM batch_items bi LEFT JOIN articles a ON a.article_id=bi.article_id "
             "WHERE bi.batch_id=? AND bi.item_status NOT IN ('EXCLUDED','REUSED_COMPLETE') ORDER BY bi.candidate_id",
             (batch_id,),
         )
-        if not active or any(article["fact_check_outcome"] != "PASS" for article in active):
-            raise WorkflowError("整批图片登记需要全部有效文章通过事实核验。请先完成核验或修订。")
         missing = [article for article in active if not article["image_id"]]
-        if not missing:
+        if missing and len(missing) != len(active):
+            raise WorkflowError(
+                "当前批次部分有效文章已登记图片，部分尚未登记，属于不一致的旧版或部分完成状态。"
+                "请从备份恢复，或通过迁移／管理员工具修复后再登记；此操作不会修改图片选择草稿。"
+            )
+        if active and not missing:
             self.dialogs.alert("图片已登记", "此批次的有效文章已有图片。请继续整批审核。")
             return
+        if not self.dialogs.confirm("登记整批图片", "请逐篇检查原始落地页、权利页与本地原图，并明确确认使用权利。"):
+            return
+        if not active or any(article["fact_check_outcome"] != "PASS" for article in active):
+            raise WorkflowError("整批图片登记需要全部有效文章通过事实核验。请先完成核验或修订。")
         path = self.workspace.image_draft_path(batch_id)
         plan = self.release.load_image_draft(batch_id) if path.exists() else BatchImagePlan(batch_id=batch_id, items=[])
         missing_ids = {article["article_id"] for article in missing}

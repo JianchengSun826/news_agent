@@ -169,10 +169,10 @@ class BatchWorkspace:
             return None
         return Path(os.path.relpath(self.room.root / repository_path, batch_root)).as_posix()
 
-    def refresh(self, batch_id: str) -> dict[str, Any]:
-        """Rebuild views without changing canonical workflow or artifact records."""
+    def snapshot(self, batch_id: str) -> dict[str, Any]:
+        """Read canonical state and existing package paths without writing views."""
         self._batch(batch_id)
-        root = self.ensure_layout(batch_id)
+        root = self.batch_root(batch_id)
         with self.room.db.connect() as connection:
             connection.execute("BEGIN")
             batch = dict(connection.execute("SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone())
@@ -198,10 +198,6 @@ class BatchWorkspace:
             if item["item_status"] not in {"EXCLUDED", "REUSED_COMPLETE"} and current_package and current_package.is_dir():
                 package = current_package
             item["package_path"] = Path(os.path.relpath(package, root)).as_posix() if package and package.is_dir() else None
-            if article_id and owner == batch_id:
-                _atomic_write(self.article_root(owner, article_id) / "image-candidates.json", json.dumps(
-                    self.room.list_image_candidates(article_id), ensure_ascii=False, indent=2
-                ) + "\n")
         pending = [request for request in requests if request["status"] == "PENDING"]
         active = [item for item in items if item["item_status"] not in {"EXCLUDED", "REUSED_COMPLETE"}]
         if any(item["item_status"] == "WAITING_DUPLICATE" for item in active):
@@ -218,7 +214,17 @@ class BatchWorkspace:
             next_action = "build-packages"
         else:
             next_action = "open-review"
-        state = {**batch, "counts": dict(sorted(Counter(item["item_status"] for item in items).items())), "next_action": next_action, "items": items, "requests": requests, "image_candidates": images}
+        return {**batch, "counts": dict(sorted(Counter(item["item_status"] for item in items).items())), "next_action": next_action, "items": items, "requests": requests, "image_candidates": images}
+
+    def refresh(self, batch_id: str) -> dict[str, Any]:
+        """Rebuild views without changing canonical workflow or artifact records."""
+        state = self.snapshot(batch_id)
+        root = self.ensure_layout(batch_id)
+        for item in state["items"]:
+            if item["article_id"] and item["owning_batch_id"] == batch_id:
+                _atomic_write(self.article_root(batch_id, item["article_id"]) / "image-candidates.json", json.dumps(
+                    self.room.list_image_candidates(item["article_id"]), ensure_ascii=False, indent=2
+                ) + "\n")
         _atomic_write(root / "batch-state.json", json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
         _atomic_write(root / "README.md", self._dashboard(state))
         self.install_root_actions()

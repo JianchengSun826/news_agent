@@ -347,3 +347,94 @@ def test_hidden_dispatcher_is_registered_when_cli_runs_as_module():
     )
     assert result.returncode == 0, result.stderr
     assert 'BATCH_ID' in result.stdout
+
+
+def file_snapshot(root):
+    return {
+        path.relative_to(root): (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ino, path.stat().st_mode)
+        for path in root.rglob('*') if path.is_file()
+    }
+
+
+def test_confirmed_failed_fact_check_import_creates_one_revision_request(content_batch, tmp_path):
+    path = write_fact_check_result(content_batch, tmp_path / 'failed-result.json', ['FAIL', 'PASS'])
+    dialogs = FakeDialogs(files=[path])
+    controller = MacOSBatchController(content_batch.room, dialogs)
+    assert controller.run(content_batch.batch_id, 'import-result') == 0
+    requests = content_batch.room.db.all("SELECT * FROM batch_requests WHERE request_type='REVISION'")
+    assert len(requests) == 1
+    assert requests[0]['status'] == 'PENDING'
+    before_db = db_snapshot(content_batch)
+    before_files = file_snapshot(content_batch.room.root)
+    assert controller.run(content_batch.batch_id, 'open-next-request') == 0
+    assert db_snapshot(content_batch) == before_db
+    assert file_snapshot(content_batch.room.root) == before_files
+    assert content_batch.room.root / requests[0]['request_path'] in dialogs.opened
+
+
+def test_open_next_missing_revision_is_read_only_with_recovery_guidance(content_batch, tmp_path):
+    path = write_fact_check_result(content_batch, tmp_path / 'legacy-failed.json', ['FAIL', 'PASS'])
+    content_batch.workflow.import_fact_checks(content_batch.batch_id, path)
+    before_db = db_snapshot(content_batch)
+    before_files = file_snapshot(content_batch.room.root)
+    dialogs = FakeDialogs()
+    assert MacOSBatchController(content_batch.room, dialogs).run(content_batch.batch_id, 'open-next-request') == 2
+    assert db_snapshot(content_batch) == before_db
+    assert file_snapshot(content_batch.room.root) == before_files
+    assert 'batch revision-request' in dialogs.errors[-1]
+    assert not dialogs.confirmations
+    assert not dialogs.opened
+
+
+@pytest.mark.parametrize('fail_dialog', [False, True])
+def test_open_batch_is_exactly_read_only_even_when_dialog_fails(prepared_batch, fail_dialog):
+    class OpeningDialogs(FakeDialogs):
+        def open_file(self, path):
+            if fail_dialog:
+                raise OSError('Finder unavailable')
+            super().open_file(path)
+    root = BatchWorkspace(prepared_batch.room).batch_root(prepared_batch.batch_id)
+    # User-edited generated views must not be overwritten by opening actions.
+    (root / 'README.md').write_text('current human view\n')
+    (root / 'batch-state.json').write_text('{"human_view": true}\n')
+    article = prepared_batch.article_ids[0]
+    (root / 'articles' / article / 'image-candidates.json').write_text('human candidate notes\n')
+    before_db = db_snapshot(prepared_batch)
+    before_files = file_snapshot(prepared_batch.room.root)
+    assert MacOSBatchController(prepared_batch.room, OpeningDialogs()).run(prepared_batch.batch_id, 'open-batch') == (2 if fail_dialog else 0)
+    assert db_snapshot(prepared_batch) == before_db
+    assert file_snapshot(prepared_batch.room.root) == before_files
+
+
+def test_mixed_registered_images_fail_without_interaction_or_mutation(ready_batch, tmp_path):
+    ignored = ready_batch.article_ids[1]
+    with ready_batch.room.db.connect() as connection:
+        connection.execute("UPDATE articles SET image_id=NULL,status='FACT_CHECKED' WHERE article_id=?", (ignored,))
+    draft = BatchWorkspace(ready_batch.room).image_draft_path(ready_batch.batch_id)
+    draft.write_text('existing resumable draft\n')
+    before_db = db_snapshot(ready_batch)
+    before_files = file_snapshot(ready_batch.room.root)
+    dialogs = FakeDialogs()
+    assert MacOSBatchController(ready_batch.room, dialogs).run(ready_batch.batch_id, 'register-images') == 2
+    assert db_snapshot(ready_batch) == before_db
+    assert file_snapshot(ready_batch.room.root) == before_files
+    assert not dialogs.confirmations
+    assert not dialogs.lists
+    assert not dialogs.pickers
+    assert not dialogs.urls
+    assert '备份' in dialogs.errors[-1]
+    assert '迁移' in dialogs.errors[-1]
+    assert '管理员' in dialogs.errors[-1]
+
+
+def test_all_registered_images_are_noop_without_confirmation(ready_batch):
+    before_db = db_snapshot(ready_batch)
+    before_files = file_snapshot(ready_batch.room.root)
+    dialogs = FakeDialogs()
+    assert MacOSBatchController(ready_batch.room, dialogs).run(ready_batch.batch_id, 'register-images') == 0
+    assert db_snapshot(ready_batch) == before_db
+    assert file_snapshot(ready_batch.room.root) == before_files
+    assert not dialogs.confirmations
+    assert not dialogs.pickers
+    assert not dialogs.urls
+    assert dialogs.alerts

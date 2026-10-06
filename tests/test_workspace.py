@@ -189,3 +189,14 @@ def test_dashboard_multiline_cell_escapes_source_html_before_line_breaks(prepare
     readme = (workspace.batch_root(batch_id) / "README.md").read_text()
     assert "校验 &lt;script&gt;失败&lt;/script&gt;<br>重新检查" in readme
     assert "&lt;br&gt;" not in readme
+
+
+def test_readonly_snapshot_does_not_create_missing_workspace(prepared_batch):
+    room, batch_id = prepared_batch
+    expected = BatchWorkspace(room).refresh(batch_id)
+    shutil.rmtree(room.root / 'workspace')
+    before_db = {table: room.db.all(f'SELECT * FROM {table}') for table in ('batches', 'batch_items', 'batch_requests', 'articles', 'images', 'state_transitions')}
+    state = BatchWorkspace(room).snapshot(batch_id)
+    assert state == expected
+    assert not (room.root / 'workspace').exists()
+    assert {table: room.db.all(f'SELECT * FROM {table}') for table in before_db} == before_db
