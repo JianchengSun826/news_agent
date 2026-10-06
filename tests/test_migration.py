@@ -478,10 +478,11 @@ def test_backup_cleanup_failure_marks_incomplete(legacy_workspace, monkeypatch):
     service = migrator(f.room)
     real_remove = shutil.rmtree
     def reject_backup_removal(path, *args, **kwargs):
-        if Path(path).name.startswith('workspace-migration-'):
+        if Path(path).name == 'blocked-child':
             raise OSError('backup removal unavailable')
         return real_remove(path, *args, **kwargs)
     def fail_verification(path):
+        (path / 'blocked-child').mkdir()
         raise WorkflowError('backup verification failed: injected corruption')
     monkeypatch.setattr('newsroom.migration.shutil.rmtree', reject_backup_removal)
     monkeypatch.setattr(service, '_verify_backup_contents', fail_verification)
@@ -701,7 +702,7 @@ def test_backup_keyboard_interrupt_preserves_incomplete_lifecycle(legacy_workspa
     assert_no_unmarked_backup(f.room)
 
 
-def test_backup_preserves_interrupt_cleanup_and_marker_errors(legacy_workspace, monkeypatch):
+def test_backup_preserves_interrupt_cleanup_without_rewriting_marker(legacy_workspace, monkeypatch):
     f = legacy_workspace
     service = migrator(f.room)
     plan = service.preflight()
@@ -712,9 +713,10 @@ def test_backup_preserves_interrupt_cleanup_and_marker_errors(legacy_workspace, 
     real_write = Path.write_text
     marker_writes = []
     def interrupt(path):
+        (path / 'blocked-child').mkdir()
         raise original
     def fail_removal(path, *args, **kwargs):
-        if Path(path).name.startswith('workspace-migration-'):
+        if Path(path).name == 'blocked-child':
             raise cleanup
         return real_remove(path, *args, **kwargs)
     def fail_marker_update(path, *args, **kwargs):
@@ -730,5 +732,118 @@ def test_backup_preserves_interrupt_cleanup_and_marker_errors(legacy_workspace, 
         service.backup(plan)
     assert isinstance(captured.value, BaseExceptionGroup)
     errors = list(exception_tree(captured.value))
-    assert all(error in errors for error in (original, cleanup, marker))
+    assert original in errors and cleanup in errors
+    assert marker not in errors
+    assert len(marker_writes) == 1
     assert_no_unmarked_backup(f.room)
+
+
+def test_backup_partial_cleanup_retains_original_marker_without_recreation(legacy_workspace, monkeypatch):
+    import os
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    original = KeyboardInterrupt('verification interrupted before cleanup')
+    cleanup = OSError('later report removal failed')
+    marker_error = OSError('marker recreation prohibited')
+    real_unlink = os.unlink
+    real_remove = shutil.rmtree
+    real_write = Path.write_text
+    marker_writes = []
+    original_marker = []
+    removed_artifacts = []
+    def interrupt(path):
+        marker = path / 'INCOMPLETE'
+        original_marker.append((marker.read_bytes(), marker.stat().st_ino))
+        raise original
+    def partial_removal(path, *args, **kwargs):
+        name = Path(path).name
+        if name == 'report.json':
+            raise cleanup
+        result = real_unlink(path, *args, **kwargs)
+        if name in {'manifest.json', 'artifacts.tar.gz'}:
+            removed_artifacts.append(name)
+        return result
+    def prohibit_marker_recreation(path, *args, **kwargs):
+        if path.name == 'INCOMPLETE':
+            marker_writes.append(path)
+            if len(marker_writes) > 1:
+                raise marker_error
+        return real_write(path, *args, **kwargs)
+    def whole_directory_marker_first(path, *args, **kwargs):
+        if Path(path).name.startswith('workspace-migration-'):
+            # Model a valid rmtree order that deletes the marker before failing.
+            (Path(path) / 'INCOMPLETE').unlink()
+            (Path(path) / 'artifacts.tar.gz').unlink()
+        return real_remove(path, *args, **kwargs)
+    monkeypatch.setattr(service, '_verify_backup_contents', interrupt)
+    monkeypatch.setattr('newsroom.migration.os.unlink', partial_removal)
+    monkeypatch.setattr('newsroom.migration.shutil.rmtree', whole_directory_marker_first)
+    monkeypatch.setattr(Path, 'write_text', prohibit_marker_recreation)
+    with pytest.raises(BaseException) as captured:
+        service.backup(plan)
+    errors = list(exception_tree(captured.value))
+    assert original in errors and cleanup in errors
+    assert removed_artifacts
+    backup = next((f.room.root / 'data/backups').glob('workspace-migration-*'))
+    assert (backup / 'report.json').is_file()
+    marker = backup / 'INCOMPLETE'
+    assert marker.is_file()
+    assert (marker.read_bytes(), marker.stat().st_ino) == original_marker[0]
+    assert len(marker_writes) == 1
+    with pytest.raises(WorkflowError, match='incomplete'):
+        service.verify_backup(backup)
+    assert_no_unmarked_backup(f.room)
+
+
+def test_backup_successful_failure_cleanup_deletes_content_before_marker(legacy_workspace, monkeypatch):
+    import os
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    original = WorkflowError('injected verification failure')
+    real_unlink = os.unlink
+    other_children_when_marker_removed = []
+    def fail_verification(path):
+        raise original
+    def inspect_marker_removal(path, *args, **kwargs):
+        if Path(path).name == 'INCOMPLETE':
+            backup = next((f.room.root / 'data/backups').glob('workspace-migration-*'))
+            other_children_when_marker_removed.append([child.name for child in backup.iterdir() if child.name != 'INCOMPLETE'])
+        return real_unlink(path, *args, **kwargs)
+    monkeypatch.setattr(service, '_verify_backup_contents', fail_verification)
+    monkeypatch.setattr('newsroom.migration.os.unlink', inspect_marker_removal)
+    with pytest.raises(WorkflowError) as captured:
+        service.backup(plan)
+    assert captured.value is original
+    assert other_children_when_marker_removed == [[]]
+    assert not list((f.room.root / 'data/backups').glob('workspace-migration-*'))
+    assert_no_unmarked_backup(f.room)
+
+
+def test_backup_final_empty_directory_removal_failure_has_no_recoverable_content(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    real_verify = service._verify_backup_contents
+    original = WorkflowError('injected verification failure')
+    cleanup = OSError('empty backup directory removal unavailable')
+    real_rmdir = Path.rmdir
+    def fail_verification(path):
+        raise original
+    def fail_empty_directory(path):
+        if path.name.startswith('workspace-migration-'):
+            raise cleanup
+        return real_rmdir(path)
+    monkeypatch.setattr(service, '_verify_backup_contents', fail_verification)
+    monkeypatch.setattr(Path, 'rmdir', fail_empty_directory)
+    with pytest.raises(BaseException) as captured:
+        service.backup(plan)
+    errors = list(exception_tree(captured.value))
+    assert original in errors and cleanup in errors
+    backup = next((f.room.root / 'data/backups').glob('workspace-migration-*'))
+    assert list(backup.iterdir()) == []
+    monkeypatch.setattr(service, '_verify_backup_contents', real_verify)
+    with pytest.raises(WorkflowError, match='backup verification'):
+        service.verify_backup(backup)
+    assert not (f.room.root / 'workspace').exists()

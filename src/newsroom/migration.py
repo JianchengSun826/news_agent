@@ -423,11 +423,13 @@ class WorkspaceMigrator:
         _no_symlinks(parent)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         backup: Path | None = None
+        marker_created = False
         incomplete_text = "Backup incomplete; do not use for migration.\n"
         try:
             parent.mkdir(parents=True, exist_ok=True)
             backup = Path(tempfile.mkdtemp(prefix=f"workspace-migration-{stamp}-", dir=parent))
             (backup / "INCOMPLETE").write_text(incomplete_text, encoding="utf-8")
+            marker_created = True
             with self._connect_readonly() as source, closing(sqlite3.connect(backup / "newsroom.db")) as destination:
                 source.backup(destination)
                 destination.execute("PRAGMA journal_mode=DELETE")
@@ -462,20 +464,66 @@ class WorkspaceMigrator:
         except BaseException as error:
             if backup is None:
                 raise
-            failures = [error]
-            try:
-                shutil.rmtree(backup)
-            except BaseException as cleanup_error:
-                failures.append(cleanup_error)
-                try:
-                    (backup / "INCOMPLETE").write_text(incomplete_text, encoding="utf-8")
-                except BaseException as marker_error:
-                    failures.append(marker_error)
+            failures = [error, *self._cleanup_failed_backup(backup, marker_created, incomplete_text)]
             if len(failures) > 1:
                 raise BaseExceptionGroup("backup failed; cleanup also failed", failures) from None
             if isinstance(error, WorkflowError) or not isinstance(error, Exception):
                 raise
             raise WorkflowError(f"backup verification failed: {error}") from error
+
+    def _cleanup_failed_backup(self, backup: Path, marker_created: bool, incomplete_text: str) -> list[BaseException]:
+        """Keep the original marker until every recoverable child is gone."""
+        failures: list[BaseException] = []
+        marker = backup / "INCOMPLETE"
+        if not marker_created:
+            # No backup content can precede the initial marker. Remove only its
+            # possible partial file and the empty directory, independently.
+            try:
+                marker.unlink(missing_ok=True)
+            except BaseException as error:
+                failures.append(error)
+            try:
+                backup.rmdir()
+            except BaseException as error:
+                failures.append(error)
+            return failures
+        try:
+            if not marker.is_file():
+                _no_symlinks(marker)
+                marker.write_text(incomplete_text, encoding="utf-8")
+        except BaseException as error:
+            failures.append(error)
+        try:
+            children = sorted(backup.iterdir())
+        except BaseException as error:
+            return [*failures, error]
+        for child in children:
+            if child == marker:
+                continue
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            except BaseException as error:
+                failures.append(error)
+        try:
+            remaining = [child for child in backup.iterdir() if child != marker]
+        except BaseException as error:
+            return [*failures, error]
+        if remaining:
+            return failures or [WorkflowError("backup cleanup left recoverable contents")]
+        # There is no recoverable content now. If rmdir fails after marker
+        # removal, the leftover empty directory cannot appear as a valid backup.
+        try:
+            marker.unlink(missing_ok=True)
+        except BaseException as error:
+            return [*failures, error]
+        try:
+            backup.rmdir()
+        except BaseException as error:
+            failures.append(error)
+        return failures
 
     def verify_backup(self, backup: Path) -> None:
         """Accept only a completed backup, then independently verify its contents."""
