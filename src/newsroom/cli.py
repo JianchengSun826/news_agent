@@ -9,8 +9,8 @@ from pydantic import ValidationError
 
 from .batch import BatchWorkflow
 from .batch_release import BatchReleaseWorkflow
-from .macos import MacOSBatchController, OsaScriptDialogs
-from .migration import WorkspaceMigrator
+from .macos import MacOSBatchController, MacOSMigrationController, OsaScriptDialogs
+from .migration import MigrationPlan, WorkspaceMigrator
 from .service import Newsroom, WorkflowError
 from .workspace import BatchWorkspace
 
@@ -71,18 +71,43 @@ def workspace_migrate(
     ctx: typer.Context,
     preflight: Annotated[bool, typer.Option("--preflight", help="Inventory migration without changing workflow")] = False,
     source_csv: Annotated[list[Path] | None, typer.Option("--source-csv", help="Original CSV selected for hash verification")] = None,
+    execute: Annotated[bool, typer.Option("--execute", help="Execute the exact saved plan and verified backup")] = False,
+    plan_file: Annotated[Path | None, typer.Option("--plan", help="Saved preflight JSON report")] = None,
+    backup_dir: Annotated[Path | None, typer.Option("--backup", help="Completed verified migration backup directory")] = None,
+    backup_plan: Annotated[bool, typer.Option("--backup-plan", help="Back up an unchanged saved clean preflight plan")] = False,
 ) -> None:
-    """Save a deterministic read-only migration plan for human review."""
-    if not preflight:
-        typer.echo("error: only --preflight is available; migration execution is not implemented", err=True)
-        raise typer.Exit(code=2)
+    """Explicit local preflight, backup, and migration operations."""
     room = _room(ctx)
     service = WorkspaceMigrator(room)
-    plan = _run(lambda: service.preflight(source_csv))
-    report = _run(lambda: service.save_report(plan))
-    _json({**plan.to_dict(), "report_path": report.relative_to(room.root).as_posix()})
-    if plan.blocking_errors:
+    if sum((preflight, execute, backup_plan)) != 1 or (preflight and (plan_file or backup_dir)) or (not preflight and source_csv):
+        typer.echo("error: choose --preflight, --backup-plan --plan PATH, or --execute --plan PATH --backup DIR", err=True)
         raise typer.Exit(code=2)
+    if preflight:
+        plan = _run(lambda: service.preflight(source_csv))
+        report = _run(lambda: service.save_report(plan))
+        _json({**plan.to_dict(), "report_path": report.relative_to(room.root).as_posix()})
+        if plan.blocking_errors:
+            raise typer.Exit(code=2)
+        return
+    if plan_file is None or (execute and backup_dir is None) or (backup_plan and backup_dir is not None):
+        typer.echo("error: saved --plan and verified --backup are required for execution", err=True)
+        raise typer.Exit(code=2)
+
+    def load_plan() -> MigrationPlan:
+        value = json.loads(plan_file.read_bytes())
+        if isinstance(value, dict):
+            value.pop("report_path", None)
+        return MigrationPlan.from_dict(value)
+
+    plan = _run(load_plan)
+    try:
+        if backup_plan:
+            _json({"status": "BACKED_UP", "backup_path": str(service.backup(plan))})
+        else:
+            _json(service.execute(plan, backup_dir))
+    except Exception as error:
+        typer.echo(f"error: {error}", err=True)
+        raise typer.Exit(code=2) from error
 
 
 @candidate_app.command("add")
@@ -317,6 +342,12 @@ def macos_action(
     """Dispatch the fixed local Finder actions."""
     code = MacOSBatchController(_room(ctx), OsaScriptDialogs()).run(batch_id, action)
     raise typer.Exit(code=code)
+
+
+@app.command("macos-migrate", hidden=True)
+def macos_migrate(ctx: typer.Context) -> None:
+    """Run mandatory migration preflight and human confirmation."""
+    raise typer.Exit(code=MacOSMigrationController(_room(ctx), OsaScriptDialogs()).run())
 
 
 if __name__ == "__main__":

@@ -181,7 +181,18 @@ uv run newsroom batch refresh-workspace BATCH_ID
 
 迁移旧工作区前，可运行 `uv run newsroom workspace migrate --preflight`。此命令只读取数据库与文件，并把确定性的 JSON 清单保存到 `data/workspace-migration-preflight.json`；它不会更新流程状态、移动素材或创建迁移暂存目录。缺失的数据库引用、路径逃逸、符号链接、归属歧义或目标冲突会阻塞迁移并返回非零状态。可重复使用 `--source-csv PATH` 指定原始 CSV，只有字节级 SHA-256 与已记录批次一致时才会列为可复制输入；缺失原始 CSV 不会阻塞。
 
-当前命令仅支持预检，尚不执行迁移。内部备份服务仅接受仍然有效且没有阻塞问题的清单，在 `data/backups/` 创建 SQLite 备份、素材归档、报告和 manifest，并重新打开数据库、检查归档成员安全性、提取并核对所有文件哈希后才返回。失败的备份会删除或标记 `INCOMPLETE`，不得用于迁移。
+迁移属于 Phase 1.1 的本地人工操作。先在复制的数据库和素材目录中演练，再操作真实工作区。预检报告审核通过后，可显式备份并执行：
+
+```bash
+uv run newsroom workspace migrate --backup-plan --plan data/workspace-migration-preflight.json
+uv run newsroom workspace migrate --execute --plan data/workspace-migration-preflight.json --backup data/backups/WORKSPACE_MIGRATION_BACKUP
+```
+
+`--backup-plan` 仅接受仍然有效且没有阻塞问题的清单，在 `data/backups/` 创建 SQLite 备份、素材归档、报告和 manifest，并重新打开数据库、检查归档成员安全性、提取并核对所有文件哈希后才返回。失败的备份会删除或标记 `INCOMPLETE`，不得用于迁移。`--execute` 要求备份与清单、当前数据库及全部素材完全一致；复制前和数据库事务提交前均重新校验来源。完整批次与 archive 在 `workspace/.migration-staging-*` 暂存，用临时数据库重建视图并校验，随后在单个事务中切换所有路径和 `workspace_version=1`，再原子替换目录。现有 canonical 素材保留原字节，缺失的 CSV 仅记录元数据。发布包验证使用一次性目录，不推进流程状态、不替换当前发布包。
+
+只有最终验证成功后，才删除清单中的旧素材及空旧目录；清单之外的文件保留。journal 位于 `data/workspace-migration-journals/`，依次记录 `BACKED_UP`、`STAGED`、`DATABASE_UPDATED`、`PROMOTED`、`VERIFIED`、`CLEANED`。数据库提交后的失败或中断会从验证备份恢复原数据库和素材；恢复本身失败时保留原错误、恢复错误、暂存和可操作 journal。发现未完成 journal 或暂存时会拒绝再次迁移，须检查 journal 指定的验证备份并完成恢复后重试，不会声称已完成。成功 receipt 位于 `data/workspace-migration-receipt.json`；再次检查必须验证 receipt、manifest、数据库引用和素材且无待清理内容，才返回 `ALREADY_MIGRATED`。
+
+刷新批次工作区会在 `workspace/README.md` 旁安装可执行、可搬迁的 `workspace/Migrate Newsroom.command`。Finder 启动器仅分派隐藏 CLI 控制器；控制器先预检、保存并打开报告，存在阻塞时拒绝继续，再要求编辑明确确认，之后才创建验证备份并执行迁移。取消只保留报告，不移动文件、不更改数据库。
 
 ## 9. 验证与离线 Demo
 

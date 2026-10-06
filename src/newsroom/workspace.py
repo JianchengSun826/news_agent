@@ -85,6 +85,11 @@ repo_root="$search_dir"
 exec uv run --project "$repo_root" newsroom --root "$repo_root" macos-action ''' + _shell_literal(batch_id) + " " + _shell_literal(action) + "\n"
 
 
+def render_migration_script() -> str:
+    """Reuse the relocatable bootstrap with a fixed migration dispatcher."""
+    return render_action_script("unused", "unused").split(" macos-action ")[0] + " macos-migrate\n"
+
+
 def _identifier(value: str) -> str:
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value):
         raise WorkflowError(f"invalid workspace identifier: {value}")
@@ -178,8 +183,11 @@ class BatchWorkspace:
         if path.exists():
             if path.read_bytes() != raw:
                 raise WorkflowError("stored source CSV differs from the batch input")
-            return path
-        _atomic_write_bytes(path, raw)
+        else:
+            _atomic_write_bytes(path, raw)
+        metadata = {"source_filename": Path(batch["source_filename"]).name,
+                    "source_sha256": source_sha256, "available": True}
+        _atomic_write(path.parent / "source-metadata.json", json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
         return path
 
     def _relative(self, batch_root: Path, repository_path: str | None) -> str | None:
@@ -250,6 +258,8 @@ class BatchWorkspace:
 
     def _dashboard(self, state: dict[str, Any]) -> str:
         lines = [f"# {_cell(state['batch_id'])}", "", "此视图由 SQLite 生成，可删除后重新生成。", "", f"状态：{_cell(state['status'])}", f"来源 CSV：{_cell(state['source_filename'])}", f"创建：{_cell(state['created_at'])} · 更新：{_cell(state['updated_at'])}", f"下一步：{_cell(state['next_action'])}", "", "## 条目状态", "", " | ".join(f"{_cell(key)}: {value}" for key, value in state["counts"].items()), "", "## 文章", "", "| 标题 | 文章 ID | 条目状态 | 版本 | 核验 | 图片 | 审批 | 发布包 |", "| --- | --- | --- | --- | --- | --- | --- | --- |"]
+        available = self.source_csv_path(state["batch_id"]).is_file()
+        lines.insert(7, "来源 CSV 副本：" + ("可用" if available else "未提供；原始文件名与 SHA-256 保存在 input/source-metadata.json。"))
         for item in state["items"]:
             lines.append("| " + " | ".join((_cell(item["title_cn"] or item["candidate_title"]), _link(item["article_id"], item["article_path"]), _cell(item["item_status"]), _cell(item["revision_number"]), _cell(item["fact_check_outcome"]), _cell(item["image_state"]), _cell(item["approval_state"]), _link("发布包", item["package_path"]) if item["package_path"] else "—")) + " |")
         lines += ["", "## Claude 交接", ""]
@@ -267,7 +277,7 @@ class BatchWorkspace:
         return "\n".join(lines) + "\n"
 
     def install_root_actions(self) -> Path:
-        """Set up the root dashboard/action location; launchers are added separately."""
+        """Install a relocatable, confirmation-gated root migration launcher."""
         actions = self.root / "actions"
         actions.mkdir(parents=True, exist_ok=True)
         batches = self.room.db.all("SELECT b.*,COUNT(bi.candidate_id) AS total,SUM(CASE WHEN bi.item_status IN ('EXCLUDED','REUSED_COMPLETE','FACT_CHECKED') THEN 1 ELSE 0 END) AS completed FROM batches b LEFT JOIN batch_items bi ON b.batch_id=bi.batch_id GROUP BY b.batch_id ORDER BY b.created_at,b.batch_id")
@@ -275,4 +285,7 @@ class BatchWorkspace:
         for batch in batches:
             lines.append(f"| {_link(batch['batch_id'], 'batches/' + _identifier(batch['batch_id']) + '/README.md')} | {_cell(batch['status'])} | {batch['completed'] or 0}/{batch['total']} | {_cell(batch['updated_at'])} |")
         _atomic_write(self.root / "README.md", "\n".join(lines) + "\n")
+        launcher = self.root / "Migrate Newsroom.command"
+        _atomic_write(launcher, render_migration_script())
+        launcher.chmod(0o755)
         return actions

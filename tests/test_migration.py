@@ -14,7 +14,8 @@ from typer.testing import CliRunner
 from newsroom.cli import app
 from newsroom.migration import WorkspaceMigrator
 from newsroom.service import Newsroom, WorkflowError
-from test_batch import candidate_row, write_batch_csv
+from test_batch import candidate_row, write_batch_csv, newsroom, prepared_batch, content_batch
+from test_batch_release import all_pass_batch, ready_batch, approved_batch
 
 
 def migrator(room):
@@ -847,3 +848,489 @@ def test_backup_final_empty_directory_removal_failure_has_no_recoverable_content
     with pytest.raises(WorkflowError, match='backup verification'):
         service.verify_backup(backup)
     assert not (f.room.root / 'workspace').exists()
+
+
+def execute_clean_migration(f):
+    service = migrator(f.room)
+    plan = service.preflight([f.room.root / 'selected.csv'])
+    return service.execute(plan, service.backup(plan))
+
+
+def artifact_snapshot(room):
+    return {name: data for name, data in snapshot(room.root).items()
+            if name.startswith(('research/', 'articles/', 'images/', 'output/', 'workspace/'))
+            and '/.migration-staging-' not in name}
+
+
+def test_execute_archives_and_preserves_exact_artifacts(legacy_workspace):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight([f.room.root / 'selected.csv'])
+    before_states = f.room.db.all('SELECT * FROM state_transitions')
+    result = service.execute(plan, service.backup(plan))
+    assert result['status'] == 'PASS'
+    for entry in plan.entries:
+        assert hashlib.sha256((f.room.root / entry.target).read_bytes()).hexdigest() == entry.sha256
+    assert f.room.get_article(f.article_id)['draft_path'].startswith('workspace/batches/')
+    assert f.room.get_article(f.single_id)['research_brief_path'].startswith('workspace/archive/legacy-single-articles/')
+    assert f.room.db.all('SELECT * FROM state_transitions') == before_states
+    assert f.room.db.one('SELECT workspace_version FROM batches')['workspace_version'] == 1
+    assert (f.room.root / f'workspace/batches/{f.batch_id}/input/source-metadata.json').is_file()
+    assert (f.room.root / 'selected.csv').is_file()
+    assert not any((f.room.root / name).exists() for name in ('research', 'articles', 'images', 'output'))
+    journal = json.loads(Path(result['journal_path']).read_text())
+    assert [record['stage'] for record in journal['history']] == ['BACKED_UP', 'STAGED', 'DATABASE_UPDATED', 'PROMOTED', 'VERIFIED', 'CLEANED']
+
+
+@pytest.mark.parametrize('race', ['before_execute', 'after_staging'])
+def test_execute_hash_race_stops_before_database_update(legacy_workspace, monkeypatch, race):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before = f.room.get_article(f.article_id)
+    if race == 'before_execute':
+        (f.room.root / f.draft).write_bytes(b'changed')
+    else:
+        real_stage = service._stage_workspace
+        def change_after_staging(*args):
+            result = real_stage(*args)
+            (f.room.root / f.draft).write_bytes(b'changed')
+            return result
+        monkeypatch.setattr(service, '_stage_workspace', change_after_staging)
+    with pytest.raises(WorkflowError, match='changed after preflight'):
+        service.execute(plan, backup)
+    assert f.room.get_article(f.article_id) == before
+    assert not (f.room.root / 'workspace/batches').exists()
+
+
+@pytest.mark.parametrize('stage', ['database', 'promotion', 'verification', 'cleanup'])
+@pytest.mark.parametrize('error_type', [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_execute_failure_restores_database_and_artifact_tree(legacy_workspace, monkeypatch, stage, error_type):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before_tree = artifact_snapshot(f.room)
+    before_db = (backup / 'newsroom.db').read_bytes()
+    original = error_type(f'interrupted {stage}')
+    method = {'database': '_switch_database', 'promotion': '_promote_workspace', 'verification': '_verify_workspace', 'cleanup': '_cleanup_originals'}[stage]
+    real = getattr(service, method)
+    def interrupt(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if stage == 'database' and len(args) > 1:
+            return result  # The disposable projected DB is not the canonical commit.
+        raise original
+    monkeypatch.setattr(service, method, interrupt)
+    with pytest.raises(BaseException) as captured:
+        service.execute(plan, backup)
+    assert original in list(exception_tree(captured.value))
+    assert f.room.db_path.read_bytes() == before_db
+    assert artifact_snapshot(f.room) == before_tree
+    journals = list((f.room.root / 'data/workspace-migration-journals').glob('*.json'))
+    assert json.loads(journals[0].read_text())['recovery_status'] == 'ROLLED_BACK'
+    assert not list((f.room.root / 'workspace').glob('.migration-staging-*'))
+
+
+def test_execute_rejects_a_different_verified_plan(legacy_workspace):
+    f = legacy_workspace
+    service = migrator(f.room)
+    backup = service.backup(service.preflight())
+    plan = service.preflight([f.room.root / 'selected.csv'])
+    before = artifact_snapshot(f.room)
+    with pytest.raises(WorkflowError, match='backup.*plan'):
+        service.execute(plan, backup)
+    assert artifact_snapshot(f.room) == before
+
+
+def test_execute_mixed_canonical_files_remain_exact(legacy_workspace):
+    f = legacy_workspace
+    from newsroom.batch import BatchWorkflow
+    csv = write_batch_csv(f.room.root / 'canonical.csv', [candidate_row(company='Canonical', product='New', primary_source='https://canonical.example/new')])
+    batch = BatchWorkflow(f.room).prepare(csv)['batch_id']
+    canonical = f.room.root / 'workspace/batches' / batch
+    before = snapshot(canonical)
+    execute_clean_migration(f)
+    after = snapshot(canonical)
+    assert {name: after[name] for name in before} == before
+    assert migrator(f.room).execute_from_current_state()['status'] == 'ALREADY_MIGRATED'
+
+
+def test_completed_migration_is_idempotent_and_checks_receipt(legacy_workspace):
+    f = legacy_workspace
+    first = execute_clean_migration(f)
+    before = snapshot(f.room.root)
+    second = migrator(f.room).execute_from_current_state()
+    assert second['status'] == 'ALREADY_MIGRATED'
+    assert second['manifest_sha256'] == first['manifest_sha256']
+    assert snapshot(f.room.root) == before
+    receipt = f.room.root / 'data/workspace-migration-receipt.json'
+    payload = json.loads(receipt.read_text())
+    payload['manifest_sha256'] = 'corrupt'
+    receipt.write_text(json.dumps(payload))
+    with pytest.raises(WorkflowError, match='receipt'):
+        migrator(f.room).execute_from_current_state()
+
+
+def test_idempotency_refuses_corrupt_workspace_and_partial_journal(legacy_workspace):
+    f = legacy_workspace
+    result = execute_clean_migration(f)
+    (f.room.root / f.room.get_article(f.article_id)['draft_path']).write_text('corrupt')
+    with pytest.raises(WorkflowError, match='hash'):
+        migrator(f.room).execute_from_current_state()
+    journal = Path(result['journal_path'])
+    data = json.loads(journal.read_text())
+    data['stage'] = 'VERIFIED'
+    journal.write_text(json.dumps(data))
+    with pytest.raises(WorkflowError, match='recovery'):
+        migrator(f.room).execute_from_current_state()
+
+
+@pytest.mark.parametrize('answer', ['cancel', 'block', 'success'])
+def test_migration_controller_saves_report_and_honors_confirmation(legacy_workspace, answer):
+    from newsroom.macos import MacOSMigrationController
+    from test_macos import FakeDialogs
+    f = legacy_workspace
+    if answer == 'block':
+        (f.room.root / f.draft).unlink()
+    before = artifact_snapshot(f.room)
+    dialogs = FakeDialogs(confirms=[answer == 'success'])
+    code = MacOSMigrationController(f.room, dialogs).run()
+    report = f.room.root / 'data/workspace-migration-preflight.json'
+    assert report in dialogs.opened
+    assert code == (2 if answer == 'block' else 0)
+    if answer != 'success':
+        assert artifact_snapshot(f.room) == before
+        assert not (f.room.root / 'data/backups').exists()
+    else:
+        assert f.room.get_article(f.article_id)['draft_path'].startswith('workspace/batches/')
+
+
+def test_cli_explicit_execute_requires_plan_and_backup(legacy_workspace):
+    f = legacy_workspace
+    runner = CliRunner()
+    assert runner.invoke(app, ['--root', str(f.room.root), 'workspace', 'migrate', '--execute']).exit_code == 2
+    service = migrator(f.room)
+    plan = service.preflight()
+    report = service.save_report(plan)
+    backup = service.backup(plan)
+    result = runner.invoke(app, ['--root', str(f.room.root), 'workspace', 'migrate', '--execute', '--plan', str(report), '--backup', str(backup)])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)['status'] == 'PASS'
+
+
+def test_execute_new_untracked_file_before_switch_stops_without_deleting_it(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    real_stage = service._stage_workspace
+    extra = f.room.root / 'research/new-untracked.md'
+    def add_after_staging(*args):
+        real_stage(*args)
+        extra.write_bytes(b'editor added this')
+    monkeypatch.setattr(service, '_stage_workspace', add_after_staging)
+    with pytest.raises(WorkflowError, match='changed after preflight'):
+        service.execute(plan, backup)
+    assert extra.read_bytes() == b'editor added this'
+    assert f.room.get_article(f.article_id)['draft_path'] == f.draft.as_posix()
+
+
+@pytest.mark.parametrize('error_type', [OSError, KeyboardInterrupt])
+def test_execute_retained_tree_retirement_failure_restores_from_archive(legacy_workspace, monkeypatch, error_type):
+    f = legacy_workspace
+    from newsroom.batch import BatchWorkflow
+    batch = BatchWorkflow(f.room).prepare(write_batch_csv(f.room.root / 'other.csv', [candidate_row(company='Other', product='Tool', primary_source='https://other.example/tool')]))['batch_id']
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before = artifact_snapshot(f.room)
+    real_remove = shutil.rmtree
+    original = error_type('retirement interrupted after deletion')
+    seen = []
+    def partial_retirement(path, *args, **kwargs):
+        path = Path(path)
+        if path.name.startswith('.migration-staging-') and not seen:
+            seen.append(path)
+            real_remove(path / 'retained')
+            raise original
+        return real_remove(path, *args, **kwargs)
+    monkeypatch.setattr('newsroom.migration.shutil.rmtree', partial_retirement)
+    with pytest.raises(BaseException) as captured:
+        service.execute(plan, backup)
+    assert original in list(exception_tree(captured.value))
+    assert artifact_snapshot(f.room) == before
+    assert f.room.db_path.read_bytes() == (backup / 'newsroom.db').read_bytes()
+    assert not service.receipt_path.exists()
+
+
+def test_execute_preserves_original_and_recovery_errors(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    original = KeyboardInterrupt('verification interrupted')
+    recovery = OSError('database restoration failed')
+    def interrupt(*args):
+        raise original
+    def fail_restore(*args):
+        raise recovery
+    monkeypatch.setattr(service, '_verify_workspace', interrupt)
+    monkeypatch.setattr(service, '_restore_database', fail_restore)
+    with pytest.raises(BaseExceptionGroup) as captured:
+        service.execute(plan, backup)
+    assert original in list(exception_tree(captured.value)) and recovery in list(exception_tree(captured.value))
+    journal = json.loads(next((f.room.root / 'data/workspace-migration-journals').glob('*.json')).read_bytes())
+    assert journal['recovery_status'] == 'RECOVERY_REQUIRED'
+    with pytest.raises(WorkflowError, match='recovery'):
+        migrator(f.room).execute_from_current_state()
+
+
+@pytest.mark.parametrize('mutation', ['handoff_identity', 'source_metadata', 'current_version'])
+def test_execute_rejects_invalid_staged_material_before_switch(legacy_workspace, monkeypatch, mutation):
+    f = legacy_workspace
+    service = migrator(f.room)
+    if mutation == 'handoff_identity':
+        request_path = f.room.root / f'output/batches/{f.batch_id}/{f.request["request_id"]}.json'
+        document = json.loads(request_path.read_bytes())
+        document['batch_id'] = 'batch-other'
+        request_path.write_text(json.dumps(document))
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before = artifact_snapshot(f.room)
+    database = f.room.db_path.read_bytes()
+    if mutation != 'handoff_identity':
+        real_validate = service._validate_materials
+        def corrupt_then_validate(room):
+            if mutation == 'source_metadata':
+                path = room.root / f'workspace/batches/{f.batch_id}/input/source-metadata.json'
+                document = json.loads(path.read_bytes())
+                document['source_sha256'] = 'wrong'
+                path.write_text(json.dumps(document))
+            else:
+                with room.db.connect() as connection:
+                    connection.execute('UPDATE articles SET revision_number=3 WHERE article_id=?', (f.article_id,))
+            return real_validate(room)
+        monkeypatch.setattr(service, '_validate_materials', corrupt_then_validate)
+    with pytest.raises(WorkflowError):
+        service.execute(plan, backup)
+    assert f.room.db_path.read_bytes() == database
+    assert artifact_snapshot(f.room) == before
+
+
+def test_execute_interruption_during_individual_promotion_restores_mixed_tree(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    from newsroom.batch import BatchWorkflow
+    BatchWorkflow(f.room).prepare(write_batch_csv(f.room.root / 'canonical.csv', [candidate_row(company='Existing', product='Tool', primary_source='https://existing.example/tool')]))
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before = artifact_snapshot(f.room)
+    real_replace = __import__('os').replace
+    original = KeyboardInterrupt('rename returned then interrupted')
+    seen = []
+    def interrupt(source, destination):
+        result = real_replace(source, destination)
+        if Path(destination) == f.room.root / 'workspace/batches' and not seen:
+            seen.append(destination)
+            raise original
+        return result
+    monkeypatch.setattr('newsroom.migration.os.replace', interrupt)
+    with pytest.raises(BaseException) as captured:
+        service.execute(plan, backup)
+    assert original in list(exception_tree(captured.value))
+    assert artifact_snapshot(f.room) == before
+    assert f.room.db_path.read_bytes() == (backup / 'newsroom.db').read_bytes()
+
+
+def test_execute_rechecks_verified_backup_before_database_switch(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    real_stage = service._stage_workspace
+    database = f.room.db_path.read_bytes()
+    def corrupt_backup(*args):
+        real_stage(*args)
+        (backup / 'newsroom.db').write_bytes(b'corrupt backup')
+    monkeypatch.setattr(service, '_stage_workspace', corrupt_backup)
+    with pytest.raises(WorkflowError, match='backup'):
+        service.execute(plan, backup)
+    assert f.room.db_path.read_bytes() == database
+
+
+def test_execute_validates_packages_disposably_without_release_state_changes(approved_batch, monkeypatch):
+    from newsroom.batch_release import BatchReleaseWorkflow
+    f = approved_batch
+    publish = BatchReleaseWorkflow(f.room).build_packages(f.batch_id)
+    before_packages = snapshot(publish)
+    before_states = f.room.db.all('SELECT * FROM state_transitions')
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    targets = []
+    real_write = f.room._write_publication_package
+    def record_package(article, image, sources, target):
+        targets.append(target)
+        return real_write(article, image, sources, target)
+    monkeypatch.setattr(f.room, '_write_publication_package', record_package)
+    result = service.execute(plan, backup)
+    assert result['status'] == 'PASS'
+    assert targets and all(not target.is_relative_to(f.room.root) for target in targets)
+    assert snapshot(publish) == before_packages
+    assert f.room.db.all('SELECT * FROM state_transitions') == before_states
+    assert all(f.room.get_article(article)['status'] == 'APPROVED' for article in f.article_ids)
+
+
+@pytest.mark.parametrize('mutation', ['metadata', 'content', 'license', 'checklist'])
+def test_execute_rejects_corrupt_existing_package_without_mutation(approved_batch, mutation):
+    from newsroom.batch_release import BatchReleaseWorkflow
+    f = approved_batch
+    publish = BatchReleaseWorkflow(f.room).build_packages(f.batch_id) / f.article_ids[0]
+    if mutation == 'metadata':
+        path = publish / 'metadata.json'
+        document = json.loads(path.read_bytes())
+        document['article_id'] = 'art-wrong'
+        path.write_text(json.dumps(document))
+    elif mutation == 'license':
+        path = publish / 'image-license.json'
+        document = json.loads(path.read_bytes())
+        document['article_id'] = 'art-wrong'
+        path.write_text(json.dumps(document))
+    else:
+        (publish / ('article.md' if mutation == 'content' else 'publication-checklist.md')).write_text('bad' if mutation == 'content' else '')
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before = artifact_snapshot(f.room)
+    database = f.room.db_path.read_bytes()
+    with pytest.raises(WorkflowError, match='package'):
+        service.execute(plan, backup)
+    assert artifact_snapshot(f.room) == before
+    assert f.room.db_path.read_bytes() == database
+
+
+def artifact_details(room):
+    return {name: data for name, data in filesystem_details(room.root).items()
+            if name.split('/')[0] in {'research', 'articles', 'images', 'output', 'workspace'}}
+
+
+def test_execute_rollback_restores_file_and_directory_modes_and_timestamps(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    from newsroom.batch import BatchWorkflow
+    BatchWorkflow(f.room).prepare(write_batch_csv(f.room.root / 'canonical.csv', [candidate_row(company='Existing', product='Tool', primary_source='https://existing.example/tool')]))
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before = artifact_details(f.room)
+    real_cleanup = service._cleanup_originals
+    def interrupt(*args):
+        real_cleanup(*args)
+        raise KeyboardInterrupt('cleanup interruption')
+    monkeypatch.setattr(service, '_cleanup_originals', interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        service.execute(plan, backup)
+    assert artifact_details(f.room) == before
+
+
+def test_execute_completed_receipt_does_not_bypass_clean_plan_and_backup(legacy_workspace):
+    from newsroom.migration import MigrationPlan
+    f = legacy_workspace
+    execute_clean_migration(f)
+    with pytest.raises(WorkflowError, match='blocking'):
+        migrator(f.room).execute(MigrationPlan(blocking_errors=['blocked']), f.room.root / 'missing-backup')
+
+
+def test_idempotency_checks_current_legacy_article_version(legacy_workspace):
+    f = legacy_workspace
+    execute_clean_migration(f)
+    with f.room.db.connect() as connection:
+        connection.execute('UPDATE articles SET revision_number=2 WHERE article_id=?', (f.single_id,))
+    with pytest.raises(WorkflowError, match='version'):
+        migrator(f.room).execute_from_current_state()
+
+
+def test_rollback_preserves_untracked_file_and_reports_required_recovery(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    real_verify = service._verify_workspace
+    extra = f.room.root / f'workspace/batches/{f.batch_id}/editor-added.md'
+    original = KeyboardInterrupt('verification interrupted')
+    def interrupt(*args):
+        real_verify(*args)
+        extra.write_bytes(b'editor data')
+        raise original
+    monkeypatch.setattr(service, '_verify_workspace', interrupt)
+    with pytest.raises(BaseExceptionGroup) as captured:
+        service.execute(plan, backup)
+    assert original in list(exception_tree(captured.value))
+    assert any('untracked' in str(error) for error in exception_tree(captured.value))
+    assert extra.read_bytes() == b'editor data'
+    with pytest.raises(WorkflowError, match='recovery'):
+        migrator(f.room).execute_from_current_state()
+
+
+def test_execute_rejects_package_rights_drift(approved_batch):
+    from newsroom.batch_release import BatchReleaseWorkflow
+    f = approved_batch
+    package = BatchReleaseWorkflow(f.room).build_packages(f.batch_id) / f.article_ids[0]
+    path = package / 'image-license.json'
+    document = json.loads(path.read_bytes())
+    document['rights_statement'] = 'Changed without editor confirmation'
+    path.write_text(json.dumps(document))
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    with pytest.raises(WorkflowError, match='rights'):
+        service.execute(plan, backup)
+
+
+def test_execute_rejects_current_image_association_before_approval(ready_batch):
+    f = ready_batch
+    image = f.room.get_article(f.article_ids[1])['image_id']
+    with f.room.db.connect() as connection:
+        connection.execute('UPDATE articles SET image_id=? WHERE article_id=?', (image, f.article_ids[0]))
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    with pytest.raises(WorkflowError, match='image'):
+        service.execute(plan, backup)
+
+
+def test_execute_reopens_generated_files_after_promotion(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before = artifact_snapshot(f.room)
+    real_promote = service._promote_workspace
+    def change_promoted_script(*args):
+        real_promote(*args)
+        (f.room.root / f'workspace/batches/{f.batch_id}/OPEN_BATCH.command').write_text('changed dispatch')
+    monkeypatch.setattr(service, '_promote_workspace', change_promoted_script)
+    with pytest.raises(WorkflowError, match='hash|launcher'):
+        service.execute(plan, backup)
+    assert artifact_snapshot(f.room) == before
+
+
+def test_idempotency_refuses_missing_generated_launcher(legacy_workspace):
+    f = legacy_workspace
+    execute_clean_migration(f)
+    (f.room.root / 'workspace/Migrate Newsroom.command').unlink()
+    with pytest.raises(WorkflowError, match='launcher'):
+        migrator(f.room).execute_from_current_state()
+
+
+@pytest.mark.parametrize('existing_canonical', [False, True])
+def test_idempotency_remains_valid_after_preparing_new_canonical_batch(legacy_workspace, existing_canonical):
+    f = legacy_workspace
+    from newsroom.batch import BatchWorkflow
+    workflow = BatchWorkflow(f.room)
+    if existing_canonical:
+        workflow.prepare(write_batch_csv(f.room.root / 'before.csv', [candidate_row(company='Before', product='Tool', primary_source='https://before.example/tool')]))
+    execute_clean_migration(f)
+    batch = workflow.prepare(write_batch_csv(f.room.root / 'after.csv', [candidate_row(company='After', product='Tool', primary_source='https://after.example/tool')]))['batch_id']
+    assert f.room.db.one('SELECT workspace_version FROM batches WHERE batch_id=?', (batch,))['workspace_version'] == 1
+    assert migrator(f.room).execute_from_current_state()['status'] == 'ALREADY_MIGRATED'

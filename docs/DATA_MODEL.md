@@ -14,7 +14,7 @@ SQLite schema version 4 is created or upgraded by `newsroom init`. Existing v1/v
 
 ## Batch records
 
-`batches` stores `batch_id`, original filename and byte SHA-256, aggregate status, latest content request ID, latest fact-check request ID, and timestamps. `workspace_version` is a non-null integer starting at 0, recording the batch workspace layout version. An identical file hash returns the existing batch.
+`batches` stores `batch_id`, original filename and byte SHA-256, aggregate status, latest content request ID, latest fact-check request ID, and timestamps. `workspace_version` is a non-null integer recording the batch workspace layout version. Its schema default remains 0 for legacy or manually inserted rows requiring migration; `BatchWorkflow.prepare` explicitly records 1 for new batches created directly in the canonical Scheme C layout. Verified migration upgrades existing batches to 1 without changing workflow states. An identical file hash returns the existing batch.
 
 `batch_items` links each batch candidate to its reused or new article. It records deterministic duplicate classification, batch-specific status, content version, and the latest actionable error. Important statuses are `WAITING_DUPLICATE`, `READY_FOR_CONTENT`, `CONTENT_IMPORTED`, `FACT_CHECKED`, `NEEDS_REVISION`, `REUSED_COMPLETE`, and `EXCLUDED`.
 

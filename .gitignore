@@ -6,6 +6,9 @@ __pycache__/
 data/*.db
 data/backups/
 data/workspace-migration-preflight.json
+data/workspace-migration-journals/
+data/workspace-migration-receipt.json
+data/*.migration-restore
 articles/
 images/
 research/
@@ -15,3 +18,4 @@ demo-workspace/
 dist/
 
 workspace/
+workspace/.migration-staging-*/

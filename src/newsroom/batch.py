@@ -67,9 +67,9 @@ class BatchWorkflow:
         now = utc_now()
         with self.room.db.connect() as connection:
             connection.execute(
-                "INSERT INTO batches(batch_id,source_filename,source_sha256,status,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?)",
-                (batch_id, source.name, source_sha256, "PREPARING", now, now),
+                "INSERT INTO batches(batch_id,source_filename,source_sha256,workspace_version,status,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (batch_id, source.name, source_sha256, 1, "PREPARING", now, now),
             )
 
         self.workspace.ensure_layout(batch_id)

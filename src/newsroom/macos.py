@@ -348,3 +348,32 @@ class MacOSBatchController:
         if isinstance(error, OSError):
             return f"无法读取文件或完成 macOS 操作。请检查文件路径、权限及本地文件后重试。\n{error}"
         return f"{error}\n请查看批次 README 与 batch status，完成当前步骤后重试。"
+
+
+class MacOSMigrationController:
+    """A narrow human-operated migration dialog; all dynamic data stays in argv."""
+
+    def __init__(self, room: Newsroom, dialogs: DialogPort):
+        self.room = room
+        self.dialogs = dialogs
+
+    def run(self) -> int:
+        from .migration import WorkspaceMigrator
+        service = WorkspaceMigrator(self.room)
+        try:
+            plan = service.preflight()
+            report = service.save_report(plan)
+            self.dialogs.open_file(report)
+            if plan.blocking_errors:
+                raise WorkflowError("迁移预检存在阻塞问题，请查看已保存报告并修复后重试。\n" + "\n".join(plan.blocking_errors))
+            if not self.dialogs.confirm("迁移新闻编辑室", f"请先阅读预检报告：{report}\n确认创建验证备份并迁移本地工作区？不会发布文章。"):
+                return 0
+            result = service.execute_from_current_state() if service.receipt_path.exists() else service.execute(plan, service.backup(plan))
+            self.dialogs.alert("迁移完成", f"{result['status']}\n清单 SHA-256：{result['manifest_sha256']}")
+            return 0
+        except Exception as error:
+            try:
+                self.dialogs.alert("迁移未完成", f"{error}\n请查看预检报告和迁移 journal；恢复完成前不要重复迁移。", error=True)
+            except OSError as dialog_error:
+                print(f"迁移未完成：{error}\n无法显示对话框：{dialog_error}", file=sys.stderr)
+            return 2

@@ -1,4 +1,4 @@
-"""Read-only workspace migration planning and independently verified local backups."""
+"""Verified local migration planning, execution and compensating recovery."""
 from __future__ import annotations
 
 from contextlib import closing, contextmanager
@@ -17,10 +17,15 @@ import stat
 import tarfile
 import tempfile
 from typing import Any, Iterator
+
+from pydantic import TypeAdapter, ValidationError
 import unicodedata
 
 from .service import Newsroom, WorkflowError
-from .workspace import BatchWorkspace, BatchWorkspacePaths, _atomic_write
+from .workspace import (
+    BATCH_ACTIONS, BatchWorkspace, BatchWorkspacePaths, _atomic_write,
+    render_action_script, render_migration_script,
+)
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -97,6 +102,17 @@ class MigrationPlan:
     @property
     def entries(self) -> list[MigrationEntry]:
         return sorted(self.claimed + self.legacy + self.unclaimed, key=lambda e: (e.source.as_posix(), e.target.as_posix(), e.database_table or "", e.database_field or ""))
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> MigrationPlan:
+        """Validate a saved, deterministic preflight report at the input boundary."""
+        try:
+            plan = TypeAdapter(cls).validate_python(value)
+            if plan.to_dict() != value:
+                raise ValueError("noncanonical migration plan")
+            return plan
+        except (ValidationError, TypeError, ValueError) as error:
+            raise WorkflowError(f"invalid migration plan: {error}") from error
 
     @property
     def expected_backup_size(self) -> int:
@@ -586,3 +602,572 @@ class WorkspaceMigrator:
                         raise WorkflowError(f"archive member hash mismatch: {member.name}")
         except (OSError, sqlite3.Error, tarfile.TarError, ValueError, KeyError, TypeError) as error:
             raise WorkflowError(f"backup verification failed: {error}") from error
+
+    @property
+    def receipt_path(self) -> Path:
+        return self.room.root / 'data/workspace-migration-receipt.json'
+
+    def _pending_journals(self) -> None:
+        directory = self.room.root / 'data/workspace-migration-journals'
+        _no_symlinks(directory)
+        _no_symlinks(self.workspace.root)
+        for path in sorted(directory.glob('*.json')):
+            try:
+                _no_symlinks(path)
+                journal = json.loads(path.read_bytes())
+                if journal.get('recovery_status') not in {None, 'ROLLED_BACK'} or (journal['stage'] != 'CLEANED' and journal.get('recovery_status') != 'ROLLED_BACK'):
+                    raise ValueError('unfinished migration')
+            except (ValueError, KeyError, OSError) as error:
+                raise WorkflowError(f'migration recovery required; inspect {path.relative_to(self.room.root)} and restore its verified backup before retrying') from error
+        if list(self.workspace.root.glob('.migration-staging-*')):
+            raise WorkflowError('migration recovery required; retained staging exists; inspect migration journals before retrying')
+
+    def _assert_unchanged(self, plan: MigrationPlan, *, inventory: bool = False) -> None:
+        if plan.blocking_errors:
+            raise WorkflowError('migration preflight has blocking errors')
+        for entry in plan.entries:
+            path = self._source(entry.source, external=entry.source.is_absolute())
+            if _digest(path) != (entry.sha256, entry.size):
+                raise WorkflowError(f'migration source changed after preflight: {entry.source}')
+        roots = {'research', 'articles', 'images', 'output', 'workspace'}
+        expected = {entry.source for entry in plan.entries if not entry.source.is_absolute() and entry.source.parts[0] in roots}
+        actual = set()
+        staging = getattr(self, '_execution', {}).get('staging_path')
+        for name in roots:
+            root = self.room.root / name
+            _no_symlinks(root)
+            if not root.exists():
+                continue
+            for directory, dirs, files in os.walk(root, onerror=_walk_error):
+                dirs[:] = [name for name in dirs if str(Path(directory) / name) != staging]
+                for name in dirs + files:
+                    _no_symlinks(Path(directory) / name)
+                actual.update((Path(directory) / name).relative_to(self.room.root) for name in files)
+        if actual != expected:
+            raise WorkflowError('migration inventory changed after preflight')
+        with self._connect_readonly() as connection:
+            if _database(connection)[1] != plan.database_snapshot_sha256:
+                raise WorkflowError('migration database changed after preflight')
+        if inventory:
+            selected = [source if source.is_absolute() else self.room.root / source for source in plan.selected_source_csvs]
+            if self.preflight(selected).to_dict() != plan.to_dict():
+                raise WorkflowError('migration inventory changed after preflight')
+
+    @staticmethod
+    def _quote_identifier(value: str) -> str:
+        return '"' + value.replace('"', '""') + '"'
+
+    def _switch_database(self, plan: MigrationPlan, room: Newsroom | None = None) -> None:
+        target = room or self.room
+        with closing(target.db.connect()) as connection:
+            try:
+                connection.execute('BEGIN IMMEDIATE')
+                if _database(connection)[1] != plan.database_snapshot_sha256:
+                    raise WorkflowError('migration database changed after preflight')
+                # Hashes are checked again while holding the DB write lock.
+                if room is None:
+                    backup = Path(self._execution['backup_path'])
+                    self.verify_backup(backup)
+                    if _digest(backup / 'manifest.json')[0] != self._execution['manifest_sha256']:
+                        raise WorkflowError('verified backup manifest changed before database switch')
+                    self._assert_unchanged(plan)
+                changes = {(e.database_table, e.database_field, e.source.as_posix(), e.target.as_posix())
+                           for e in plan.entries if e.database_table and e.database_field}
+                for table, column, source, destination in sorted(changes):
+                    quoted_table, quoted_column = self._quote_identifier(table), self._quote_identifier(column)
+                    cursor = connection.execute(
+                        f'UPDATE {quoted_table} SET {quoted_column}=? WHERE {quoted_column}=?',
+                        (destination, source),
+                    )
+                    if not cursor.rowcount:
+                        raise WorkflowError('migration database source no longer matches plan')
+                connection.execute('UPDATE batches SET workspace_version=?', (1,))
+                connection.commit()
+                if room is None:
+                    self._execution['database_updated'] = True
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def _verify_hashes(self, plan: MigrationPlan, root: Path, *, current_views: bool = False) -> None:
+        for entry in plan.entries:
+            # Receipt verification permits derived views to evolve with current
+            # SQLite state. Their identities/content are validated separately;
+            # canonical source artifacts remain bound to original manifest bytes.
+            parts = entry.target.parts
+            view = entry.target == Path('workspace/README.md') or entry.target == Path('workspace/Migrate Newsroom.command')
+            if parts[:2] == ('workspace', 'batches') and len(parts) >= 4:
+                view = view or parts[3:] in {('README.md',), ('batch-state.json',), ('OPEN_BATCH.command',), ('input', 'source-metadata.json')}
+                view = view or (len(parts) == 6 and parts[3] == 'articles' and parts[5] == 'image-candidates.json')
+                view = view or (len(parts) == 5 and parts[3] == 'actions' and parts[4] in {filename for filename, _ in BATCH_ACTIONS})
+            if current_views and entry.database_field is None and view:
+                continue
+            _safe_relative(entry.target)
+            path = root / entry.target
+            _no_symlinks(path)
+            if not path.resolve().is_relative_to(root) or not path.is_file():
+                raise WorkflowError(f'missing or unsafe migrated artifact: {entry.target}')
+            if _digest(path) != (entry.sha256, entry.size):
+                raise WorkflowError(f'migrated artifact hash mismatch: {entry.target}')
+
+    def _stage_workspace(self, plan: MigrationPlan, backup: Path, stage: Path) -> None:
+        """Project paths and rebuild views against a disposable database, never live DB."""
+        staged_room = Newsroom(stage)
+        staged_room.db_path.parent.mkdir(parents=True)
+        shutil.copy2(backup / 'newsroom.db', staged_room.db_path)
+        for name in ('batches', 'archive'):
+            (stage / 'workspace' / name).mkdir(parents=True)
+        for entry in plan.entries:
+            if entry.target.parts[0] != 'workspace':
+                raise WorkflowError(f'migration target must be beneath workspace: {entry.target}')
+            target = stage / entry.target
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self._source(entry.source, external=entry.source.is_absolute()), target)
+        self._verify_hashes(plan, stage)
+        self._switch_database(plan, staged_room)
+        workspace = BatchWorkspace(staged_room)
+        for batch_id, metadata in plan.source_metadata.items():
+            path = workspace.batch_root(batch_id) / 'input/source-metadata.json'
+            # Existing canonical metadata is retained byte for byte.
+            if not path.exists():
+                _atomic_write(path, _json_bytes(metadata).decode())
+            if not (workspace.batch_root(batch_id) / 'batch-state.json').exists():
+                workspace.refresh(batch_id)
+        workspace.install_root_actions()
+        self._verify_hashes(plan, stage)
+        self._validate_materials(staged_room)
+        self._execution['expected_database'] = self._database_fingerprint(staged_room)
+        self._execution['promoted_files'] = {
+            path.relative_to(stage / 'workspace').as_posix(): _digest(path)[0]
+            for path in (stage / 'workspace').rglob('*') if path.is_file()
+        }
+
+    @staticmethod
+    def _database_fingerprint(room: Newsroom) -> str:
+        with closing(room.db.connect()) as connection:
+            return _database(connection)[1]
+
+    def _validate_materials(self, room: Newsroom) -> None:
+        """Reopen paths, typed handoffs, images, and packages without workflow writes."""
+        from . import batch_models as models
+        from .batch_release import BatchReleaseWorkflow
+        with closing(room.db.connect()) as connection:
+            tables, _ = _database(connection)
+        articles = {row['article_id']: row for row in tables['articles']}
+        if max((row['version'] for row in tables['schema_version']), default=0) != 4:
+            raise WorkflowError('migration requires database schema version 4')
+        for table, rows in tables.items():
+            for row in rows:
+                for column, value in row.items():
+                    if not column.endswith('_path') or not value:
+                        continue
+                    relative = Path(value)
+                    _safe_relative(relative)
+                    if relative.parts[:2] not in {('workspace', 'batches'), ('workspace', 'archive')}:
+                        raise WorkflowError(f'noncanonical database reference: {table}.{column}')
+                    path = room.root / relative
+                    _no_symlinks(path)
+                    if not path.resolve().is_relative_to(room.root) or not path.is_file():
+                        raise WorkflowError(f'missing database reference: {table}.{column}')
+                    _digest(path)  # Reopen every path, including prompts and images.
+                    article = articles.get(row.get('article_id'))
+                    batch = article['owning_batch_id'] if article else row.get('batch_id')
+                    kind = {'draft_path': 'article', 'research_brief_path': 'research-brief', 'fact_check_path': 'fact-check'}.get(column)
+                    if article and kind:
+                        match = re.fullmatch(kind + r'-v([1-9][0-9]*)\.md', relative.name)
+                        version = int(match[1]) if match else 0
+                        prior_check = column == 'fact_check_path' and article['fact_check_outcome'] is None and 1 <= version <= article['revision_number']
+                        if not match or (version != article['revision_number'] and not prior_check):
+                            raise WorkflowError(f'database artifact current version mismatch: {table}.{column}')
+                    if table == 'batch_requests':
+                        expected_request = BatchWorkspace(room).request_artifact_path(
+                            row['batch_id'], row['request_type'], row['revision_number'], result=column == 'result_path',
+                            historical_request_id=row['request_id'] if row['status'] == 'SUPERSEDED' and column == 'request_path' else None,
+                        ).relative_to(room.root)
+                        if relative != expected_request:
+                            raise WorkflowError('database request filename/version identity mismatch')
+                    expected = WorkspaceMigrator(room)._target(relative, article, batch, column, row if table == 'batch_requests' else None)
+                    if relative != expected:
+                        raise WorkflowError(f'database artifact identity mismatch: {table}.{column}')
+        if any(row['workspace_version'] != 1 for row in tables['batches']):
+            raise WorkflowError('workspace migration version mismatch')
+        images = {image['image_id']: image for image in tables['images']}
+        for article in articles.values():
+            if article['image_id']:
+                selected = images.get(article['image_id'])
+                if selected is None or selected['article_id'] != article['article_id']:
+                    raise WorkflowError('current migrated image belongs to a different article')
+        launcher = room.root / 'workspace/Migrate Newsroom.command'
+        try:
+            _no_symlinks(launcher)
+            if launcher.read_text() != render_migration_script() or not launcher.stat().st_mode & 0o111:
+                raise ValueError('root launcher differs from bootstrap dispatcher')
+        except (OSError, ValueError) as error:
+            raise WorkflowError('missing or invalid migration launcher') from error
+        for batch in tables['batches']:
+            workspace = BatchWorkspace(room)
+            root = workspace.batch_root(batch['batch_id'])
+            for filename, action in (('OPEN_BATCH.command', 'open-batch'), *BATCH_ACTIONS):
+                launcher = root / filename if filename == 'OPEN_BATCH.command' else root / 'actions' / filename
+                try:
+                    _no_symlinks(launcher)
+                    if launcher.read_text() != render_action_script(batch['batch_id'], action) or not launcher.stat().st_mode & 0o111:
+                        raise ValueError('batch launcher differs from bootstrap dispatcher')
+                except (OSError, ValueError) as error:
+                    raise WorkflowError('missing or invalid batch launcher') from error
+            try:
+                metadata = json.loads((root / 'input/source-metadata.json').read_bytes())
+                source = workspace.source_csv_path(batch['batch_id'])
+                expected = {'source_filename': Path(batch['source_filename']).name,
+                            'source_sha256': batch['source_sha256'], 'available': source.is_file()}
+                if metadata != expected or (source.is_file() and _digest(source)[0] != batch['source_sha256']):
+                    raise ValueError('source metadata does not match batch')
+                state = json.loads((root / 'batch-state.json').read_bytes())
+                expected_state = workspace.snapshot(batch['batch_id'])
+                if {key: value for key, value in state.items() if key != 'workspace_version'} != {key: value for key, value in expected_state.items() if key != 'workspace_version'} or batch['batch_id'] not in (root / 'README.md').read_text():
+                    raise ValueError('dashboard batch identity mismatch')
+            except (OSError, ValueError, TypeError) as error:
+                raise WorkflowError(f'migrated source metadata or dashboard identity mismatch: {batch["batch_id"]}') from error
+            for article in room.db.all('SELECT article_id FROM articles WHERE owning_batch_id=?', (batch['batch_id'],)):
+                candidate_view = workspace.article_root(batch['batch_id'], article['article_id']) / 'image-candidates.json'
+                if json.loads(candidate_view.read_bytes()) != room.list_image_candidates(article['article_id']):
+                    raise WorkflowError('migrated image candidate view differs from current database')
+        for request in tables['batch_requests']:
+            kind = {'CONTENT': 'Content', 'FACT_CHECK': 'FactCheck', 'REVISION': 'Revision'}.get(request['request_type'])
+            if kind is None:
+                raise WorkflowError('unknown migrated request type')
+            documents = {}
+            for column, suffix in (('request_path', 'Request'), ('result_path', 'Result')):
+                if not request[column]:
+                    continue
+                raw = (room.root / request[column]).read_bytes()
+                try:
+                    document = getattr(models, 'Batch' + kind + suffix).model_validate_json(raw)
+                except ValidationError as error:
+                    raise WorkflowError(f'invalid migrated handoff: {column}') from error
+                if (document.batch_id, document.request_id, document.output_file) != (
+                    request['batch_id'], request['request_id'], request['expected_result_filename'],
+                ):
+                    raise WorkflowError('migrated request/result identity mismatch')
+                ids = {item.article_id for item in document.items}
+                if any(article_id not in articles or articles[article_id]['owning_batch_id'] != request['batch_id'] for article_id in ids):
+                    raise WorkflowError('migrated handoff article identity mismatch')
+                documents[column] = ids
+                if column == 'result_path' and request['result_sha256'] != hashlib.sha256(raw).hexdigest():
+                    raise WorkflowError('migrated result hash mismatch')
+            if len(documents) == 2 and documents['request_path'] != documents['result_path']:
+                raise WorkflowError('migrated request/result article sets differ')
+        for image in tables['images']:
+            article = articles.get(image['article_id'])
+            if article is None:
+                raise WorkflowError('migrated image article identity mismatch')
+            if image['image_candidate_id']:
+                candidate = next((row for row in tables['image_candidates'] if row['image_candidate_id'] == image['image_candidate_id']), None)
+                if candidate is None or candidate['article_id'] != image['article_id'] or candidate['batch_id'] != article['owning_batch_id']:
+                    raise WorkflowError('migrated image candidate identity mismatch')
+        # Generate/read dashboards only in a disposable clone. Existing canonical
+        # views remain byte-for-byte intact, and no states or publish trees advance.
+        with tempfile.TemporaryDirectory(prefix='newsroom-migration-validation-') as temporary:
+            clone = Newsroom(temporary)
+            clone.db_path.parent.mkdir()
+            with closing(room.db.connect()) as source, closing(clone.db.connect()) as destination:
+                source.backup(destination)
+            shutil.copytree(room.root / 'workspace', clone.root / 'workspace', ignore=shutil.ignore_patterns('.migration-staging-*'))
+            for batch in tables['batches']:
+                state = BatchWorkspace(clone).refresh(batch['batch_id'])
+                root = BatchWorkspace(clone).batch_root(batch['batch_id'])
+                if json.loads((root / 'batch-state.json').read_bytes()) != state or not (root / 'README.md').read_text().strip():
+                    raise WorkflowError('migrated dashboard validation failed')
+                actual_root = BatchWorkspace(room).batch_root(batch['batch_id'])
+                def dashboard_content(path: Path) -> str:
+                    return '\n'.join(line for line in path.read_text().splitlines() if not line.startswith('来源 CSV 副本：'))
+                if dashboard_content(actual_root / 'README.md') != dashboard_content(root / 'README.md'):
+                    raise WorkflowError('migrated dashboard differs from current database')
+            if (room.root / 'workspace/README.md').read_bytes() != (clone.root / 'workspace/README.md').read_bytes():
+                raise WorkflowError('migration root dashboard differs from current database')
+            for original in tables['articles']:
+                article = room.get_article(original['article_id'])
+                if article['status'] not in {'APPROVED', 'PUBLISHED'}:
+                    continue
+                if article['fact_check_outcome'] != 'PASS':
+                    raise WorkflowError('publication material requires current PASS fact-check')
+                package_article = {**article, 'status': 'APPROVED'}
+                image, sources = room._publication_materials(package_article)
+                package = Path(temporary) / 'packages' / article['article_id']
+                package.mkdir(parents=True)
+                room._write_publication_package(article, image, sources, package)
+                BatchReleaseWorkflow._validate_staged_package(package, article, image, sources)
+                owner = article['owning_batch_id']
+                existing = (BatchWorkspace(room).batch_root(owner) / 'publish' / article['article_id']) if owner else room.root / 'workspace/archive/legacy-single-articles' / article['article_id'] / 'publish'
+                if existing.is_dir():
+                    metadata = json.loads((existing / 'metadata.json').read_bytes())
+                    if metadata.get('article_id') != article['article_id'] or metadata.get('revision_number') != article['revision_number']:
+                        raise WorkflowError('existing package article/version identity mismatch')
+                    # Old package metadata paths legitimately precede migration;
+                    # content and identity must still represent the current version.
+                    for output, source in sources.items():
+                        filename = 'hero' + source.suffix.lower() if output == 'hero' else output
+                        if (existing / filename).read_bytes() != source.read_bytes():
+                            raise WorkflowError('existing package content differs from current material')
+                    license_metadata = json.loads((existing / 'image-license.json').read_bytes())
+                    if license_metadata.get('image_id') != image['image_id'] or license_metadata.get('article_id') != article['article_id']:
+                        raise WorkflowError('existing package image identity mismatch')
+                    if {key: value for key, value in license_metadata.items() if key not in {'image_path', 'prompt_path'}} != {key: value for key, value in image.items() if key not in {'image_path', 'prompt_path'}}:
+                        raise WorkflowError('existing package image rights differ from registered provenance')
+                    for filename in ('sources.md', 'publication-checklist.md'):
+                        if not (existing / filename).read_text().strip():
+                            raise WorkflowError('existing package missing required material')
+
+    def _journal(self, stage: str | None = None) -> None:
+        state = self._execution
+        if stage:
+            state['stage'] = stage
+            state['history'].append({'stage': stage, 'timestamp': datetime.now(timezone.utc).isoformat(timespec='seconds')})
+        _atomic_write(Path(state['journal_path']), _json_bytes(state).decode())
+
+    def _promote_workspace(self, stage: Path) -> None:
+        retained = stage / 'retained'
+        retained.mkdir()
+        for source in sorted((stage / 'workspace').iterdir()):
+            destination = self.workspace.root / source.name
+            operation = {'name': source.name, 'had_original': destination.exists()}
+            self._execution['promotions'].append(operation)
+            self._journal()  # Persist intent before either rename, including interruptions.
+            if operation['had_original']:
+                os.replace(destination, retained / source.name)
+            os.replace(source, destination)
+            self._journal()
+
+    def _verify_workspace(self, plan: MigrationPlan) -> None:
+        self._verify_hashes(plan, self.room.root)
+        for relative, expected_sha in self._execution['promoted_files'].items():
+            path = self.workspace.root / relative
+            _no_symlinks(path)
+            if not path.is_file() or _digest(path)[0] != expected_sha:
+                raise WorkflowError(f'promoted workspace hash mismatch: {relative}')
+        if self._database_fingerprint(self.room) != self._execution['expected_database']:
+            raise WorkflowError('migrated database does not match projected records')
+        self._validate_materials(self.room)
+
+    def _cleanup_originals(self, plan: MigrationPlan) -> None:
+        if self._execution['stage'] != 'VERIFIED':
+            raise WorkflowError('cleanup requires verified migration')
+        for entry in {entry.source: entry for entry in plan.entries}.values():
+            if entry.source.is_absolute() or entry.source == entry.target or entry.source.parts[0] not in {'research', 'articles', 'images', 'output'}:
+                continue
+            path = self._source(entry.source)
+            if _digest(path) != (entry.sha256, entry.size):
+                raise WorkflowError('migration original changed before cleanup')
+            self._execution['removed_sources'].append(entry.source.as_posix())
+            self._journal()
+            path.unlink()
+        for record in sorted(self._execution['directories'], key=lambda item: len(Path(item['path']).parts), reverse=True):
+            path = self.room.root / record['path']
+            if Path(record['path']).parts[0] in {'research', 'articles', 'images', 'output'} and path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+
+    def _remove_promoted(self, path: Path) -> None:
+        paths = list(path.rglob('*')) if path.is_dir() else [path]
+        for file in paths:
+            if file.is_symlink():
+                raise WorkflowError('recovery refuses an untracked symlink in promoted tree')
+            if file.is_file():
+                key = file.relative_to(self.workspace.root).as_posix()
+                if key not in self._execution['promoted_files']:
+                    raise WorkflowError('recovery refuses an untracked file in promoted tree')
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+
+    def _restore_database(self, backup: Path) -> None:
+        self.verify_backup(backup)
+        temporary = self.room.db_path.with_suffix('.migration-restore')
+        shutil.copy2(backup / 'newsroom.db', temporary)
+        for suffix in ('-wal', '-shm', '-journal'):
+            Path(str(self.room.db_path) + suffix).unlink(missing_ok=True)
+        os.replace(temporary, self.room.db_path)
+
+    def _restore_artifacts(self, plan: MigrationPlan, backup: Path, stage: Path) -> None:
+        for operation in reversed(self._execution['promotions']):
+            name = operation['name']
+            destination, previous = self.workspace.root / name, stage / 'retained' / name
+            # An intent can exist before the first rename. In that case the
+            # original destination is still intact and must not be replaced.
+            if (stage / 'workspace' / name).exists() and not previous.exists():
+                continue
+            if operation['had_original']:
+                relative = Path('workspace') / name
+                with tempfile.TemporaryDirectory(prefix='newsroom-artifact-recovery-', dir=self.room.root / 'data') as temporary:
+                    restored = Path(temporary) / name
+                    records = [record for record in self._execution['directories'] if Path(record['path']).is_relative_to(relative)]
+                    for record in records:
+                        path = Path(temporary) / Path(record['path']).relative_to('workspace')
+                        path.mkdir(parents=True, exist_ok=True)
+                        path.chmod(record['mode'])
+                    with tarfile.open(backup / 'artifacts.tar.gz', 'r:gz') as archive:
+                        originals = {entry.source: entry for entry in plan.entries if not entry.source.is_absolute() and entry.source.is_relative_to(relative)}
+                        for source, entry in originals.items():
+                            path = Path(temporary) / source.relative_to('workspace')
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            with archive.extractfile(self._archive_name(entry)) as archived, path.open('wb') as output:
+                                shutil.copyfileobj(archived, output)
+                            metadata = self._execution['source_stats'][source.as_posix()]
+                            path.chmod(metadata['mode'])
+                            os.utime(path, ns=(metadata['atime_ns'], metadata['mtime_ns']))
+                            if _digest(path) != (entry.sha256, entry.size):
+                                raise WorkflowError('recovery archive artifact hash mismatch')
+                    if not restored.exists():
+                        raise WorkflowError('recovery archive lacks original promoted tree')
+                    if destination.exists():
+                        self._remove_promoted(destination)
+                    os.replace(restored, destination)
+            elif destination.exists():
+                self._remove_promoted(destination)
+        removed = set(self._execution['removed_sources'])
+        with tarfile.open(backup / 'artifacts.tar.gz', 'r:gz') as archive:
+            for entry in {entry.source: entry for entry in plan.entries}.values():
+                if entry.source.as_posix() not in removed:
+                    continue
+                destination = self.room.root / entry.source
+                _no_symlinks(destination)
+                if destination.exists():
+                    if _digest(destination) != (entry.sha256, entry.size):
+                        raise WorkflowError('recovery refuses to overwrite changed original')
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.extractfile(self._archive_name(entry)) as source, destination.open('wb') as output:
+                    shutil.copyfileobj(source, output)
+                metadata = self._execution['source_stats'][entry.source.as_posix()]
+                destination.chmod(metadata['mode'])
+                os.utime(destination, ns=(metadata['atime_ns'], metadata['mtime_ns']))
+        for record in self._execution['directories']:
+            path = self.room.root / record['path']
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(record['mode'])
+        self._verify_originals(plan)
+
+    def _verify_originals(self, plan: MigrationPlan) -> None:
+        for entry in plan.entries:
+            if _digest(self._source(entry.source, external=entry.source.is_absolute())) != (entry.sha256, entry.size):
+                raise WorkflowError('recovery source hash mismatch')
+        with self._connect_readonly() as connection:
+            if _database(connection)[1] != plan.database_snapshot_sha256:
+                raise WorkflowError('recovery database does not match original snapshot')
+
+    def execute(self, plan: MigrationPlan, backup_dir: Path) -> dict[str, Any]:
+        """Execute only the exact verified plan; compensate all post-commit failures."""
+        self._pending_journals()
+        self._assert_unchanged(plan, inventory=True)
+        _no_symlinks(Path(backup_dir).absolute())
+        backup = Path(backup_dir).resolve()
+        self.verify_backup(backup)
+        manifest = json.loads((backup / 'manifest.json').read_bytes())
+        if manifest['plan'] != plan.to_dict():
+            raise WorkflowError('verified backup does not match migration plan')
+        manifest_sha = _digest(backup / 'manifest.json')[0]
+        if self.receipt_path.exists():
+            return self.execute_from_current_state()
+        directories = []
+        for name in ('research', 'articles', 'images', 'output', 'workspace'):
+            root = self.room.root / name
+            for path in ([root, *root.rglob('*')] if root.is_dir() else []):
+                if path.is_dir():
+                    metadata = path.stat()
+                    directories.append({'path': path.relative_to(self.room.root).as_posix(), 'mode': stat.S_IMODE(metadata.st_mode), 'mtime_ns': metadata.st_mtime_ns, 'atime_ns': metadata.st_atime_ns})
+        stats = {}
+        for entry in plan.entries:
+            metadata = self._source(entry.source, external=entry.source.is_absolute()).stat()
+            stats[entry.source.as_posix()] = {'mode': stat.S_IMODE(metadata.st_mode), 'mtime_ns': metadata.st_mtime_ns, 'atime_ns': metadata.st_atime_ns}
+        workspace_existed = self.workspace.root.exists()
+        self.workspace.root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+        stage = Path(tempfile.mkdtemp(prefix=f'.migration-staging-{stamp}-', dir=self.workspace.root))
+        journal = self.room.root / 'data/workspace-migration-journals' / (stage.name + '.json')
+        self._execution = {'schema_version': 1, 'stage': None, 'history': [], 'manifest_sha256': manifest_sha,
+                           'backup_path': str(backup), 'journal_path': str(journal), 'staging_path': str(stage),
+                           'database_updated': False, 'promotions': [], 'removed_sources': [],
+                           'directories': directories, 'source_stats': stats, 'promoted_files': {}}
+        try:
+            self._journal('BACKED_UP')
+            self._assert_unchanged(plan)  # Immediately before copying any sources.
+            self._stage_workspace(plan, backup, stage)
+            self._journal('STAGED')
+            # Full inventory cannot include our own staging/journal. Sources and
+            # DB are rehashed again immediately before the locked switch.
+            self._assert_unchanged(plan)
+            self._switch_database(plan)
+            self._journal('DATABASE_UPDATED')
+            self._promote_workspace(stage)
+            self._journal('PROMOTED')
+            self._verify_workspace(plan)
+            self._journal('VERIFIED')
+            self._cleanup_originals(plan)
+            receipt = {'schema_version': 1, 'manifest_sha256': manifest_sha, 'backup_path': str(backup), 'journal_path': str(journal)}
+            _atomic_write(self.receipt_path, _json_bytes(receipt).decode())
+            shutil.rmtree(stage)
+            self._journal('CLEANED')
+        except BaseException as original:
+            failures = [original]
+            self._execution['failure'] = {'type': type(original).__name__, 'message': str(original)}
+            if self._execution['database_updated']:
+                for recover in (lambda: self._restore_database(backup), lambda: self._restore_artifacts(plan, backup, stage), lambda: self.receipt_path.unlink(missing_ok=True)):
+                    try:
+                        recover()
+                    except BaseException as error:
+                        failures.append(error)
+            if len(failures) == 1:
+                try:
+                    if stage.exists():
+                        shutil.rmtree(stage)
+                    if not workspace_existed and not any(self.workspace.root.iterdir()):
+                        self.workspace.root.rmdir()
+                    for record in reversed(directories):
+                        path = self.room.root / record['path']
+                        _no_symlinks(path)
+                        path.chmod(record['mode'])
+                        os.utime(path, ns=(record['atime_ns'], record['mtime_ns']))
+                except BaseException as error:
+                    failures.append(error)
+            self._execution['recovery_status'] = 'ROLLED_BACK' if len(failures) == 1 else 'RECOVERY_REQUIRED'
+            self._execution['recovery_failures'] = [{'type': type(error).__name__, 'message': str(error)} for error in failures[1:]]
+            try:
+                self._journal()
+            except BaseException as error:
+                failures.append(error)
+            if len(failures) > 1:
+                raise BaseExceptionGroup('migration failed; recovery also failed; inspect migration journal', failures) from None
+            raise
+        return {'status': 'PASS', 'manifest_sha256': manifest_sha, 'journal_path': str(journal), 'backup_path': str(backup)}
+
+    def execute_from_current_state(self) -> dict[str, Any]:
+        """Never infer completion from paths/version alone or an unfinished journal."""
+        self._pending_journals()
+        if not self.receipt_path.exists():
+            raise WorkflowError('verified migration receipt required; run explicit preflight and execute with a verified backup')
+        try:
+            _no_symlinks(self.receipt_path)
+            receipt = json.loads(self.receipt_path.read_bytes())
+            backup = Path(receipt['backup_path'])
+            self.verify_backup(backup)
+            if receipt['schema_version'] != 1 or _digest(backup / 'manifest.json')[0] != receipt['manifest_sha256']:
+                raise ValueError('manifest mismatch')
+            journal_path = Path(receipt['journal_path'])
+            if not journal_path.resolve().is_relative_to(self.room.root / 'data/workspace-migration-journals'):
+                raise ValueError('journal escape')
+            _no_symlinks(journal_path)
+            journal = json.loads(journal_path.read_bytes())
+            if journal['stage'] != 'CLEANED' or journal['manifest_sha256'] != receipt['manifest_sha256'] or journal.get('recovery_status'):
+                raise ValueError('unfinished journal')
+            plan = MigrationPlan.from_dict(json.loads((backup / 'manifest.json').read_bytes())['plan'])
+        except (KeyError, ValueError, OSError) as error:
+            raise WorkflowError(f'invalid migration receipt; recovery required: {error}') from error
+        self._verify_hashes(plan, self.room.root, current_views=True)
+        with self._connect_readonly() as connection:
+            if any(row['workspace_version'] != 1 for row in _database(connection)[0]['batches']):
+                raise WorkflowError('migration receipt workspace version mismatch')
+        for entry in plan.entries:
+            if not entry.source.is_absolute() and entry.source != entry.target and entry.source.parts[0] in {'research', 'articles', 'images', 'output'} and (self.room.root / entry.source).exists():
+                raise WorkflowError('migration recovery required; original cleanup remains pending')
+        self._validate_materials(self.room)
+        return {'status': 'ALREADY_MIGRATED', 'manifest_sha256': receipt['manifest_sha256'], 'journal_path': str(journal_path), 'backup_path': str(backup)}

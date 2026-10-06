@@ -859,4 +859,4 @@ def test_batch_created_article_records_owning_batch(
     article = newsroom.get_article(prepared["items"][0]["article_id"])
     assert article["owning_batch_id"] == prepared["batch_id"]
     batch = newsroom.db.one("SELECT workspace_version FROM batches WHERE batch_id=?", (prepared["batch_id"],))
-    assert batch["workspace_version"] == 0
+    assert batch["workspace_version"] == 1

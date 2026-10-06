@@ -73,7 +73,7 @@ def test_refresh_rebuilds_views_from_database_and_does_not_mutate_state(prepared
     updated = workspace.refresh(batch_id)
     assert updated["items"][0]["error_message"] == "校验 | 失败\n重新检查"
     assert "重新检查" in (root / "README.md").read_text()
-    assert room.db.one("SELECT workspace_version FROM batches WHERE batch_id=?", (batch_id,))["workspace_version"] == 0
+    assert room.db.one("SELECT workspace_version FROM batches WHERE batch_id=?", (batch_id,))["workspace_version"] == 1
     assert not list(root.glob("*.tmp"))
 
 
@@ -200,3 +200,25 @@ def test_readonly_snapshot_does_not_create_missing_workspace(prepared_batch):
     assert state == expected
     assert not (room.root / 'workspace').exists()
     assert {table: room.db.all(f'SELECT * FROM {table}') for table in before_db} == before_db
+
+
+def test_root_migration_launcher_bootstraps_after_relocation(prepared_batch, tmp_path):
+    room, _ = prepared_batch
+    BatchWorkspace(room).install_root_actions()
+    source = room.root / 'workspace/Migrate Newsroom.command'
+    assert source.is_file() and os.access(source, os.X_OK)
+    assert 'rm ' not in source.read_text()
+    assert subprocess.run(['zsh', '-n', str(source)], capture_output=True).returncode == 0
+    relocated = tmp_path / 'relocated newsroom'
+    relocated.mkdir()
+    (relocated / 'pyproject.toml').write_text('[project]\nname="relocated"\n')
+    (relocated / 'workspace').mkdir()
+    script = relocated / 'workspace/Migrate Newsroom.command'
+    shutil.copy2(source, script)
+    bin_dir = tmp_path / 'migration-bin'
+    bin_dir.mkdir()
+    uv = bin_dir / 'uv'
+    uv.write_text('#!/bin/zsh\nprintf "%s\\n" "$@"\n')
+    uv.chmod(0o755)
+    result = subprocess.run(['zsh', str(script)], cwd=tmp_path, env={**os.environ, 'PATH': f"{bin_dir}:{os.environ['PATH']}"}, capture_output=True, text=True, check=True)
+    assert result.stdout.splitlines() == ['run', '--project', str(relocated), 'newsroom', '--root', str(relocated), 'macos-migrate']
