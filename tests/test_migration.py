@@ -2636,3 +2636,85 @@ def test_final_inventory_cannot_accept_changed_bytes_between_verification_and_sc
     assert changed
     assert not service.receipt_path.exists()
     assert any(path.read_bytes() == b'editor write immediately before inventory' for path in f.room.root.rglob('article-v2.md'))
+
+
+@pytest.mark.parametrize('damage', ['readme', 'state', 'candidates', 'old_paths', 'missing'])
+def test_mixed_migration_regenerates_disposable_views_before_validation(legacy_workspace, monkeypatch, damage):
+    from newsroom.workspace import BatchWorkspace
+    f = legacy_workspace
+    canonical_batch = prepare_existing_canonical(f)
+    workspace = BatchWorkspace(f.room)
+    canonical_article = f.room.db.one('SELECT article_id FROM articles WHERE owning_batch_id=?', (canonical_batch,))['article_id']
+    root = workspace.batch_root(canonical_batch)
+    views = [f.room.root / 'workspace/README.md', root / 'README.md', root / 'batch-state.json',
+             workspace.article_root(canonical_batch, canonical_article) / 'image-candidates.json']
+    affected = {'readme': views[:2], 'state': views[2:3], 'candidates': views[3:], 'old_paths': views, 'missing': views}[damage]
+    for path in affected:
+        if damage == 'missing':
+            path.unlink()
+        elif path.name == 'batch-state.json':
+            state = json.loads(path.read_bytes())
+            state['requests'][0]['request_path'] = '../../../../output/batches/old-request.json'
+            state['workspace_version'] = 0
+            path.write_text(json.dumps(state))
+        elif path.name == 'image-candidates.json':
+            path.write_text('[{"article_id":"art-old","landing_page_url":"https://obsolete.example/image"}]')
+        else:
+            path.write_text('# obsolete view\n[Old material](../../../articles/old/article-v1.md)\n')
+    original = {path.relative_to(f.room.root).as_posix(): path.read_bytes() for path in affected if path.exists()}
+    service = migrator(f.room)
+    plan = service.preflight()
+    assert plan.blocking_errors == []
+    backup = service.backup(plan)
+    staged = {}
+    real_stage = service._stage_workspace
+    def stage_and_capture(plan, backup, stage):
+        real_stage(plan, backup, stage)
+        staged.update({path.relative_to(stage).as_posix(): path.read_bytes() for path in (stage / 'workspace').rglob('*')
+                       if path.name in {'README.md', 'batch-state.json', 'image-candidates.json'}})
+    monkeypatch.setattr(service, '_stage_workspace', stage_and_capture)
+    result = service.execute(plan, backup)
+    assert result['status'] == 'PASS'
+    assert staged
+    for relative, content in staged.items():
+        assert (f.room.root / relative).read_bytes() == content
+    for batch_id in (f.batch_id, canonical_batch):
+        batch = workspace.batch_root(batch_id)
+        state = json.loads((batch / 'batch-state.json').read_bytes())
+        assert state['workspace_version'] == 1
+        assert state['requests'][0]['request_path'] == 'claude/requests/content-request.json'
+        assert 'claude/requests/content-request.json' in (batch / 'README.md').read_text()
+    assert json.loads(views[3].read_bytes()) == []
+    rendered = {relative: (f.room.root / relative).read_bytes() for relative in staged}
+    for batch_id in (f.batch_id, canonical_batch):
+        workspace.refresh(batch_id)
+    assert {relative: (f.room.root / relative).read_bytes() for relative in staged} == rendered
+    journal = json.loads(Path(result['journal_path']).read_bytes())
+    retained = Path(journal['retired_stages'][0]['path']) / 'retained'
+    for relative, content in original.items():
+        assert (retained / Path(relative).relative_to('workspace')).read_bytes() == content
+    assert migrator(f.room).execute_from_current_state()['status'] == 'ALREADY_MIGRATED'
+
+
+@pytest.mark.parametrize('input_kind', ['source_metadata', 'handoff'])
+def test_staging_view_refresh_does_not_repair_invalid_canonical_inputs(legacy_workspace, input_kind):
+    f = legacy_workspace
+    canonical_batch = prepare_existing_canonical(f)
+    if input_kind == 'source_metadata':
+        path = f.room.root / 'workspace/batches' / canonical_batch / 'input/source-metadata.json'
+        document = json.loads(path.read_bytes())
+        document['source_sha256'] = 'incorrect canonical source identity'
+    else:
+        request = f.room.db.one('SELECT request_path FROM batch_requests WHERE batch_id=?', (canonical_batch,))
+        path = f.room.root / request['request_path']
+        document = json.loads(path.read_bytes())
+        document['batch_id'] = 'batch-wrong'
+    path.write_text(json.dumps(document))
+    before = artifact_snapshot(f.room)
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    with pytest.raises(WorkflowError):
+        service.execute(plan, backup)
+    assert artifact_snapshot(f.room) == before
+    assert not service.receipt_path.exists()

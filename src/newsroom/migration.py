@@ -186,6 +186,23 @@ def _walk_error(error: OSError) -> None:
     raise error
 
 
+def _generated_workspace_artifact(path: Path) -> bool:
+    """Only fixed renderer outputs; canonical inputs never qualify."""
+    if path in {Path('workspace/README.md'), Path('workspace/Migrate Newsroom.command')}:
+        return True
+    parts = path.parts
+    if parts[:2] != ('workspace', 'batches'):
+        return False
+    if len(parts) == 4:
+        return parts[3] in {'README.md', 'batch-state.json', 'OPEN_BATCH.command'}
+    if len(parts) == 5 and parts[3] == 'actions':
+        return parts[4] in {filename for filename, _ in BATCH_ACTIONS}
+    if len(parts) == 6:
+        return ((parts[3] == 'articles' and parts[5] == 'image-candidates.json')
+                or parts[3:] == ('claude', 'inbox', '将Claude返回的JSON放在这里.txt'))
+    return False
+
+
 def _database(connection: sqlite3.Connection) -> tuple[dict[str, list[dict[str, Any]]], str]:
     if [row[0] for row in connection.execute("PRAGMA integrity_check")] != ["ok"]:
         raise WorkflowError("database integrity check failed")
@@ -859,9 +876,11 @@ class WorkspaceMigrator:
                     raise BaseExceptionGroup('database switch and connection rollback failed', [original, rollback_error]) from None
                 raise
 
-    def _verify_hashes(self, plan: MigrationPlan, root: Path) -> None:
+    def _verify_hashes(self, plan: MigrationPlan, root: Path, *, regenerated_views: bool = False) -> None:
         for entry in plan.entries:
             _safe_relative(entry.target)
+            if regenerated_views and entry.database_field is None and _generated_workspace_artifact(entry.target):
+                continue  # Renderer/material validation verifies current outputs.
             path = root / entry.target
             _no_symlinks(path)
             if not path.resolve().is_relative_to(root) or not path.is_file():
@@ -890,10 +909,11 @@ class WorkspaceMigrator:
             # Existing canonical metadata is retained byte for byte.
             if not path.exists():
                 _atomic_write(path, _json_bytes(metadata).decode())
-            if not (workspace.batch_root(batch_id) / 'batch-state.json').exists():
-                workspace.refresh(batch_id)
+            # Source views can be missing/stale or refer to old artifact paths.
+            # Every disposable view/launcher is rendered from projected SQLite.
+            workspace.refresh(batch_id)
         workspace.install_root_actions()
-        self._verify_hashes(plan, stage)
+        self._verify_hashes(plan, stage, regenerated_views=True)
         self._validate_materials(staged_room)
         self._execution['expected_database'] = self._database_fingerprint(staged_room)
         self._execution['promoted_files'] = {
@@ -1158,7 +1178,7 @@ class WorkspaceMigrator:
             self._journal()
 
     def _verify_workspace(self, plan: MigrationPlan) -> None:
-        self._verify_hashes(plan, self.room.root)
+        self._verify_hashes(plan, self.room.root, regenerated_views=True)
         for relative, expected_sha in self._execution['promoted_files'].items():
             path = self.workspace.root / relative
             _no_symlinks(path)
