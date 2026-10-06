@@ -37,16 +37,19 @@ def root_callback(
     root: Annotated[Path, typer.Option(help="Newsroom workspace root")] = Path.cwd(),
 ) -> None:
     ctx.meta["migration_access_bypass"] = ctx.invoked_subcommand in {"workspace", "macos-migrate"}
-    if not ctx.meta["migration_access_bypass"]:
-        _run(lambda: ctx.with_resource(operation_lock(root)))
-    ctx.obj = Newsroom(root)
+    ctx.meta['newsroom_root'] = root
 
 
 def _room(ctx: typer.Context) -> Newsroom:
-    room = ctx.ensure_object(Newsroom)
     if not ctx.meta.get("migration_access_bypass"):
-        _run(lambda: assert_migration_access(room.root))
-    return room
+        if not ctx.meta.get('operation_lock_held'):
+            _run(lambda: ctx.find_root().with_resource(operation_lock(ctx.meta['newsroom_root'])))
+            ctx.meta['operation_lock_held'] = True
+        _run(lambda: assert_migration_access(ctx.meta['newsroom_root']))
+    root_context = ctx.find_root()
+    if root_context.obj is None:
+        root_context.obj = Newsroom(ctx.meta['newsroom_root'])
+    return root_context.obj
 
 
 def _json(value: object) -> None:

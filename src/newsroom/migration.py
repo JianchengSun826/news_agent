@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import closing, contextmanager
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import gzip
@@ -31,13 +32,48 @@ from .workspace import (
 
 
 def assert_migration_access(root: Path | str) -> None:
-    """Block normal CLI/Finder access before constructing or using a newsroom."""
-    barrier = Path(root).resolve() / 'data/workspace-migration-lock.json'
-    if barrier.exists() or barrier.is_symlink():
+    """Read-only, fail-closed admission using barrier and terminal journals."""
+    root = Path(root).resolve()
+    barrier = root / 'data/workspace-migration-lock.json'
+    try:
+        barrier.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise WorkflowError('migration barrier unreadable; recovery required') from error
+    else:
         raise WorkflowError(
             'migration access barrier active; recovery required: inspect '
             'data/workspace-migration-journals and the verified backup before using normal commands'
         )
+    directory = root / 'data/workspace-migration-journals'
+    try:
+        metadata = directory.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise WorkflowError('migration journals unreadable; recovery required') from error
+    try:
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError('journal directory is unsafe')
+        for path in sorted(directory.iterdir()):
+            _no_symlinks(path)
+            if path.suffix != '.json' or not path.is_file():
+                raise ValueError('unexpected journal entry')
+            journal = json.loads(path.read_bytes())
+            if journal['schema_version'] != 1 or Path(journal['journal_path']) != path or not isinstance(journal['history'], list):
+                raise ValueError('invalid journal identity')
+            if (journal.get('recovery_status') == 'ROLLED_BACK'
+                    and journal.get('rollback_verified') is True
+                    and journal.get('access_released') is True
+                    and not journal.get('recovery_failures')
+                    and journal.get('finalization_status') in {None, 'COMMITTED'}):
+                continue
+            if journal.get('recovery_status') or journal['stage'] != 'CLEANED' or journal.get('finalization_status') != 'COMMITTED' or journal.get('access_released') is not True:
+                raise ValueError('migration is unresolved')
+            WorkspaceMigrator(Newsroom(root))._validate_completed_receipt(expected_journal=path)
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error, WorkflowError) as error:
+        raise WorkflowError(f'migration journal unresolved or invalid; recovery required: {error}; inspect data/workspace-migration-journals and verified backup') from error
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -541,7 +577,7 @@ class WorkspaceMigrator:
                 continue
             try:
                 if child.is_dir() and not child.is_symlink():
-                    shutil.rmtree(child)
+                    child.rmdir()  # Never recursively delete an editor-added tree.
                 else:
                     child.unlink()
             except BaseException as error:
@@ -991,10 +1027,13 @@ class WorkspaceMigrator:
 
     def _journal(self, stage: str | None = None) -> None:
         state = self._execution
+        candidate = deepcopy(state)
         if stage:
-            state['stage'] = stage
-            state['history'].append({'stage': stage, 'timestamp': datetime.now(timezone.utc).isoformat(timespec='seconds')})
-        _durable_json(Path(state['journal_path']), state)
+            candidate['stage'] = stage
+            candidate['history'].append({'stage': stage, 'timestamp': datetime.now(timezone.utc).isoformat(timespec='seconds')})
+        _durable_json(Path(candidate['journal_path']), candidate)
+        state.clear()
+        state.update(candidate)
 
     def _verify_retained(self, plan: MigrationPlan, stage: Path) -> None:
         """Detect additions, symlinks and changed original bytes before retirement."""
@@ -1074,7 +1113,26 @@ class WorkspaceMigrator:
                 path.rmdir()
 
     def _remove_promoted(self, path: Path) -> None:
-        relative = path.relative_to(self.workspace.root)
+        scan_error = None
+        try:
+            changed = not self._promoted_matches(path)
+        except OSError as error:
+            changed = True
+            scan_error = {'type': type(error).__name__, 'message': str(error)}
+        record = self._preserve_tree(path, 'quarantined_promotions', 'promoted')
+        # Compare after the atomic move too. Nothing will ever be deleted on
+        # either side of this check, including writes that race with scanning.
+        try:
+            record['changed'] = changed or not self._promoted_matches(Path(record['path']), relative=path.relative_to(self.workspace.root))
+        except OSError as error:
+            record['changed'] = True
+            scan_error = {'type': type(error).__name__, 'message': str(error)}
+        if scan_error:
+            record['scan_error'] = scan_error
+        self._journal()
+
+    def _promoted_matches(self, path: Path, *, relative: Path | None = None) -> bool:
+        relative = relative or path.relative_to(self.workspace.root)
         expected_files = {name: digest for name, digest in self._execution['promoted_files'].items()
                           if Path(name).is_relative_to(relative)}
         expected_directories = {name for name in self._execution['promoted_directories']
@@ -1083,7 +1141,7 @@ class WorkspaceMigrator:
         changed = False
         paths = [path, *path.rglob('*')] if path.is_dir() and not path.is_symlink() else [path]
         for file in paths:
-            key = file.relative_to(self.workspace.root).as_posix()
+            key = (relative / file.relative_to(path)).as_posix()
             mode = file.lstat().st_mode
             if stat.S_ISREG(mode):
                 actual_files[key] = _digest(file)[0]
@@ -1091,24 +1149,41 @@ class WorkspaceMigrator:
                 actual_directories.add(key)
             else:
                 changed = True
-        if changed or actual_files != expected_files or actual_directories != expected_directories:
-            recovery = self.room.root / 'data/workspace-migration-recovery' / Path(self._execution['journal_path']).stem
-            _no_symlinks(recovery)
-            recovery.mkdir(parents=True, exist_ok=True)
-            destination = recovery / path.name
-            if destination.exists() or destination.is_symlink():
-                raise WorkflowError('recovery quarantine already exists; originals and changed content retained')
-            record = {'source': str(path), 'path': str(destination), 'status': 'PLANNED'}
-            self._execution.setdefault('quarantined_promotions', []).append(record)
-            self._journal()  # Bind the atomic move to its recovery journal first.
-            os.replace(path, destination)
-            record['status'] = 'PRESERVED'
-            self._journal()
-            return
-        if path.is_dir():
-            shutil.rmtree(path)
-        elif path.exists():
-            path.unlink()
+        return not changed and actual_files == expected_files and actual_directories == expected_directories
+
+    def _recovery_root(self) -> Path:
+        recovery = self.room.root / 'data/workspace-migration-recovery' / Path(self._execution['journal_path']).stem
+        _no_symlinks(recovery)
+        recovery.mkdir(parents=True, exist_ok=True)
+        return recovery
+
+    def _preserve_tree(self, path: Path, field: str, kind: str) -> dict[str, Any]:
+        container = Path(tempfile.mkdtemp(prefix=kind + '-', dir=self._recovery_root()))
+        destination = container / path.name
+        record = {'source': str(path), 'path': str(destination), 'status': 'PLANNED'}
+        self._execution.setdefault(field, []).append(record)
+        index = len(self._execution[field]) - 1
+        self._journal()
+        os.replace(path, destination)
+        record = self._execution[field][index]
+        record['status'] = 'PRESERVED'
+        self._journal()
+        return self._execution[field][index]
+
+    @contextmanager
+    def _reconstruction_directory(self) -> Iterator[str]:
+        path = tempfile.mkdtemp(prefix='reconstruction-', dir=self._recovery_root())
+        self._execution.setdefault('reconstruction_paths', []).append(path)
+        self._journal()
+        yield path  # Preserve the entire recovery scratch tree on every exit.
+
+    def _retained_stage(self, stage: Path) -> Path:
+        if stage.exists():
+            return stage
+        for record in reversed(self._execution.get('retired_stages', [])):
+            if Path(record['path']).exists():
+                return Path(record['path'])
+        return stage
 
     def _restore_database(self, backup: Path) -> None:
         self.verify_backup(backup)
@@ -1119,6 +1194,7 @@ class WorkspaceMigrator:
         os.replace(temporary, self.room.db_path)
 
     def _restore_artifacts(self, plan: MigrationPlan, backup: Path, stage: Path) -> None:
+        stage = self._retained_stage(stage)
         for operation in reversed(self._execution['promotions']):
             name = operation['name']
             destination, previous = self.workspace.root / name, stage / 'retained' / name
@@ -1149,7 +1225,7 @@ class WorkspaceMigrator:
                     os.replace(previous, destination)
                     continue
 
-                with tempfile.TemporaryDirectory(prefix='newsroom-artifact-recovery-', dir=self.room.root / 'data') as temporary:
+                with self._reconstruction_directory() as temporary:
                     restored = Path(temporary) / name
                     records = [record for record in self._execution['directories'] if Path(record['path']).is_relative_to(relative)]
                     for record in records:
@@ -1261,14 +1337,27 @@ class WorkspaceMigrator:
             self._verify_workspace(plan)
             self._journal('VERIFIED')
             self._cleanup_originals(plan)
-            receipt = {'schema_version': 1, 'manifest_sha256': manifest_sha, 'backup_path': str(backup), 'journal_path': str(journal)}
-            _durable_json(self.receipt_path, receipt)
             self._verify_retained(plan, stage)
-            shutil.rmtree(stage)
+            retired = self._preserve_tree(stage, 'retired_stages', 'retired')
+            self._verify_retained(plan, Path(retired['path']))
+            receipt = {'schema_version': 1, 'manifest_sha256': manifest_sha, 'backup_path': str(backup), 'journal_path': str(journal), 'retired_paths': [record['path'] for record in self._execution['retired_stages']]}
+            _durable_json(self.receipt_path, receipt)
             self._journal('CLEANED')
             self._release_barrier()
+            self._execution['access_released'] = True
+            self._execution['finalization_status'] = 'COMMITTED'
+            self._journal()
         except BaseException as original:
-            if self._execution['stage'] == 'CLEANED':
+            persisted_cleaned = self._execution['stage'] == 'CLEANED'
+            try:
+                persisted = json.loads(journal.read_bytes())
+                persisted_cleaned = persisted_cleaned or persisted['stage'] == 'CLEANED'
+                if persisted['stage'] == 'CLEANED':
+                    self._execution.clear()
+                    self._execution.update(persisted)
+            except (OSError, ValueError, KeyError):
+                pass
+            if persisted_cleaned:
                 # Receipt and cleanup are the commit point. Finalization cannot
                 # revert them, even if unlink completed before raising.
                 return self._finalize_committed(plan, receipt, original)
@@ -1283,7 +1372,7 @@ class WorkspaceMigrator:
             if len(failures) == 1:
                 try:
                     if stage.exists():
-                        shutil.rmtree(stage)
+                        self._preserve_tree(stage, 'retired_stages', 'rollback-staging')
                     if not workspace_existed and not any(self.workspace.root.iterdir()):
                         self.workspace.root.rmdir()
                     for record in reversed(directories):
@@ -1295,14 +1384,17 @@ class WorkspaceMigrator:
                         os.utime(path, ns=(record['atime_ns'], record['mtime_ns']))
                 except BaseException as error:
                     failures.append(error)
-            if self._execution.get('quarantined_promotions'):
+            if any(record.get('changed') for record in self._execution.get('quarantined_promotions', [])):
                 failures.append(WorkflowError('changed promoted content preserved in migration recovery quarantine; recovery required'))
             self._execution['recovery_status'] = 'ROLLED_BACK' if len(failures) == 1 else 'RECOVERY_REQUIRED'
+            self._execution['rollback_verified'] = len(failures) == 1
             self._execution['recovery_failures'] = [{'type': type(error).__name__, 'message': str(error)} for error in failures[1:]]
             try:
                 self._journal()
                 if len(failures) == 1:
                     self._release_barrier()  # Only after a recorded completed rollback.
+                    self._execution['access_released'] = True
+                    self._journal()
             except BaseException as error:
                 failures.append(error)
                 self._execution['recovery_status'] = 'RECOVERY_REQUIRED'
@@ -1346,6 +1438,7 @@ class WorkspaceMigrator:
             except BaseException as error:
                 diagnostics.append(error)
         state['finalization_status'] = 'COMMITTED' if verified and absent else 'RECOVERY_REQUIRED'
+        state['access_released'] = verified and absent
         state['barrier_acquired'] = not absent
         state['finalization_failures'] = [{'type': type(error).__name__, 'message': str(error)} for error in diagnostics]
         try:
@@ -1360,6 +1453,9 @@ class WorkspaceMigrator:
     def execute_from_current_state(self) -> dict[str, Any]:
         """Never infer completion from paths/version alone or an unfinished journal."""
         self._pending_journals()
+        return self._validate_completed_receipt()
+
+    def _validate_completed_receipt(self, *, expected_journal: Path | None = None) -> dict[str, Any]:
         if not self.receipt_path.exists():
             raise WorkflowError('verified migration receipt required; run explicit preflight and execute with a verified backup')
         try:
@@ -1370,12 +1466,23 @@ class WorkspaceMigrator:
             if receipt['schema_version'] != 1 or _digest(backup / 'manifest.json')[0] != receipt['manifest_sha256']:
                 raise ValueError('manifest mismatch')
             journal_path = Path(receipt['journal_path'])
+            if expected_journal is not None and journal_path != expected_journal:
+                raise ValueError('receipt/journal mismatch')
             if not journal_path.resolve().is_relative_to(self.room.root / 'data/workspace-migration-journals'):
                 raise ValueError('journal escape')
             _no_symlinks(journal_path)
             journal = json.loads(journal_path.read_bytes())
-            if journal['stage'] != 'CLEANED' or journal['manifest_sha256'] != receipt['manifest_sha256'] or journal.get('recovery_status'):
+            if journal['stage'] != 'CLEANED' or journal['manifest_sha256'] != receipt['manifest_sha256'] or journal.get('recovery_status') or journal.get('access_released') is not True or journal.get('finalization_status') != 'COMMITTED':
                 raise ValueError('unfinished journal')
+            retired = [record['path'] for record in journal['retired_stages'] if record['status'] == 'PRESERVED']
+            if receipt['retired_paths'] != retired or not retired:
+                raise ValueError('receipt retired tree inventory mismatch')
+            recovery = self.room.root / 'data/workspace-migration-recovery' / journal_path.stem
+            for value in retired:
+                path = Path(value)
+                _no_symlinks(path)
+                if not path.is_relative_to(recovery) or not path.is_dir():
+                    raise ValueError('receipt retired tree unavailable or unsafe')
             plan = MigrationPlan.from_dict(json.loads((backup / 'manifest.json').read_bytes())['plan'])
         except (KeyError, ValueError, OSError) as error:
             raise WorkflowError(f'invalid migration receipt; recovery required: {error}') from error
@@ -1386,5 +1493,14 @@ class WorkspaceMigrator:
         for entry in plan.entries:
             if not entry.source.is_absolute() and entry.source != entry.target and entry.source.parts[0] in {'research', 'articles', 'images', 'output'} and (self.room.root / entry.source).exists():
                 raise WorkflowError('migration recovery required; original cleanup remains pending')
-        self._validate_materials(self.room)
+        # Material validation uses a copied SQLite database, never creating
+        # canonical WAL/SHM or changing the workspace during admission.
+        from .db import Database
+        with self._connect_readonly() as source, tempfile.TemporaryDirectory(prefix='newsroom-access-validation-') as temporary:
+            copied = Path(temporary) / 'newsroom.db'
+            with closing(sqlite3.connect(copied)) as destination:
+                source.backup(destination)
+            room = Newsroom(self.room.root)
+            room.db_path, room.db = copied, Database(copied)
+            self._validate_materials(room)
         return {'status': 'ALREADY_MIGRATED', 'manifest_sha256': receipt['manifest_sha256'], 'journal_path': str(journal_path), 'backup_path': str(backup)}

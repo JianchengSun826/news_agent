@@ -480,7 +480,7 @@ def test_preflight_selected_csv_symlink_is_not_hidden_by_normalization(legacy_wo
 def test_backup_cleanup_failure_marks_incomplete(legacy_workspace, monkeypatch):
     f = legacy_workspace
     service = migrator(f.room)
-    real_remove = shutil.rmtree
+    real_remove = Path.rmdir
     def reject_backup_removal(path, *args, **kwargs):
         if Path(path).name == 'blocked-child':
             raise OSError('backup removal unavailable')
@@ -488,7 +488,7 @@ def test_backup_cleanup_failure_marks_incomplete(legacy_workspace, monkeypatch):
     def fail_verification(path):
         (path / 'blocked-child').mkdir()
         raise WorkflowError('backup verification failed: injected corruption')
-    monkeypatch.setattr('newsroom.migration.shutil.rmtree', reject_backup_removal)
+    monkeypatch.setattr(Path, 'rmdir', reject_backup_removal)
     monkeypatch.setattr(service, '_verify_backup_contents', fail_verification)
     with pytest.raises(ExceptionGroup) as captured:
         service.backup(service.preflight())
@@ -713,7 +713,7 @@ def test_backup_preserves_interrupt_cleanup_without_rewriting_marker(legacy_work
     original = KeyboardInterrupt('original verification interruption')
     cleanup = OSError('backup directory removal unavailable')
     marker = OSError('incomplete marker update unavailable')
-    real_remove = shutil.rmtree
+    real_remove = Path.rmdir
     real_write = Path.write_text
     marker_writes = []
     def interrupt(path):
@@ -730,7 +730,7 @@ def test_backup_preserves_interrupt_cleanup_without_rewriting_marker(legacy_work
                 raise marker
         return real_write(path, *args, **kwargs)
     monkeypatch.setattr(service, '_verify_backup_contents', interrupt)
-    monkeypatch.setattr('newsroom.migration.shutil.rmtree', fail_removal)
+    monkeypatch.setattr(Path, 'rmdir', fail_removal)
     monkeypatch.setattr(Path, 'write_text', fail_marker_update)
     with pytest.raises(BaseException) as captured:
         service.backup(plan)
@@ -1048,17 +1048,17 @@ def test_execute_retained_tree_retirement_failure_restores_from_archive(legacy_w
     plan = service.preflight()
     backup = service.backup(plan)
     before = artifact_snapshot(f.room)
-    real_remove = shutil.rmtree
+    real_replace = os.replace
     original = error_type('retirement interrupted after deletion')
     seen = []
-    def partial_retirement(path, *args, **kwargs):
-        path = Path(path)
-        if path.name.startswith('.migration-staging-') and not seen:
+    def partial_retirement(source, destination):
+        real_replace(source, destination)
+        path = Path(destination)
+        if Path(source).name.startswith('.migration-staging-') and path.is_relative_to(f.room.root / 'data/workspace-migration-recovery') and not seen:
             seen.append(path)
-            real_remove(path / 'retained')
+            shutil.rmtree(path / 'retained')
             raise original
-        return real_remove(path, *args, **kwargs)
-    monkeypatch.setattr('newsroom.migration.shutil.rmtree', partial_retirement)
+    monkeypatch.setattr('newsroom.migration.os.replace', partial_retirement)
     with pytest.raises(BaseException) as captured:
         service.execute(plan, backup)
     assert original in list(exception_tree(captured.value))
@@ -1825,7 +1825,7 @@ def test_migration_exclusive_lock_refuses_new_actions_before_persistent_barrier(
         with monkeypatch.context() as patch:
             patch.setattr('newsroom.cli.Newsroom', lambda *_: pytest.fail('normal action accessed Newsroom during migration'))
             result = CliRunner().invoke(app, ['--root', str(f.room.root), 'batch', 'status', f.batch_id])
-            assert result.exit_code == 2 and 'migration operation active' in result.output, result.output
+            assert result.exit_code == 2 and ('migration operation active' in result.output or 'recovery' in result.output), result.output
         dialogs = FakeDialogs()
         controller = MacOSBatchController(f.room, dialogs)
         with monkeypatch.context() as patch:
@@ -1896,3 +1896,265 @@ def test_unverifiable_committed_receipt_reinstates_barrier_without_rollback(lega
     assert journal['stage'] == 'CLEANED' and journal['finalization_status'] == 'RECOVERY_REQUIRED'
     result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
     assert result.exit_code == 2 and 'recovery' in result.output.lower()
+
+
+def test_nested_help_leaves_empty_root_unchanged(tmp_path):
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    result = CliRunner().invoke(app, ['--root', str(empty), 'batch', 'status', '--help'])
+    assert result.exit_code == 0, result.output
+    assert list(empty.iterdir()) == []
+
+
+@pytest.mark.parametrize('state', ['DATABASE_UPDATED', 'CLEANED', 'corrupt', 'unreadable', 'failed_rollback'])
+def test_ordinary_access_blocks_unresolved_journal_without_barrier(legacy_workspace, monkeypatch, state):
+    from newsroom.macos import MacOSBatchController
+    from test_macos import FakeDialogs
+    f = legacy_workspace
+    directory = f.room.root / 'data/workspace-migration-journals'
+    directory.mkdir()
+    journal = directory / 'interrupted.json'
+    value = {'schema_version': 1, 'stage': state, 'history': [], 'journal_path': str(journal)}
+    if state == 'failed_rollback':
+        value.update(recovery_status='RECOVERY_REQUIRED', stage='VERIFIED')
+    journal.write_bytes(b'{' if state == 'corrupt' else json.dumps(value).encode())
+    original_read = Path.read_bytes
+    if state == 'unreadable':
+        def unreadable(path):
+            if path == journal:
+                raise OSError('journal unavailable')
+            return original_read(path)
+        monkeypatch.setattr(Path, 'read_bytes', unreadable)
+    before = {path: original_read(path) for path in f.room.root.rglob('*') if path.is_file()}
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'recovery' in result.output.lower(), result.output
+    dialogs = FakeDialogs()
+    assert MacOSBatchController(f.room, dialogs).run(f.batch_id, 'approve') == 2
+    assert not dialogs.confirmations
+    assert {path: original_read(path) for path in f.room.root.rglob('*') if path.is_file()} == before
+
+
+def test_journal_stage_and_history_change_only_after_durable_write(legacy_workspace, monkeypatch):
+    from copy import deepcopy
+    service = migrator(legacy_workspace.room)
+    service._execution = {'stage': 'VERIFIED', 'history': [{'stage': 'VERIFIED'}], 'journal_path': str(legacy_workspace.room.root / 'data/journal.json')}
+    before = deepcopy(service._execution)
+    def fail_write(*args):
+        raise OSError('journal replacement did not happen')
+    monkeypatch.setattr('newsroom.migration._durable_json', fail_write)
+    with pytest.raises(OSError):
+        service._journal('CLEANED')
+    assert service._execution == before
+
+
+@pytest.mark.parametrize('persisted', [False, True])
+def test_uncertain_cleaned_write_uses_persisted_state(legacy_workspace, monkeypatch, persisted):
+    import newsroom.migration as migration
+    f = legacy_workspace
+    prepare_existing_canonical(f)
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before = artifact_snapshot(f.room)
+    original = KeyboardInterrupt('CLEANED write interrupted')
+    durable = migration._durable_json
+    interrupted = False
+    def fail_cleaned(path, value):
+        nonlocal interrupted
+        if value.get('stage') == 'CLEANED' and not interrupted:
+            interrupted = True
+            if persisted:
+                durable(path, value)
+            raise original
+        return durable(path, value)
+    monkeypatch.setattr(migration, '_durable_json', fail_cleaned)
+    with pytest.raises(BaseException) as captured:
+        service.execute(plan, backup)
+    assert original in list(exception_tree(captured.value))
+    journal = json.loads(next((f.room.root / 'data/workspace-migration-journals').glob('*.json')).read_bytes())
+    if persisted:
+        assert journal['stage'] == 'CLEANED'
+        assert f.room.get_article(f.article_id)['draft_path'].startswith('workspace/')
+        assert service.receipt_path.exists()
+    else:
+        assert journal['stage'] != 'CLEANED'
+        assert journal['recovery_status'] == 'ROLLED_BACK'
+        assert artifact_snapshot(f.room) == before
+        assert f.room.db_path.read_bytes() == (backup / 'newsroom.db').read_bytes()
+        assert not service.receipt_path.exists()
+
+
+@pytest.mark.parametrize('boundary', ['rollback', 'retirement'])
+def test_write_at_tree_retirement_boundary_is_preserved(legacy_workspace, monkeypatch, boundary):
+    f = legacy_workspace
+    batch = prepare_existing_canonical(f)
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    real_replace, real_remove = os.replace, shutil.rmtree
+    injected = False
+    def inject(path):
+        nonlocal injected
+        path = Path(path)
+        if injected:
+            return
+        if boundary == 'rollback' and path == f.room.root / 'workspace/batches':
+            target = path / batch / 'boundary-write.md'
+        elif boundary == 'retirement' and path.name.startswith('.migration-staging-'):
+            target = path / 'retained/batches' / batch / 'boundary-write.md'
+        else:
+            return
+        target.write_bytes(b'editor wrote at the deletion boundary')
+        injected = True
+    def replace(source, destination):
+        if Path(destination).is_relative_to(f.room.root / 'data/workspace-migration-recovery'):
+            inject(source)
+        return real_replace(source, destination)
+    def remove(path, *args, **kwargs):
+        inject(path)
+        return real_remove(path, *args, **kwargs)
+    monkeypatch.setattr('newsroom.migration.os.replace', replace)
+    monkeypatch.setattr('newsroom.migration.shutil.rmtree', remove)
+    if boundary == 'rollback':
+        def stop(*args):
+            raise KeyboardInterrupt('rollback before tree retirement')
+        monkeypatch.setattr(service, '_verify_workspace', stop)
+    try:
+        service.execute(plan, backup)
+    except BaseException:
+        pass
+    assert injected
+    preserved = list(f.room.root.rglob('boundary-write.md'))
+    assert preserved and all(path.read_bytes() == b'editor wrote at the deletion boundary' for path in preserved)
+
+
+def test_failed_barrier_recreation_still_blocks_access_by_journal(legacy_workspace, monkeypatch):
+    from newsroom.macos import MacOSBatchController
+    from test_macos import FakeDialogs
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    real_release, real_acquire = service._release_barrier, service._acquire_barrier
+    def unlink_then_damage():
+        real_release()
+        service.receipt_path.write_bytes(b'{')
+        raise KeyboardInterrupt('receipt damaged after release')
+    def fail_recreation():
+        if service._execution['stage'] == 'CLEANED':
+            raise OSError('one-shot barrier recreation failed')
+        return real_acquire()
+    monkeypatch.setattr(service, '_release_barrier', unlink_then_damage)
+    monkeypatch.setattr(service, '_acquire_barrier', fail_recreation)
+    with pytest.raises(WorkflowError, match='committed.*recovery'):
+        service.execute(plan, backup)
+    assert not (f.room.root / 'data/workspace-migration-lock.json').exists()
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'recovery' in result.output.lower(), result.output
+    dialogs = FakeDialogs()
+    assert MacOSBatchController(f.room, dialogs).run(f.batch_id, 'approve') == 2
+    assert not dialogs.confirmations
+
+
+def test_durably_cleaned_state_never_rolls_back_if_journal_is_unreadable(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    real_release = service._release_barrier
+    committed = {}
+    def release_then_corrupt_journal():
+        committed['database'] = f.room.db_path.read_bytes()
+        committed['artifacts'] = artifact_snapshot(f.room)
+        real_release()
+        Path(service._execution['journal_path']).write_bytes(b'{')
+        raise KeyboardInterrupt('journal damaged after durable CLEANED')
+    monkeypatch.setattr(service, '_release_barrier', release_then_corrupt_journal)
+    with pytest.raises(BaseException) as captured:
+        service.execute(plan, backup)
+    assert isinstance(captured.value, WorkflowError) and 'committed' in str(captured.value)
+    assert f.room.db_path.read_bytes() == committed['database']
+    assert artifact_snapshot(f.room) == committed['artifacts']
+    assert service.receipt_path.exists()
+    result = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert result.exit_code == 2 and 'recovery' in result.output.lower()
+
+
+def test_rollback_preserves_whole_tree_when_prescan_cannot_read_it(legacy_workspace, monkeypatch):
+    f = legacy_workspace
+    prepare_existing_canonical(f)
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    before = artifact_snapshot(f.room)
+    real_matches = service._promoted_matches
+    failed = False
+    def unreadable(path, **kwargs):
+        nonlocal failed
+        if path == service.workspace.root / 'batches' and not failed:
+            failed = True
+            raise OSError('cannot read promoted tree during prescan')
+        return real_matches(path, **kwargs)
+    def interrupt(*args):
+        raise KeyboardInterrupt('rollback required')
+    monkeypatch.setattr(service, '_promoted_matches', unreadable)
+    monkeypatch.setattr(service, '_verify_workspace', interrupt)
+    with pytest.raises(BaseExceptionGroup):
+        service.execute(plan, backup)
+    assert artifact_snapshot(f.room) == before
+    journal = json.loads(next((f.room.root / 'data/workspace-migration-journals').glob('*.json')).read_bytes())
+    record = next(record for record in journal['quarantined_promotions'] if Path(record['source']).name == 'batches')
+    assert Path(record['path']).is_dir()
+    assert journal['recovery_status'] == 'RECOVERY_REQUIRED'
+
+
+@pytest.mark.parametrize('journal_mode', ['DELETE', 'WAL'])
+def test_terminal_access_validation_is_read_only(legacy_workspace, journal_mode):
+    from newsroom.migration import assert_migration_access
+    f = legacy_workspace
+    execute_clean_migration(f)
+    with f.room.db.connect() as connection:
+        connection.execute(f'PRAGMA journal_mode={journal_mode}')
+    before = filesystem_details(f.room.root)
+    assert_migration_access(f.room.root)
+    assert filesystem_details(f.room.root) == before
+
+
+@pytest.mark.parametrize('mutation', ['missing_release', 'pending_finalization', 'receipt_mismatch', 'missing_retired_tree', 'corrupt_database'])
+def test_cleaned_journal_without_matching_terminal_invariants_refuses_access(legacy_workspace, mutation):
+    f = legacy_workspace
+    result = execute_clean_migration(f)
+    path = Path(result['journal_path'])
+    journal = json.loads(path.read_bytes())
+    if mutation == 'missing_release':
+        journal.pop('access_released')
+    elif mutation == 'pending_finalization':
+        journal['finalization_status'] = 'PENDING'
+    elif mutation == 'receipt_mismatch':
+        receipt = json.loads(migrator(f.room).receipt_path.read_bytes())
+        receipt['manifest_sha256'] = '0' * 64
+        migrator(f.room).receipt_path.write_text(json.dumps(receipt))
+    elif mutation == 'missing_retired_tree':
+        Path(journal['retired_stages'][0]['path']).rename(Path(journal['retired_stages'][0]['path']).with_name('human-moved-retired'))
+    else:
+        f.room.db_path.write_bytes(b'not a SQLite database')
+    path.write_text(json.dumps(journal))
+    before = snapshot(f.room.root)
+    admission = CliRunner().invoke(app, ['--root', str(f.room.root), 'stats'])
+    assert admission.exit_code == 2 and 'recovery' in admission.output.lower(), admission.output
+    assert snapshot(f.room.root) == before
+
+
+@pytest.mark.parametrize('pending', ['recovery_failures', 'finalization_status'])
+def test_rollback_journal_with_pending_diagnostics_refuses_access(legacy_workspace, pending):
+    from newsroom.migration import assert_migration_access
+    f = legacy_workspace
+    directory = f.room.root / 'data/workspace-migration-journals'
+    directory.mkdir()
+    path = directory / 'rollback.json'
+    journal = {'schema_version': 1, 'stage': 'PROMOTED', 'history': [], 'journal_path': str(path),
+               'recovery_status': 'ROLLED_BACK', 'rollback_verified': True, 'access_released': True,
+               pending: ['restore remains pending'] if pending == 'recovery_failures' else 'RECOVERY_REQUIRED'}
+    path.write_text(json.dumps(journal))
+    with pytest.raises(WorkflowError, match='recovery'):
+        assert_migration_access(f.room.root)
