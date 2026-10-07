@@ -264,7 +264,8 @@ class Database:
             )
         return [row[0] for row in rows]
 
-    def _existing_version(self) -> int:
+    def validate_existing_schema(self) -> int:
+        """Return schema version 0-4 after a read-only snapshot validation."""
         versions = self._existing_versions()
         unsupported = next(
             (version for version in versions if version < 1 or version > SUPPORTED_SCHEMA_VERSION),
@@ -315,7 +316,7 @@ class Database:
             )
 
     def initialize(self, applied_at: str) -> None:
-        existing_version = self._existing_version()
+        existing_version = self.validate_existing_schema()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if existing_version in {1, 2, 3}:
             self._backup_before_upgrade(existing_version, applied_at)

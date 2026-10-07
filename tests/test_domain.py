@@ -511,6 +511,16 @@ def test_init_allows_existing_empty_sqlite_file(tmp_path: Path):
     assert not (db_path.parent / "backups").exists()
 
 
+def test_public_schema_validation_returns_supported_version_without_mutation(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    database = Database(db_path)
+    database.initialize("2026-10-06T02:00:00+00:00")
+    before = db_path.read_bytes()
+
+    assert database.validate_existing_schema() == 4
+    assert db_path.read_bytes() == before
+
+
 def test_init_seeds_source_registry(newsroom: Newsroom):
     sources = newsroom.db.all("SELECT source_id,domain FROM sources ORDER BY source_id")
     assert {row["domain"] for row in sources} >= {"openai.com", "reuters.com"}
