@@ -904,6 +904,73 @@ def test_preflight_projects_one_active_owner_and_ignores_inactive_memberships(le
     assert MigrationPlan.from_dict(plan.to_dict()).ownership_projection == plan.ownership_projection
 
 
+def add_membership_candidate(room, label):
+    values = candidate_row(
+        candidate_title=f'Membership {label}',
+        core_fact=f'Membership {label} is a distinct fixture.',
+        company=f'Company {label}',
+        product=f'Product {label}',
+        primary_source=f'https://membership.example/{label}',
+    )
+    return room.add_candidate(**{
+        **values,
+        'keywords': values['keywords'].split('|'),
+        'secondary_sources': [],
+        'priority': int(values['priority']),
+    })
+
+
+@pytest.mark.parametrize('clear_owner', [False, True])
+def test_preflight_blocks_two_active_membership_rows_in_same_batch(
+    legacy_workspace, clear_owner,
+):
+    f = legacy_workspace
+    extra = add_membership_candidate(f.room, f'duplicate-{clear_owner}')
+    with f.room.db.connect() as connection:
+        if clear_owner:
+            connection.execute(
+                'UPDATE articles SET owning_batch_id=NULL WHERE article_id=?',
+                (f.article_id,),
+            )
+        connection.execute(
+            "INSERT INTO batch_items(batch_id,candidate_id,article_id,item_status,"
+            "duplicate_classification,content_version,created_at,updated_at) "
+            "VALUES (?,?,?,'READY_FOR_CONTENT','NEW',1,'now','now')",
+            (f.batch_id, extra['candidate_id'], f.article_id),
+        )
+
+    first = migrator(f.room).preflight()
+    second = migrator(f.room).preflight()
+
+    assert first.to_dict() == second.to_dict()
+    assert any(f'ambiguous ownership: {f.article_id}' in error
+               for error in first.blocking_errors)
+    assert first.ownership_projection[f.article_id] == (
+        None if clear_owner else f.batch_id
+    )
+
+
+def test_preflight_ignores_same_batch_reused_and_excluded_duplicate_rows(legacy_workspace):
+    f = legacy_workspace
+    inactive = [
+        (add_membership_candidate(f.room, status.lower()), status)
+        for status in ('REUSED_COMPLETE', 'EXCLUDED')
+    ]
+    with f.room.db.connect() as connection:
+        for candidate, status in inactive:
+            connection.execute(
+                "INSERT INTO batch_items(batch_id,candidate_id,article_id,item_status,"
+                "duplicate_classification,content_version,created_at,updated_at) "
+                "VALUES (?,?,?,?, 'NEW',1,'now','now')",
+                (f.batch_id, candidate['candidate_id'], f.article_id, status),
+            )
+
+    plan = migrator(f.room).preflight()
+
+    assert plan.blocking_errors == []
+    assert plan.ownership_projection[f.article_id] == f.batch_id
+
+
 def test_preflight_ambiguous_article_membership_blocks(legacy_workspace):
     f = legacy_workspace
     with f.room.db.connect() as connection:
@@ -1772,6 +1839,26 @@ def test_execute_rejects_batch_membership_change_after_owner_plan(legacy_workspa
     assert f.room.get_article(f.article_id)['owning_batch_id'] is None
 
 
+def test_execute_rejects_same_batch_duplicate_membership_added_after_owner_plan(
+    legacy_workspace,
+):
+    f = legacy_workspace
+    service = migrator(f.room)
+    plan = service.preflight()
+    backup = service.backup(plan)
+    extra = add_membership_candidate(f.room, 'post-plan-duplicate')
+    with f.room.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO batch_items(batch_id,candidate_id,article_id,item_status,"
+            "duplicate_classification,content_version,created_at,updated_at) "
+            "VALUES (?,?,?,'READY_FOR_CONTENT','NEW',1,'now','now')",
+            (f.batch_id, extra['candidate_id'], f.article_id),
+        )
+
+    with pytest.raises(WorkflowError, match='database changed after preflight'):
+        service.execute(plan, backup)
+
+
 def test_execute_archives_and_preserves_exact_artifacts(legacy_workspace):
     f = legacy_workspace
     service = migrator(f.room)
@@ -2220,6 +2307,9 @@ def test_execute_accepts_exact_v3_legacy_package_shape_without_modern_fields(
     package = convert_package_to_exact_v3_shape(
         f, prepare_legacy_publication_package(f, status='PUBLISHED')
     )
+    assert json.loads((package / 'metadata.json').read_bytes())['image_id'] == (
+        'img-legacy-package'
+    )
     before_package = snapshot(package)
 
     service = migrator(f.room)
@@ -2236,8 +2326,9 @@ def test_execute_accepts_exact_v3_legacy_package_shape_without_modern_fields(
     assert article['fact_check_outcome'] is None
 
 
-def test_execute_accepts_unowned_legacy_approved_archive_with_no_image_or_modern_members(
-    legacy_workspace,
+@pytest.mark.parametrize('metadata_image_id', ['absent', None])
+def test_execute_accepts_unowned_legacy_approved_archive_with_nullable_image_identity(
+    legacy_workspace, metadata_image_id,
 ):
     f = legacy_workspace
     article_id = f.single_id
@@ -2255,7 +2346,10 @@ def test_execute_accepts_unowned_legacy_approved_archive_with_no_image_or_modern
     package = f.room.root / 'output' / article_id
     package.mkdir(parents=True)
     (package / 'article.md').write_bytes(draft.read_bytes())
-    (package / 'metadata.json').write_text(json.dumps({'article_id': article_id}))
+    metadata = {'article_id': article_id}
+    if metadata_image_id != 'absent':
+        metadata['image_id'] = metadata_image_id
+    (package / 'metadata.json').write_text(json.dumps(metadata))
 
     service = migrator(f.room)
     plan = service.preflight()
@@ -2265,6 +2359,23 @@ def test_execute_accepts_unowned_legacy_approved_archive_with_no_image_or_modern
     archived = f.room.root / 'workspace/archive/legacy-single-articles' / article_id / 'publish'
     assert set(snapshot(archived)) == {'article.md', 'metadata.json'}
     assert f.room.get_article(article_id)['image_id'] is None
+
+
+def test_execute_accepts_legacy_metadata_without_image_identity_for_registered_image(
+    legacy_workspace,
+):
+    f = legacy_workspace
+    package = prepare_legacy_publication_package(f)
+    metadata = json.loads((package / 'metadata.json').read_bytes())
+    metadata.pop('image_id')
+    (package / 'metadata.json').write_text(json.dumps(metadata))
+
+    service = migrator(f.room)
+    plan = service.preflight()
+    result = service.execute(plan, service.backup(plan))
+
+    assert result['status'] == 'PASS'
+    assert f.room.get_article(f.single_id)['image_id'] == 'img-legacy-package'
 
 
 def test_execute_owned_approved_article_without_current_pass_still_blocks(approved_batch):
@@ -2322,7 +2433,10 @@ def test_execute_reused_only_legacy_package_remains_unowned_archive_only(legacy_
     assert snapshot(archived) == before_package
 
 
-@pytest.mark.parametrize('mutation', ['identity', 'image_identity', 'content', 'image_content'])
+@pytest.mark.parametrize('mutation', [
+    'identity', 'metadata_image_identity', 'metadata_image_null', 'image_identity',
+    'content', 'image_content',
+])
 def test_execute_validates_legacy_package_identity_and_available_content(
     legacy_workspace, mutation,
 ):
@@ -2331,6 +2445,12 @@ def test_execute_validates_legacy_package_identity_and_available_content(
     if mutation == 'identity':
         metadata = json.loads((package / 'metadata.json').read_bytes())
         metadata['article_id'] = 'art-wrong'
+        (package / 'metadata.json').write_text(json.dumps(metadata))
+    elif mutation in {'metadata_image_identity', 'metadata_image_null'}:
+        metadata = json.loads((package / 'metadata.json').read_bytes())
+        metadata['image_id'] = (
+            'img-wrong' if mutation == 'metadata_image_identity' else None
+        )
         (package / 'metadata.json').write_text(json.dumps(metadata))
     elif mutation == 'image_identity':
         metadata = json.loads((package / 'image-license.json').read_bytes())
@@ -2345,6 +2465,22 @@ def test_execute_validates_legacy_package_identity_and_available_content(
 
     with pytest.raises(WorkflowError, match='package'):
         service.execute(plan, service.backup(plan))
+
+
+def test_terminal_admission_rejects_two_active_rows_in_same_owned_batch(legacy_workspace):
+    f = legacy_workspace
+    execute_clean_migration(f)
+    extra = add_membership_candidate(f.room, 'terminal-duplicate')
+    with f.room.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO batch_items(batch_id,candidate_id,article_id,item_status,"
+            "duplicate_classification,content_version,created_at,updated_at) "
+            "VALUES (?,?,?,'READY_FOR_CONTENT','NEW',1,'now','now')",
+            (f.batch_id, extra['candidate_id'], f.article_id),
+        )
+
+    with pytest.raises(WorkflowError, match='ownership'):
+        migrator(f.room).execute_from_current_state()
 
 
 @pytest.mark.parametrize('mutation', ['metadata', 'content', 'license', 'checklist'])

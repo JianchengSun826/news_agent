@@ -354,21 +354,21 @@ class WorkspaceMigrator:
         recorded_articles = {a["article_id"]: a for a in tables["articles"]}
         batches = {b["batch_id"]: b for b in tables["batches"]}
         for article_id, article in sorted(recorded_articles.items()):
-            memberships = {
+            memberships = [
                 item["batch_id"] for item in tables["batch_items"]
                 if item["article_id"] == article_id
                 and item["item_status"] not in {"REUSED_COMPLETE", "EXCLUDED"}
-            }
+            ]
             owner = article["owning_batch_id"]
             if len(memberships) > 1:
                 plan.blocking_errors.append(f"ambiguous ownership: {article_id}")
                 plan.ownership_projection[article_id] = owner
             elif owner is not None:
-                if owner not in batches or memberships != {owner}:
+                if owner not in batches or memberships != [owner]:
                     plan.blocking_errors.append(f"ownership mismatch: {article_id}")
                 plan.ownership_projection[article_id] = owner
             else:
-                plan.ownership_projection[article_id] = next(iter(memberships), None)
+                plan.ownership_projection[article_id] = memberships[0] if memberships else None
         articles = {
             article_id: {**article, "owning_batch_id": plan.ownership_projection[article_id]}
             for article_id, article in recorded_articles.items()
@@ -1257,6 +1257,9 @@ class WorkspaceMigrator:
                     raise ValueError('historical article metadata is not an object')
                 if metadata.get('article_id') != article['article_id']:
                     raise ValueError('historical article identity mismatch')
+                if ('image_id' in metadata
+                        and metadata['image_id'] != article.get('image_id')):
+                    raise ValueError('historical article image identity mismatch')
                 recorded_revision = metadata.get('revision_number')
                 if (recorded_revision is not None
                         and recorded_revision != article['revision_number']):
@@ -1335,17 +1338,17 @@ class WorkspaceMigrator:
             tables, _ = _database(connection)
         articles = {row['article_id']: row for row in tables['articles']}
         batches = {row['batch_id'] for row in tables['batches']}
-        active_memberships: dict[str, set[str]] = {}
+        active_memberships: dict[str, list[str]] = {}
         for item in tables['batch_items']:
             if item['article_id'] and item['item_status'] not in {'REUSED_COMPLETE', 'EXCLUDED'}:
-                active_memberships.setdefault(item['article_id'], set()).add(item['batch_id'])
+                active_memberships.setdefault(item['article_id'], []).append(item['batch_id'])
         for article in articles.values():
             owner = article['owning_batch_id']
-            memberships = active_memberships.get(article['article_id'], set())
+            memberships = active_memberships.get(article['article_id'], [])
             if owner is None:
                 if memberships:
                     raise WorkflowError('active batch article is missing projected ownership')
-            elif owner not in batches or memberships != {owner}:
+            elif owner not in batches or memberships != [owner]:
                 raise WorkflowError('article ownership does not match current batch membership')
         if max((row['version'] for row in tables['schema_version']), default=0) != 4:
             raise WorkflowError('migration requires database schema version 4')

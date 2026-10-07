@@ -82,7 +82,7 @@ JSON 含 `schema_version: 1`、`batch_id` 和 `items`；每项为 `article_id`�
 
 ## 五、迁移、备份与恢复
 
-旧运行素材先在数据库和目录副本中演练，再在真实工作区操作。根迁移启动器只读预检所有引用、归属、冲突、符号链接和路径安全；报告保存到 `data/workspace-migration-preflight.json`。有阻塞不会继续；取消只留报告。v3 升级到 v4 后 NULL `owning_batch_id` 不会由 init 自动填写：预检只把具有唯一有效 `batch_items` 关系的文章投影给该批次，忽略 `REUSED_COMPLETE` 和 `EXCLUDED`；没有有效关系的文章继续进入旧单篇 archive，多个关系或已有 owner 不一致会阻塞。归属投影（包括 NULL）固定写入计划和 manifest；预检后关系变化会使执行失效。执行在同一事务回填 owner、切换路径和更新 workspace version，成功 journal/receipt 绑定投影摘要。
+旧运行素材先在数据库和目录副本中演练，再在真实工作区操作。根迁移启动器只读预检所有引用、归属、冲突、符号链接和路径安全；报告保存到 `data/workspace-migration-preflight.json`。有阻塞不会继续；取消只留报告。v3 升级到 v4 后 NULL `owning_batch_id` 不会由 init 自动填写：预检只把具有恰好一条有效 `batch_items` 关系的文章投影给该批次，忽略 `REUSED_COMPLETE` 和 `EXCLUDED`；没有有效关系的文章继续进入旧单篇 archive，两条或更多关系会阻塞，即使来自同一批次，已有 owner 也必须只有一条匹配关系。归属投影（包括 NULL）固定写入计划和 manifest；预检后关系变化会使执行失效。执行在同一事务回填 owner、切换路径和更新 workspace version，成功 journal/receipt 绑定投影摘要。
 
 若归属明确的同一旧单篇文章中，一个数据库绑定文件占用首选 archive 路径，其他未绑定旧文件碰巧投影到同一路径，首选文件保留规范名称，额外文件分别保存到文章的 `legacy-files/原始相对目录/`，并在文件名加入按原始 UTF-8 路径生成的稳定摘要；大小写或 Unicode 规范等价的源路径仍有不同目标名称。超长名称会按目标文件系统限制和 UTF-8 字节边界确定性截短并尽量保留扩展名；复制的父目录组件必须是有效 UTF-8 且分别符合目标限制，不会被静默改名。无法读取可用限制、摘要无法容纳或父目录组件超限时预检阻断。两个数据库记录即使引用完全相同的源、目标和字段也会阻塞；仅含未绑定文件的冲突、归属歧义、祖先文件、符号链接、路径逃逸或已有目标同样阻塞。仅同一已验证条目的源和目标完全相同时才允许原地已有目标，计划移走的其他源路径不能复用。归属推断会按 macOS 大小写规则收集全部文章和批次 ID；多个候选或文章/批次不一致会在分流前阻断。安全分流的所有源文件分别进入清单与备份，只有数据库绑定条目更新 SQLite 路径，不会覆盖、删除或按内容合并。原 CSV 缺失不阻塞，提供时必须与已记录 SHA-256 一致。
 
@@ -94,7 +94,7 @@ uv run newsroom workspace migrate --execute --plan data/workspace-migration-pref
 
 确认后创建并重新打开验证 SQLite、素材归档及 manifest，校验所有哈希。迁移暂存规范文件并重建视图，事务切换相对路径与 `workspace_version=1`，整体提升并核对引用；没有推进文章状态。未归属文件和旧单篇资料复制为 `workspace/archive/unclaimed-files/` 和 `legacy-single-articles/` 下只读参考。
 
-发布验证区分当前批次与旧 archive。具有 owner 的文章必须只属于该有效批次，且 `APPROVED`/`PUBLISHED` 仍执行当前 PASS、图片、审核素材和发布包检查。NULL owner 只在没有有效成员关系时成立；`REUSED_COMPLETE`/`EXCLUDED` 不转移归属。未归属旧包按原字节归档，不重新生成，也不要求补齐新版 fact-check、图片或 package 字段；已有身份字段和可比较素材必须与数据库一致，旧路径、版本化 hero 名称及缺少可选成员可以保留。
+发布验证区分当前批次与旧 archive。具有 owner 的文章必须有恰好一条指向该 owner 的有效关系，同一批次的重复有效记录也会阻塞；`APPROVED`/`PUBLISHED` 仍执行当前 PASS、图片、审核素材和发布包检查。NULL owner 只在没有有效成员关系时成立；`REUSED_COMPLETE`/`EXCLUDED` 不转移归属。未归属旧包按原字节归档，不重新生成，也不要求补齐新版 fact-check、图片或 package 字段；已有文章、图片身份字段和可比较素材必须与数据库一致，缺少 `metadata.json.image_id` 仍兼容旧格式，旧路径、版本化 hero 名称及缺少可选成员可以保留。
 
 完整旧 `research/`、`articles/`、`images/`、`output/` 树在验证成功后原子改名保留到 journal 绑定的 `data/workspace-migration-recovery/`，包括空目录和文件身份；程序不会自动 unlink 或递归删除。改变、新增或缺失 archive/recovery 文件会阻止普通访问；活动批次素材和发布包可继续按批次规则编辑或重建。备份与 retained 树均需人工保管。
 
