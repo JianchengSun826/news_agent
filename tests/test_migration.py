@@ -2102,6 +2102,251 @@ def test_execute_validates_packages_disposably_without_release_state_changes(app
     assert all(f.room.get_article(article)['status'] == 'APPROVED' for article in f.article_ids)
 
 
+def prepare_legacy_publication_package(f, *, status='APPROVED'):
+    """Model a complete pre-batch package whose fact check predates v4 outcomes."""
+    article_id = f.single_id
+    article_root = f.room.root / 'articles' / article_id
+    image_root = f.room.root / 'images' / article_id
+    article_root.mkdir(parents=True, exist_ok=True)
+    image_root.mkdir(parents=True, exist_ok=True)
+    draft = article_root / 'article.md'
+    fact_check = article_root / 'fact-check.md'
+    image_path = image_root / 'hero.png'
+    draft.write_bytes(b'# Legacy article\n\nHistorical copy.\n')
+    fact_check.write_bytes(b'# Legacy fact check\n\nHistorical verification.\n')
+    image_path.write_bytes(b'legacy image bytes')
+    image_id = 'img-legacy-package'
+    with f.room.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO images(image_id,article_id,image_type,source_url,creator,license,"
+            "license_url,attribution_text,image_path,rights_basis,rights_statement) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (image_id, article_id, 'LICENSED_SOURCE', 'https://legacy.example/image',
+             'Legacy photographer', 'CC BY 4.0', 'https://creativecommons.org/licenses/by/4.0/',
+             'Legacy photographer / CC BY 4.0', image_path.relative_to(f.room.root).as_posix(),
+             'LICENSE', 'Historical rights record'),
+        )
+        connection.execute(
+            "UPDATE articles SET status=?,title_cn='Legacy archive',slug='legacy-archive',"
+            "draft_path=?,fact_check_path=?,fact_check_outcome=NULL,image_id=?,article_url=? "
+            "WHERE article_id=?",
+            (status, draft.relative_to(f.room.root).as_posix(),
+             fact_check.relative_to(f.room.root).as_posix(), image_id,
+             'https://published.example/legacy' if status == 'PUBLISHED' else None, article_id),
+        )
+    article = f.room.get_article(article_id)
+    image = f.room.db.one('SELECT * FROM images WHERE image_id=?', (image_id,))
+    sources = {
+        'article.md': draft,
+        'research-brief.md': f.room.root / article['research_brief_path'],
+        'fact-check.md': fact_check,
+        'hero': image_path,
+    }
+    package = f.room.root / 'output' / article_id
+    package.mkdir(parents=True)
+    f.room._write_publication_package(article, image, sources, package)
+    return package
+
+
+def convert_package_to_exact_v3_shape(f, package):
+    """Match the on-disk package produced before batch/image-rights schema fields."""
+    article_id = f.single_id
+    old_image = f.room.root / 'images' / article_id / 'hero.png'
+    versioned_image = old_image.with_name('hero-v2.png')
+    old_image.rename(versioned_image)
+    (package / 'hero.png').rename(package / 'hero-v2.png')
+    with f.room.db.connect() as connection:
+        connection.execute(
+            'UPDATE images SET image_path=? WHERE article_id=?',
+            (versioned_image.relative_to(f.room.root).as_posix(), article_id),
+        )
+
+    metadata = json.loads((package / 'metadata.json').read_bytes())
+    for field in ('fact_check_outcome', 'revision_number', 'owning_batch_id'):
+        metadata.pop(field, None)
+    (package / 'metadata.json').write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+
+    license_metadata = json.loads((package / 'image-license.json').read_bytes())
+    license_metadata['image_path'] = versioned_image.relative_to(f.room.root).as_posix()
+    for field in ('image_candidate_id', 'rights_basis', 'rights_statement'):
+        license_metadata.pop(field, None)
+    (package / 'image-license.json').write_text(
+        json.dumps(license_metadata, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+    return package
+
+
+@pytest.mark.parametrize('status', ['APPROVED', 'PUBLISHED'])
+def test_execute_archives_unowned_legacy_package_without_current_release_gates(
+    legacy_workspace, status,
+):
+    f = legacy_workspace
+    package = prepare_legacy_publication_package(f, status=status)
+    before_package = snapshot(package)
+    before_status = f.room.get_article(f.single_id)['status']
+    service = migrator(f.room)
+    plan = service.preflight()
+    package_entries = [
+        entry for entry in plan.entries
+        if entry.source.is_relative_to(Path('output') / f.single_id)
+    ]
+    assert package_entries
+    assert all(entry.article_id == f.single_id and entry.batch_id is None for entry in package_entries)
+    backup = service.backup(plan)
+    manifest = json.loads((backup / 'manifest.json').read_bytes())
+    manifest_artifacts = {entry['source']: entry for entry in manifest['artifacts']}
+    for entry in package_entries:
+        record = manifest_artifacts[entry.source.as_posix()]
+        assert (record['sha256'], record['size']) == (entry.sha256, entry.size)
+
+    result = service.execute(plan, backup)
+
+    assert result['status'] == 'PASS'
+    article = f.room.get_article(f.single_id)
+    assert article['owning_batch_id'] is None
+    assert article['status'] == before_status == status
+    archived = f.room.root / 'workspace/archive/legacy-single-articles' / f.single_id / 'publish'
+    assert snapshot(archived) == before_package
+    assert all(hashlib.sha256((f.room.root / entry.target).read_bytes()).hexdigest() == entry.sha256
+               for entry in package_entries)
+
+
+def test_execute_accepts_exact_v3_legacy_package_shape_without_modern_fields(
+    legacy_workspace,
+):
+    f = legacy_workspace
+    package = convert_package_to_exact_v3_shape(
+        f, prepare_legacy_publication_package(f, status='PUBLISHED')
+    )
+    before_package = snapshot(package)
+
+    service = migrator(f.room)
+    plan = service.preflight()
+    result = service.execute(plan, service.backup(plan))
+
+    assert result['status'] == 'PASS'
+    archived = f.room.root / 'workspace/archive/legacy-single-articles' / f.single_id / 'publish'
+    assert snapshot(archived) == before_package
+    assert (archived / 'hero-v2.png').read_bytes() == b'legacy image bytes'
+    article = f.room.get_article(f.single_id)
+    assert article['owning_batch_id'] is None
+    assert article['status'] == 'PUBLISHED'
+    assert article['fact_check_outcome'] is None
+
+
+def test_execute_accepts_unowned_legacy_approved_archive_with_no_image_or_modern_members(
+    legacy_workspace,
+):
+    f = legacy_workspace
+    article_id = f.single_id
+    article_root = f.room.root / 'articles' / article_id
+    article_root.mkdir(parents=True, exist_ok=True)
+    draft = article_root / 'article.md'
+    draft.write_bytes(b'# Image-free legacy archive\n')
+    with f.room.db.connect() as connection:
+        connection.execute(
+            "UPDATE articles SET status='APPROVED',title_cn='Legacy archive',"
+            "slug='legacy-archive',draft_path=?,fact_check_outcome=NULL,image_id=NULL "
+            "WHERE article_id=?",
+            (draft.relative_to(f.room.root).as_posix(), article_id),
+        )
+    package = f.room.root / 'output' / article_id
+    package.mkdir(parents=True)
+    (package / 'article.md').write_bytes(draft.read_bytes())
+    (package / 'metadata.json').write_text(json.dumps({'article_id': article_id}))
+
+    service = migrator(f.room)
+    plan = service.preflight()
+    result = service.execute(plan, service.backup(plan))
+
+    assert result['status'] == 'PASS'
+    archived = f.room.root / 'workspace/archive/legacy-single-articles' / article_id / 'publish'
+    assert set(snapshot(archived)) == {'article.md', 'metadata.json'}
+    assert f.room.get_article(article_id)['image_id'] is None
+
+
+def test_execute_owned_approved_article_without_current_pass_still_blocks(approved_batch):
+    f = approved_batch
+    from newsroom.batch_release import BatchReleaseWorkflow
+    BatchReleaseWorkflow(f.room).build_packages(f.batch_id)
+    with f.room.db.connect() as connection:
+        connection.execute(
+            'UPDATE articles SET fact_check_outcome=NULL WHERE article_id=?',
+            (f.article_ids[0],),
+        )
+    service = migrator(f.room)
+    plan = service.preflight()
+    with pytest.raises(WorkflowError, match='current PASS'):
+        service.execute(plan, service.backup(plan))
+
+
+def test_execute_active_batch_article_cannot_evade_release_gate_by_clearing_owner(approved_batch):
+    f = approved_batch
+    with f.room.db.connect() as connection:
+        connection.execute(
+            'UPDATE articles SET owning_batch_id=NULL,fact_check_outcome=NULL WHERE article_id=?',
+            (f.article_ids[0],),
+        )
+    service = migrator(f.room)
+    plan = service.preflight()
+    assert plan.ownership_projection[f.article_ids[0]] == f.batch_id
+    with pytest.raises(WorkflowError, match='current PASS'):
+        service.execute(plan, service.backup(plan))
+
+
+def test_execute_reused_only_legacy_package_remains_unowned_archive_only(legacy_workspace):
+    f = legacy_workspace
+    package = prepare_legacy_publication_package(f)
+    before_package = snapshot(package)
+    candidate_id = f.room.get_article(f.single_id)['candidate_id']
+    with f.room.db.connect() as connection:
+        connection.execute(
+            "INSERT INTO batch_items(batch_id,candidate_id,article_id,item_status,"
+            "duplicate_classification,content_version,created_at,updated_at) "
+            "VALUES (?,?,?,'REUSED_COMPLETE','EXACT_DUPLICATE',1,'now','now')",
+            (f.batch_id, candidate_id, f.single_id),
+        )
+    service = migrator(f.room)
+    plan = service.preflight()
+    assert plan.ownership_projection[f.single_id] is None
+
+    result = service.execute(plan, service.backup(plan))
+
+    assert result['status'] == 'PASS'
+    article = f.room.get_article(f.single_id)
+    assert article['owning_batch_id'] is None
+    assert article['status'] == 'APPROVED'
+    archived = f.room.root / 'workspace/archive/legacy-single-articles' / f.single_id / 'publish'
+    assert snapshot(archived) == before_package
+
+
+@pytest.mark.parametrize('mutation', ['identity', 'image_identity', 'content', 'image_content'])
+def test_execute_validates_legacy_package_identity_and_available_content(
+    legacy_workspace, mutation,
+):
+    f = legacy_workspace
+    package = prepare_legacy_publication_package(f)
+    if mutation == 'identity':
+        metadata = json.loads((package / 'metadata.json').read_bytes())
+        metadata['article_id'] = 'art-wrong'
+        (package / 'metadata.json').write_text(json.dumps(metadata))
+    elif mutation == 'image_identity':
+        metadata = json.loads((package / 'image-license.json').read_bytes())
+        metadata['image_id'] = 'img-wrong'
+        (package / 'image-license.json').write_text(json.dumps(metadata))
+    elif mutation == 'content':
+        (package / 'article.md').write_text('different historical package content')
+    else:
+        (package / 'hero.png').write_bytes(b'different historical image content')
+    service = migrator(f.room)
+    plan = service.preflight()
+
+    with pytest.raises(WorkflowError, match='package'):
+        service.execute(plan, service.backup(plan))
+
+
 @pytest.mark.parametrize('mutation', ['metadata', 'content', 'license', 'checklist'])
 def test_execute_rejects_corrupt_existing_package_without_mutation(approved_batch, mutation):
     from newsroom.batch_release import BatchReleaseWorkflow

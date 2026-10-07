@@ -1196,6 +1196,128 @@ class WorkspaceMigrator:
         with closing(room.db.connect()) as connection:
             return _database(connection)[1]
 
+    @staticmethod
+    def _validate_existing_owned_package(
+        existing: Path,
+        article: dict[str, Any],
+        image: dict[str, Any],
+        sources: dict[str, Path],
+    ) -> None:
+        """Validate a current owned package against current release material."""
+        if not existing.is_dir():
+            return
+        try:
+            metadata = json.loads((existing / 'metadata.json').read_bytes())
+            if (metadata.get('article_id') != article['article_id']
+                    or metadata.get('revision_number') != article['revision_number']):
+                raise ValueError('article/version identity mismatch')
+            # Old package metadata paths legitimately precede migration;
+            # content and identity must still represent the current version.
+            for output, source in sources.items():
+                filename = 'hero' + source.suffix.lower() if output == 'hero' else output
+                if (existing / filename).read_bytes() != source.read_bytes():
+                    raise ValueError('content differs from current material')
+            license_metadata = json.loads((existing / 'image-license.json').read_bytes())
+            if (license_metadata.get('image_id') != image['image_id']
+                    or license_metadata.get('article_id') != article['article_id']):
+                raise ValueError('image identity mismatch')
+            if ({key: value for key, value in license_metadata.items()
+                 if key not in {'image_path', 'prompt_path'}}
+                    != {key: value for key, value in image.items()
+                        if key not in {'image_path', 'prompt_path'}}):
+                raise ValueError('image rights differ from registered provenance')
+            for filename in ('sources.md', 'publication-checklist.md'):
+                if not (existing / filename).read_text().strip():
+                    raise ValueError('missing required material')
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            raise WorkflowError(f'existing package validation failed: {error}') from error
+
+    @staticmethod
+    def _validate_historical_package(
+        existing: Path,
+        article: dict[str, Any],
+        image: dict[str, Any] | None,
+        root: Path,
+    ) -> None:
+        """Validate identities and comparable bytes without applying current gates.
+
+        Unowned legacy packages are immutable archive input. Their complete bytes
+        are already bound by the migration plan and verified backup, so missing
+        modern package members are not synthesized or rejected here.
+        """
+        if not existing.exists():
+            return
+        if not existing.is_dir():
+            raise WorkflowError('historical package path is not a directory')
+        try:
+            metadata_path = existing / 'metadata.json'
+            if metadata_path.exists():
+                metadata = json.loads(metadata_path.read_bytes())
+                if not isinstance(metadata, dict):
+                    raise ValueError('historical article metadata is not an object')
+                if metadata.get('article_id') != article['article_id']:
+                    raise ValueError('historical article identity mismatch')
+                recorded_revision = metadata.get('revision_number')
+                if (recorded_revision is not None
+                        and recorded_revision != article['revision_number']):
+                    raise ValueError('historical article version mismatch')
+
+            comparable = {
+                'article.md': article.get('draft_path'),
+                'research-brief.md': article.get('research_brief_path'),
+                'fact-check.md': article.get('fact_check_path'),
+            }
+            for filename, stored in comparable.items():
+                package_file = existing / filename
+                source = root / stored if stored else None
+                if package_file.exists() and source is not None and source.is_file():
+                    if package_file.read_bytes() != source.read_bytes():
+                        raise ValueError(f'historical package content mismatch: {filename}')
+
+            license_path = existing / 'image-license.json'
+            license_metadata: dict[str, Any] | None = None
+            if license_path.exists():
+                license_metadata = json.loads(license_path.read_bytes())
+                if not isinstance(license_metadata, dict):
+                    raise ValueError('historical image metadata is not an object')
+                if license_metadata.get('article_id') != article['article_id']:
+                    raise ValueError('historical image article identity mismatch')
+                if license_metadata.get('image_id') != article.get('image_id'):
+                    raise ValueError('historical image identity mismatch')
+                if image is not None:
+                    if license_metadata.get('image_id') != image['image_id']:
+                        raise ValueError('historical image identity mismatch')
+                    # A v3 package predates image_candidate_id, rights_basis,
+                    # and rights_statement. Compare only fields the archived
+                    # package actually recorded; paths legitimately change as
+                    # migration projects them beneath workspace/archive.
+                    for key, value in license_metadata.items():
+                        if key in {'image_path', 'prompt_path'} or key not in image:
+                            continue
+                        if image[key] != value:
+                            raise ValueError('historical image rights mismatch')
+
+            if image is not None and image.get('image_path'):
+                source = root / image['image_path']
+                if source.is_file():
+                    declared: Path | None = None
+                    if license_metadata and license_metadata.get('image_path'):
+                        declared = existing / Path(str(license_metadata['image_path'])).name
+                    if declared is not None and declared.is_file():
+                        candidates = [declared]
+                    else:
+                        candidates = sorted(
+                            path for path in existing.iterdir()
+                            if path.is_file() and path.name.casefold().startswith('hero')
+                        )
+                    if candidates and not any(
+                        candidate.read_bytes() == source.read_bytes()
+                        for candidate in candidates
+                    ):
+                        raise ValueError('historical package content mismatch: registered image')
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            raise WorkflowError(f'historical package validation failed: {error}') from error
+
     def _validate_materials(self, room: Newsroom, *, terminal: bool = False) -> None:
         """Reopen paths, typed handoffs, images, and packages without workflow writes."""
         from . import batch_models as models
@@ -1212,6 +1334,19 @@ class WorkspaceMigrator:
         with closing(room.db.connect()) as connection:
             tables, _ = _database(connection)
         articles = {row['article_id']: row for row in tables['articles']}
+        batches = {row['batch_id'] for row in tables['batches']}
+        active_memberships: dict[str, set[str]] = {}
+        for item in tables['batch_items']:
+            if item['article_id'] and item['item_status'] not in {'REUSED_COMPLETE', 'EXCLUDED'}:
+                active_memberships.setdefault(item['article_id'], set()).add(item['batch_id'])
+        for article in articles.values():
+            owner = article['owning_batch_id']
+            memberships = active_memberships.get(article['article_id'], set())
+            if owner is None:
+                if memberships:
+                    raise WorkflowError('active batch article is missing projected ownership')
+            elif owner not in batches or memberships != {owner}:
+                raise WorkflowError('article ownership does not match current batch membership')
         if max((row['version'] for row in tables['schema_version']), default=0) != 4:
             raise WorkflowError('migration requires database schema version 4')
         for table, rows in tables.items():
@@ -1353,6 +1488,14 @@ class WorkspaceMigrator:
                 raise WorkflowError('migration root dashboard differs from current database')
             for original in tables['articles']:
                 article = room.get_article(original['article_id'])
+                owner = article['owning_batch_id']
+                if owner is None:
+                    existing = (room.root / 'workspace/archive/legacy-single-articles'
+                                / article['article_id'] / 'publish')
+                    self._validate_historical_package(
+                        existing, article, images.get(article['image_id']), room.root,
+                    )
+                    continue
                 if article['status'] not in {'APPROVED', 'PUBLISHED'}:
                     continue
                 if article['fact_check_outcome'] != 'PASS':
@@ -1363,26 +1506,8 @@ class WorkspaceMigrator:
                 package.mkdir(parents=True)
                 room._write_publication_package(article, image, sources, package)
                 BatchReleaseWorkflow._validate_staged_package(package, article, image, sources)
-                owner = article['owning_batch_id']
-                existing = (BatchWorkspace(room).batch_root(owner) / 'publish' / article['article_id']) if owner else room.root / 'workspace/archive/legacy-single-articles' / article['article_id'] / 'publish'
-                if existing.is_dir():
-                    metadata = json.loads((existing / 'metadata.json').read_bytes())
-                    if metadata.get('article_id') != article['article_id'] or metadata.get('revision_number') != article['revision_number']:
-                        raise WorkflowError('existing package article/version identity mismatch')
-                    # Old package metadata paths legitimately precede migration;
-                    # content and identity must still represent the current version.
-                    for output, source in sources.items():
-                        filename = 'hero' + source.suffix.lower() if output == 'hero' else output
-                        if (existing / filename).read_bytes() != source.read_bytes():
-                            raise WorkflowError('existing package content differs from current material')
-                    license_metadata = json.loads((existing / 'image-license.json').read_bytes())
-                    if license_metadata.get('image_id') != image['image_id'] or license_metadata.get('article_id') != article['article_id']:
-                        raise WorkflowError('existing package image identity mismatch')
-                    if {key: value for key, value in license_metadata.items() if key not in {'image_path', 'prompt_path'}} != {key: value for key, value in image.items() if key not in {'image_path', 'prompt_path'}}:
-                        raise WorkflowError('existing package image rights differ from registered provenance')
-                    for filename in ('sources.md', 'publication-checklist.md'):
-                        if not (existing / filename).read_text().strip():
-                            raise WorkflowError('existing package missing required material')
+                existing = BatchWorkspace(room).batch_root(owner) / 'publish' / article['article_id']
+                self._validate_existing_owned_package(existing, article, image, sources)
 
     def _journal(self, stage: str | None = None) -> None:
         state = self._execution

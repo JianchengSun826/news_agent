@@ -244,7 +244,7 @@ The manifest records original path, target path, size, SHA-256, owning batch/art
 
 Failure before database commit leaves the original database and directories untouched. Failure after database commit triggers restoration from the verified backup and records a failure report. Re-running a completed migration is idempotent.
 
-Legacy single-article artifacts with no batch ownership move to `workspace/archive/legacy-single-articles/ARTICLE_ID/` and become read-only reference material. They do not receive action scripts or active batch state.
+Legacy single-article artifacts with no batch ownership move to `workspace/archive/legacy-single-articles/ARTICLE_ID/` and become read-only reference material. They do not receive action scripts or active batch state. An unowned article must have no active membership; `REUSED_COMPLETE` and `EXCLUDED` do not claim it. Historical publication packages are copied and hash-bound as archive input rather than regenerated or subjected to current release gates. Present identity fields and comparable canonical bytes must agree, while absent modern fields, optional members, nullable images, historical path values, and old hero naming remain valid. Batch-owned `APPROVED`/`PUBLISHED` articles continue through current PASS, image, review-material, and package validation.
 
 ## Data Model Changes
 
@@ -285,6 +285,7 @@ Implementation follows TDD with temporary directories and real SQLite databases.
 - resumable image-selection drafts without partial registration;
 - atomic multi-article transitions and package staging;
 - migration preflight, ownership projection, relationship-change rejection, hash mismatch, missing file, collision, rollback, idempotency, and cleanup;
+- separation of owned current release validation from unowned legacy package validation, including exact older package shapes;
 - `REUSED_COMPLETE` owner links;
 - legacy single-article archival;
 - derived dashboard rebuilds;

@@ -94,9 +94,11 @@ uv run newsroom workspace migrate --execute --plan data/workspace-migration-pref
 
 确认后创建并重新打开验证 SQLite、素材归档及 manifest，校验所有哈希。迁移暂存规范文件并重建视图，事务切换相对路径与 `workspace_version=1`，整体提升并核对引用；没有推进文章状态。未归属文件和旧单篇资料复制为 `workspace/archive/unclaimed-files/` 和 `legacy-single-articles/` 下只读参考。
 
-完整旧 `research/`、`articles/`、`images/`、`output/` 树在验证成功后原子改名保留到 journal 绑定的 `data/workspace-migration-recovery/`，包括空目录和文件身份；程序不会自动 unlink 或递归删除。改变、新增或缺失恢复文件会阻止普通访问，活动批次素材则可继续按批次规则编辑。备份与 retained 树均需人工保管。
+发布验证区分当前批次与旧 archive。具有 owner 的文章必须只属于该有效批次，且 `APPROVED`/`PUBLISHED` 仍执行当前 PASS、图片、审核素材和发布包检查。NULL owner 只在没有有效成员关系时成立；`REUSED_COMPLETE`/`EXCLUDED` 不转移归属。未归属旧包按原字节归档，不重新生成，也不要求补齐新版 fact-check、图片或 package 字段；已有身份字段和可比较素材必须与数据库一致，旧路径、版本化 hero 名称及缺少可选成员可以保留。
 
-`data/workspace-migration-journals/`、成功 receipt、验证回滚 proof 和持久 `workspace-migration-lock.json` 记录恢复证据。迁移用独占 `flock`，普通 CLI/Finder 操作持共享锁到对话和写入结束，帮助命令不创建锁。未完成、损坏或恢复失败的 journal/屏障会拒绝普通访问，不能删 flags 或反复执行来绕过。失败保留备份、暂存、隔离内容与诊断，验证恢复完成才允许重试；最终已提交后的收尾中断只继续恢复收尾。详细阶段、终态准入和恢复树规则见[主流程第 9 节](WORKFLOW.md#9-旧工作区迁移与恢复)。
+完整旧 `research/`、`articles/`、`images/`、`output/` 树在验证成功后原子改名保留到 journal 绑定的 `data/workspace-migration-recovery/`，包括空目录和文件身份；程序不会自动 unlink 或递归删除。改变、新增或缺失 archive/recovery 文件会阻止普通访问；活动批次素材和发布包可继续按批次规则编辑或重建。备份与 retained 树均需人工保管。
+
+`data/workspace-migration-journals/`、成功 receipt、验证回滚 proof 和持久 `workspace-migration-lock.json` 记录恢复证据。迁移用独占 `flock`，普通 CLI/Finder 操作持共享锁到对话和写入结束，帮助命令不创建锁。未完成、损坏或恢复失败的 journal/屏障会拒绝普通访问，不能删 flags 或反复执行来绕过。失败保留备份、暂存、隔离内容与诊断，验证恢复完成才允许重试；最终已提交后的收尾中断只继续恢复收尾。终态准入继续验证不可变 archive 与 retained recovery proof，同时允许活动包按正常闸门变化。详细阶段、终态准入和恢复树规则见[主流程第 9 节](WORKFLOW.md#9-旧工作区迁移与恢复)。
 
 ## 六、离线验收
 
