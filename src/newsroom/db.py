@@ -347,7 +347,8 @@ def _semantic_schema(connection: sqlite3.Connection) -> dict[str, object]:
         (str(row[0]), str(row[1]), str(row[2]))
         for row in connection.execute(
             "SELECT type,name,tbl_name FROM sqlite_master "
-            "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','index','view','trigger')"
+            "WHERE substr(name, 1, 7) != 'sqlite_' "
+            "AND type IN ('table','index','view','trigger')"
         )
     }
     tables = {name for object_type, name, _ in objects if object_type == "table"}
@@ -486,7 +487,7 @@ class Database:
                         row[0]
                         for row in connection.execute(
                             "SELECT name FROM sqlite_master "
-                            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                            "WHERE type='table' AND substr(name, 1, 7) != 'sqlite_'"
                         )
                     }
                     if "schema_version" not in user_tables:

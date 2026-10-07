@@ -52,3 +52,27 @@ def test_init_runbooks_require_complete_compatible_v4_before_idempotent_init() -
     plan = INIT_RUNBOOKS[1].read_text(encoding="utf-8")
     assert "complete, compatible v4 schema" in plan
     assert "schema must remain unchanged" in plan
+
+
+def test_chinese_migration_runbook_documents_current_schema_and_snapshot_guards() -> None:
+    text = (ROOT / "docs/WORKFLOW_ZH.md").read_text(encoding="utf-8")
+
+    assert "历史记录必须恰好为 `1..max(version)`" in text
+    assert "含隐藏/生成列" in text
+    assert "CHECK 约束" in text
+    assert "带唯一后缀且绝不覆盖既有文件" in text
+    assert "目标根路径本身也必须先用未解析路径检查" in text
+
+
+def test_task_11_plan_documents_current_schema_and_rehearsal_guards() -> None:
+    text = (ROOT / "docs/superpowers/plans/2026-10-05-batch-workspace-finder-workflow.md").read_text(
+        encoding="utf-8"
+    )
+    task_11 = text.split("### Task 11:", 1)[1].split("### Task 12:", 1)[0]
+
+    assert "history is exactly `1..max(version)`" in task_11
+    assert "hidden/generated columns" in task_11
+    assert "normalized CHECK constraint" in task_11
+    assert "unique suffix and exclusive no-clobber creation" in task_11
+    assert "unresolved target path before `resolve()`" in task_11
+    assert "substr(name, 1, 7) != 'sqlite_'" in task_11

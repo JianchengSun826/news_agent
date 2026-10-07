@@ -438,6 +438,24 @@ def test_init_rejects_unversioned_user_tables_without_mutation(tmp_path: Path):
         ).fetchone() is None
 
 
+def test_init_rejects_sqlite_prefix_lookalike_table_without_schema_version(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE sqliteXcustom (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO sqliteXcustom VALUES ('preserve-me')")
+        connection.commit()
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"user tables.*no schema_version"):
+        Database(db_path).initialize("2026-10-07T00:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute("SELECT value FROM sqliteXcustom").fetchone()[0] == "preserve-me"
+
+
 def test_init_rejects_unversioned_wal_user_tables_without_mutating_sidecars(tmp_path: Path):
     db_path = tmp_path / "data/newsroom.db"
     db_path.parent.mkdir(parents=True)
@@ -713,6 +731,36 @@ def test_init_rejects_unexpected_v4_user_objects_but_ignores_sqlite_internals(tm
         Database(db_path).initialize("2026-10-07T00:00:00+00:00")
 
     assert db_path.read_bytes() == before
+
+
+def test_init_rejects_sqlite_prefix_lookalike_object_in_v4(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    Database(db_path).initialize("2026-10-06T02:00:00+00:00")
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE sqliteXcustom (value TEXT)")
+        connection.commit()
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"unexpected schema object.*sqliteXcustom"):
+        Database(db_path).initialize("2026-10-07T00:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+
+
+def test_v4_validation_ignores_genuine_sqlite_internal_objects(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    Database(db_path).initialize("2026-10-06T02:00:00+00:00")
+    with closing(sqlite3.connect(db_path)) as connection:
+        internal_tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND substr(name, 1, 7) = 'sqlite_'"
+            )
+        }
+
+    assert "sqlite_sequence" in internal_tables
+    assert Database(db_path).validate_existing_schema() == 4
 
 
 def test_init_accepts_v4_created_by_v3_alter_upgrade_and_is_idempotent(tmp_path: Path):
