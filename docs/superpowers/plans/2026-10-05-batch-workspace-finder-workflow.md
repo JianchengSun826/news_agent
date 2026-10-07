@@ -840,7 +840,7 @@ INIT_BACKUPS_BEFORE="$(mktemp /tmp/newsroom-init-backups.XXXXXX)"
 INIT_EVIDENCE_BEFORE="$(mktemp /tmp/newsroom-init-before.XXXXXX)"
 INIT_EVIDENCE_COPY="$(mktemp /tmp/newsroom-init-copy.XXXXXX)"
 INIT_EVIDENCE_AFTER="$(mktemp /tmp/newsroom-init-current.XXXXXX)"
-EVIDENCE_SCRIPT="$(mktemp /tmp/newsroom-db-evidence.XXXXXX.py)"
+EVIDENCE_SCRIPT="$(mktemp /tmp/newsroom-db-evidence.XXXXXX)"
 PREFLIGHT_JSON="$(mktemp /tmp/newsroom-preflight.XXXXXX)"
 BACKUP_JSON="$(mktemp /tmp/newsroom-backup.XXXXXX)"
 trap 'rm -f "$INIT_BACKUPS_BEFORE" "$INIT_EVIDENCE_BEFORE" "$INIT_EVIDENCE_COPY" "$INIT_EVIDENCE_AFTER" "$EVIDENCE_SCRIPT" "$PREFLIGHT_JSON" "$BACKUP_JSON"' EXIT
@@ -905,7 +905,41 @@ print(value)
 PY
 )"
 
-uv run newsroom --root "$rehearsal_root" init
+uv run python - "$NEWSROOM_ROOT" <<'PY'
+from pathlib import Path
+import sqlite3
+import sys
+
+from newsroom.coordination import operation_lock
+from newsroom.service import Newsroom
+
+root = Path(sys.argv[1]).resolve()
+database = root / "data/newsroom.db"
+wal = Path(f"{database}-wal")
+shm = Path(f"{database}-shm")
+with operation_lock(root, exclusive=True):
+    with sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True) as connection:
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        print(f"journal_mode={journal_mode}")
+        if journal_mode.lower() == "wal":
+            busy, log_frames, checkpointed = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            print(
+                f"wal_checkpoint: busy={busy} log={log_frames} "
+                f"checkpointed={checkpointed}"
+            )
+            if busy != 0 or log_frames != checkpointed:
+                raise SystemExit(
+                    "WAL checkpoint was busy or incomplete; stop and investigate"
+                )
+    if (wal.exists() and wal.stat().st_size != 0) or shm.exists():
+        raise SystemExit(
+            "WAL/SHM sidecars remain after checkpoint and close; "
+            "stop and investigate without deleting them"
+        )
+    Newsroom(root).init()
+PY
 INIT_SAFETY_BACKUP="$(python3 - "$NEWSROOM_ROOT" "$INIT_BACKUPS_BEFORE" "$SOURCE_SCHEMA" <<'PY'
 from pathlib import Path
 import sys
@@ -995,7 +1029,7 @@ Regenerate dashboards, open the copied batch README, validate current Claude req
 
 - [ ] **Step 4: Run real preflight and inspect the saved report**
 
-Before production init, close every newsroom/Finder action and external writer, acquire the exclusive operation lock, and inspect journal mode plus WAL/SHM state as in Step 1. Read the source schema version first. For v1-v3, require exactly one new safety snapshot and compare it with the pre-init evidence; for v4, require no new upgrade snapshot and no schema change; reject every other version. Then run the root `Migrate Newsroom.command` or the exact gated CLI sequence in `docs/WORKFLOW.md`. Confirm no blocking errors and that all claimed, legacy, and unclaimed files appear in the saved `PLAN`; create and independently verify the migration backup before `--execute --plan "$PLAN" --backup "$BACKUP"`.
+Before production init, close every newsroom/Finder action and external writer. Use the exact guarded init block from `docs/WORKFLOW.md`: its exclusive operation lock spans journal-mode inspection, `wal_checkpoint(TRUNCATE)`, connection close, sidecar checks, and init. Require a non-busy complete checkpoint; afterward WAL must be absent or zero bytes and SHM absent. Stop and investigate any failure or remaining sidecar without deleting it manually. Read the source schema version first. For v1-v3, require exactly one new safety snapshot and compare it with the pre-init evidence; for v4, require no new upgrade snapshot and no schema change; reject every other version. Then run the root `Migrate Newsroom.command` or the exact gated CLI sequence in `docs/WORKFLOW.md`. Confirm no blocking errors and that all claimed, legacy, and unclaimed files appear in the saved `PLAN`; create and independently verify the migration backup before `--execute --plan "$PLAN" --backup "$BACKUP"`.
 
 - [ ] **Step 5: Execute the already-authorized real migration**
 

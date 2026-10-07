@@ -159,7 +159,47 @@ uv run newsroom --root . batch refresh-workspace BATCH_ID
 
 任何 rehearsal copy 或 production init 前，先关闭所有 newsroom Terminal/Finder 操作、外部素材编辑器和 SQLite 写入者。复制过程应取得 newsroom 独占 operation lock，检查 `PRAGMA journal_mode` 与 WAL/SHM 状态，用 SQLite backup API 创建连贯的 rehearsal 数据库，并在同一静默窗口复制 `data/`、现有 `workspace/` 和全部旧素材。目录复制必须使用 `symlinks=True` 保留符号链接身份，让预检拒绝它们，不能解引用。若选择 checkpoint/close/copy，必须先正常关闭写入者、完成 checkpoint，再把相关 SQLite 状态作为一个整体处理；不能先复制活动主数据库。
 
-在完整副本演练并核对恢复证据后，再使用真实工作区的 `workspace/Migrate Newsroom.command`。`init` 初始化或升级 schema，并幂等写入配置的来源种子；它不移动文章素材。真实 production init 同样要求上述静默条件和 WAL/SHM 检查。
+在完整副本演练并核对恢复证据后，再使用真实工作区的 `workspace/Migrate Newsroom.command`。`init` 初始化或升级 schema，并幂等写入配置的来源种子；它不移动文章素材。rehearsal 与 production init 都必须使用下面的 guarded 入口：独占 operation lock 覆盖 checkpoint、关闭检查和 init。WAL checkpoint 必须非 busy 且完整；连接关闭后只允许 WAL 不存在或为零字节，并要求 SHM 不存在。任何失败都在 init 前退出；不要手工删除 sidecar。
+
+```bash
+set -euo pipefail
+NEWSROOM_ROOT="/path/to/newsroom-root"
+uv run python - "$NEWSROOM_ROOT" <<'PY'
+from pathlib import Path
+import sqlite3
+import sys
+
+from newsroom.coordination import operation_lock
+from newsroom.service import Newsroom
+
+root = Path(sys.argv[1]).resolve()
+database = root / "data/newsroom.db"
+wal = Path(f"{database}-wal")
+shm = Path(f"{database}-shm")
+with operation_lock(root, exclusive=True):
+    with sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True) as connection:
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        print(f"journal_mode={journal_mode}")
+        if journal_mode.lower() == "wal":
+            busy, log_frames, checkpointed = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            print(
+                f"wal_checkpoint: busy={busy} log={log_frames} "
+                f"checkpointed={checkpointed}"
+            )
+            if busy != 0 or log_frames != checkpointed:
+                raise SystemExit(
+                    "WAL checkpoint was busy or incomplete; stop and investigate"
+                )
+    if (wal.exists() and wal.stat().st_size != 0) or shm.exists():
+        raise SystemExit(
+            "WAL/SHM sidecars remain after checkpoint and close; "
+            "stop and investigate without deleting them"
+        )
+    Newsroom(root).init()
+PY
+```
 
 运行 `init` 前先读取 `MAX(schema_version)`，仅接受 1、2、3 或 4。v1-v3 升级时必须恰好生成一份 `data/backups/newsroom-v旧版本-时间.db`；这份 `copy2` 只是安全快照，并非迁移系统的验证备份。只读打开它，检查 `PRAGMA integrity_check`，并与升级前记录的 schema、各表行数和必要业务抽样逐项比较。v4 初始化不得生成新的升级快照或改变 schema；来源种子仍按配置幂等核对。其他版本立即停止。完整性检查单独通过不证明逻辑等价。任何差异都必须停止；无论源版本为何，执行迁移前仍必须运行 `--backup-plan` 并独立验证其 SQLite、manifest 与素材归档。启动器会保存预检报告、要求明确确认，然后创建这份验证备份。取消只留下报告，不移动素材、不改变数据库。迁移不是发布，也不推进文章状态。
 

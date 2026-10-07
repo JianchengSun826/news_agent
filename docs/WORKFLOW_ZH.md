@@ -82,7 +82,7 @@ JSON 含 `schema_version: 1`、`batch_id` 和 `items`；每项为 `article_id`�
 
 ## 五、迁移、备份与恢复
 
-任何 rehearsal copy 或 production init 前，先关闭所有 newsroom Terminal/Finder 操作、外部素材编辑器和 SQLite 写入者。复制过程取得 newsroom 独占 operation lock，检查 journal mode 与 WAL/SHM 状态，用 SQLite backup API 创建连贯数据库，再在同一静默窗口复制 `data/`、现有 `workspace/` 和全部旧素材。目录复制必须保留 symlink 本身，不能解引用；这样预检才能拒绝它。真实 production init 也必须保持静默并先处理 WAL/SHM。
+任何 rehearsal copy 或 production init 前，先关闭所有 newsroom Terminal/Finder 操作、外部素材编辑器和 SQLite 写入者。复制过程取得 newsroom 独占 operation lock，检查 journal mode 与 WAL/SHM 状态，用 SQLite backup API 创建连贯数据库，再在同一静默窗口复制 `data/`、现有 `workspace/` 和全部旧素材。目录复制必须保留 symlink 本身，不能解引用；这样预检才能拒绝它。真实 production init 也必须保持静默，并使用[主流程第 9 节](WORKFLOW.md#9-旧工作区迁移与恢复)的 guarded init：WAL 模式先执行非 busy 的完整 `wal_checkpoint(TRUNCATE)`，关闭连接后只允许 WAL 不存在或为零字节，且 SHM 必须不存在。否则在 init 前停止调查，不能手工删除 sidecar。
 
 `init` 前读取 `MAX(schema_version)`，只接受 1、2、3、4。v1-v3 必须恰好生成一份新的 `copy2` 升级安全快照；运行前记录 schema、表行数和必要业务抽样，运行后只读打开快照并逐项比较。v4 不得生成新的升级快照或改变 schema；其他版本立即停止。`PRAGMA integrity_check` 不能单独证明逻辑等价，且 init 安全快照不是 workspace migration 的验证备份。无论源版本为何，执行迁移前仍须创建并独立验证 `--backup-plan` 返回的 SQLite、manifest 和素材归档。完整、失败即停止的命令见[主流程第 9 节](WORKFLOW.md#9-旧工作区迁移与恢复)。根迁移启动器只读预检所有引用、归属、冲突、符号链接和路径安全；报告保存到 `data/workspace-migration-preflight.json`。有阻塞不会继续；取消只留报告。v3 升级到 v4 后 NULL `owning_batch_id` 不会由 init 自动填写：预检只把具有恰好一条有效 `batch_items` 关系的文章投影给该批次，忽略 `REUSED_COMPLETE` 和 `EXCLUDED`；没有有效关系的文章继续进入旧单篇 archive，两条或更多关系会阻塞，即使来自同一批次，已有 owner 也必须只有一条匹配关系。归属投影（包括 NULL）固定写入计划和 manifest；预检后关系变化会使执行失效。执行在同一事务回填 owner、切换路径和更新 workspace version，成功 journal/receipt 绑定投影摘要。
 
