@@ -59,6 +59,25 @@ def test_cli_init_rejects_future_schema_without_backup_or_database_changes(tmp_p
         assert connection.execute("SELECT value FROM sentinel").fetchone()[0] == "preserve-me"
 
 
+def test_cli_init_rejects_unversioned_user_database_without_changes(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE legacy_content (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO legacy_content VALUES ('preserve-me')")
+        connection.commit()
+    before = db_path.read_bytes()
+
+    result = runner.invoke(app, ["--root", str(tmp_path), "init"])
+
+    assert result.exit_code != 0
+    assert "user tables" in result.output
+    assert "no schema_version" in result.output
+    assert "new empty database" in result.output
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+
+
 def test_cli_candidate_add_accepts_primary_only(tmp_path: Path):
     assert runner.invoke(app, ["--root", str(tmp_path), "init"]).exit_code == 0
 

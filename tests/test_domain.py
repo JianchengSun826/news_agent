@@ -414,6 +414,103 @@ def test_init_rejects_future_wal_schema_without_mutating_database_or_sidecars(tm
         writer.close()
 
 
+def test_init_rejects_unversioned_user_tables_without_mutation(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE legacy_content (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO legacy_content VALUES ('preserve-me')")
+        connection.commit()
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"user tables.*no schema_version.*new empty database"):
+        Database(db_path).initialize("2026-10-06T02:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute("SELECT value FROM legacy_content").fetchone()[0] == "preserve-me"
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+        ).fetchone() is None
+
+
+def test_init_rejects_unversioned_wal_user_tables_without_mutating_sidecars(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    writer = sqlite3.connect(db_path)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.execute("CREATE TABLE legacy_content (value TEXT NOT NULL)")
+        writer.execute("INSERT INTO legacy_content VALUES ('preserve-wal')")
+        writer.commit()
+        files = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")]
+        assert all(path.is_file() for path in files)
+        before = {path: path.read_bytes() for path in files}
+
+        with pytest.raises(ValueError, match=r"user tables.*no schema_version"):
+            Database(db_path).initialize("2026-10-06T02:00:00+00:00")
+
+        assert {path: path.read_bytes() for path in files} == before
+        assert not (db_path.parent / "backups").exists()
+        assert writer.execute("SELECT value FROM legacy_content").fetchone()[0] == "preserve-wal"
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize(
+    ("version_definition", "version_sql"),
+    [
+        ("version INTEGER PRIMARY KEY", ""),
+        ("version TEXT", "INSERT INTO schema_version VALUES ('invalid', 'bad')"),
+    ],
+)
+def test_init_rejects_schema_version_table_without_valid_rows(
+    tmp_path: Path, version_definition: str, version_sql: str
+):
+    db_path = tmp_path / "data/newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            f"CREATE TABLE schema_version ({version_definition}, applied_at TEXT NOT NULL)"
+        )
+        if version_sql:
+            connection.execute(version_sql)
+        connection.commit()
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"invalid database schema version"):
+        Database(db_path).initialize("2026-10-06T02:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+
+
+def test_init_rejects_corrupt_database_without_mutation(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"not-a-sqlite-database")
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"invalid or unreadable database schema version"):
+        Database(db_path).initialize("2026-10-06T02:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+
+
+def test_init_allows_existing_empty_sqlite_file(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(db_path)):
+        pass
+
+    Database(db_path).initialize("2026-10-06T02:00:00+00:00")
+
+    assert Database(db_path).one("SELECT MAX(version) AS version FROM schema_version")["version"] == 4
+    assert not (db_path.parent / "backups").exists()
+
+
 def test_init_seeds_source_registry(newsroom: Newsroom):
     sources = newsroom.db.all("SELECT source_id,domain FROM sources ORDER BY source_id")
     assert {row["domain"] for row in sources} >= {"openai.com", "reuters.com"}

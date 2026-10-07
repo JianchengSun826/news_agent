@@ -229,16 +229,28 @@ class Database:
                 if self._schema_snapshot_signature() != before:
                     raise ValueError("database changed while checking schema version; stop writers and retry")
                 with closing(sqlite3.connect(copied)) as connection:
-                    table = connection.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
-                    ).fetchone()
-                    if not table:
+                    user_tables = {
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT name FROM sqlite_master "
+                            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                        )
+                    }
+                    if "schema_version" not in user_tables:
+                        if user_tables:
+                            raise ValueError(
+                                "existing database contains user tables but no schema_version; "
+                                "restore a supported v1-v4 database or use a new empty database"
+                            )
                         return []
                     rows = connection.execute(
                         "SELECT version FROM schema_version ORDER BY version"
                     ).fetchall()
         except sqlite3.Error as error:
-            raise ValueError(f"cannot read database schema version safely: {error}") from error
+            raise ValueError(
+                f"invalid or unreadable database schema version; this newsroom supports versions "
+                f"1 through {SUPPORTED_SCHEMA_VERSION}: {error}"
+            ) from error
 
         if not rows:
             raise ValueError(
