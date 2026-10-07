@@ -3,10 +3,12 @@ from __future__ import annotations
 from contextlib import closing
 from functools import lru_cache
 import hashlib
+import os
 import re
 import shutil
 import sqlite3
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -200,16 +202,87 @@ def _normalized_default(value: str | None) -> str | None:
     return result
 
 
-def _column_contract(connection: sqlite3.Connection, table: str) -> dict[str, tuple[str, int, str | None, int]]:
+def _column_contract(
+    connection: sqlite3.Connection, table: str
+) -> dict[str, tuple[str, int, str | None, int, int]]:
     return {
         row[1]: (
             " ".join(str(row[2]).upper().split()),
             int(row[3]),
             _normalized_default(row[4]),
             int(row[5]),
+            int(row[6]),
         )
-        for row in connection.execute(f"PRAGMA table_info({_quote_identifier(table)})")
+        for row in connection.execute(f"PRAGMA table_xinfo({_quote_identifier(table)})")
     }
+
+
+def _normalized_sql_fragment(fragment: str) -> str:
+    """Canonicalize token spacing and keyword case while preserving literals."""
+    tokens = re.findall(
+        r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|"
+        r"\[(?:\]\]|[^\]])*\]|[A-Za-z_][A-Za-z0-9_$]*|"
+        r"\d+(?:\.\d+)?|<=|>=|<>|!=|==|[^\s]",
+        fragment,
+    )
+    return " ".join(
+        token if token[:1] in "'\"`[" else token.upper()
+        for token in tokens
+    )
+
+
+def _check_contract(connection: sqlite3.Connection, table: str) -> tuple[str, ...]:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    sql = str(row[0] or "") if row else ""
+    clauses: list[str] = []
+    index = 0
+    while index < len(sql):
+        if sql[index] in "'\"`[":
+            opening = sql[index]
+            closing = "]" if opening == "[" else opening
+            index += 1
+            while index < len(sql):
+                if sql[index] == closing:
+                    if index + 1 < len(sql) and sql[index + 1] == closing:
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                index += 1
+            continue
+        match = re.match(r"CHECK\s*\(", sql[index:], re.IGNORECASE)
+        if not match or (index and (sql[index - 1].isalnum() or sql[index - 1] == "_")):
+            index += 1
+            continue
+        start = index + match.end()
+        depth = 1
+        cursor = start
+        quote: str | None = None
+        while cursor < len(sql) and depth:
+            character = sql[cursor]
+            if quote:
+                if character == quote:
+                    if cursor + 1 < len(sql) and sql[cursor + 1] == quote:
+                        cursor += 1
+                    else:
+                        quote = None
+            elif character in "'\"`":
+                quote = character
+            elif character == "[":
+                quote = "]"
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            clauses.append("<unclosed>")
+            break
+        clauses.append(_normalized_sql_fragment(sql[start : cursor - 1]))
+        index = cursor
+    return tuple(sorted(clauses))
 
 
 def _foreign_key_contract(connection: sqlite3.Connection, table: str) -> set[tuple[str, str, str, str, str, str]]:
@@ -269,6 +342,7 @@ def _semantic_schema(connection: sqlite3.Connection) -> dict[str, object]:
         "tables": tables,
         "table_flags": table_flags,
         "columns": {table: _column_contract(connection, table) for table in tables},
+        "checks": {table: _check_contract(connection, table) for table in tables},
         "foreign_keys": {table: _foreign_key_contract(connection, table) for table in tables},
         "indexes": {table: _index_contract(connection, table) for table in tables},
     }
@@ -324,6 +398,8 @@ def _validate_v4_schema(connection: sqlite3.Connection, versions: list[int]) -> 
             raise ValueError(f"incompatible schema v4 table option mismatch: {table}")
         if actual["columns"][table] != expected["columns"][table]:
             raise ValueError(f"incompatible schema v4 column mismatch: {table}")
+        if actual["checks"][table] != expected["checks"][table]:
+            raise ValueError(f"incompatible schema v4 check constraint mismatch: {table}")
         if actual["foreign_keys"][table] != expected["foreign_keys"][table]:
             raise ValueError(f"incompatible schema v4 foreign key mismatch: {table}")
         if actual["indexes"][table] != expected["indexes"][table]:
@@ -430,13 +506,35 @@ class Database:
                 f"unsupported database schema version {unsupported}; this newsroom supports versions "
                 f"1 through {SUPPORTED_SCHEMA_VERSION}. Upgrade the application before running init."
             )
+        if versions:
+            maximum = max(versions)
+            if versions != list(range(1, maximum + 1)):
+                raise ValueError(
+                    f"invalid database schema version history; expected versions 1 through {maximum}"
+                )
         return max(versions, default=0)
 
     def _backup_before_upgrade(self, version: int, applied_at: str) -> None:
         backup_dir = self.path.parent / "backups"
         backup_dir.mkdir(parents=True, exist_ok=True)
         stamp = re.sub(r"[^0-9A-Za-z]+", "", applied_at)
-        shutil.copy2(self.path, backup_dir / f"newsroom-v{version}-{stamp}.db")
+        for _ in range(10):
+            destination = backup_dir / f"newsroom-v{version}-{stamp}-{uuid.uuid4().hex}.db"
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".newsroom-upgrade-", suffix=".tmp", dir=backup_dir
+            )
+            os.close(descriptor)
+            temporary = Path(temporary_name)
+            try:
+                shutil.copy2(self.path, temporary)
+                try:
+                    os.link(temporary, destination)
+                except FileExistsError:
+                    continue
+                return
+            finally:
+                temporary.unlink(missing_ok=True)
+        raise FileExistsError("could not allocate a unique pre-upgrade snapshot name")
 
     def _require_clear_sidecars(self) -> None:
         wal = Path(f"{self.path}-wal")

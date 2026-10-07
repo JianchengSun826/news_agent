@@ -80,3 +80,21 @@ def test_rehearsal_copy_copies_normal_root_coherently_and_preserves_symlinks(tmp
     assert (target / "research/reference").is_symlink()
     assert (target / "research/reference").readlink() == Path("source.md")
     assert _source_bytes(source) == before
+
+
+def test_rehearsal_copy_rejects_symlink_target_even_when_destination_is_empty(tmp_path: Path):
+    source = tmp_path / "source"
+    destination = tmp_path / "empty-destination"
+    target = tmp_path / "target-link"
+    Newsroom(source).init()
+    destination.mkdir()
+    target.symlink_to(destination, target_is_directory=True)
+    before = _source_bytes(source)
+
+    result = _run(source, target)
+
+    assert result.returncode != 0
+    assert "target must not be a symlink" in result.stderr
+    assert target.is_symlink()
+    assert list(destination.iterdir()) == []
+    assert _source_bytes(source) == before

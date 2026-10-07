@@ -19,7 +19,10 @@ DATABASE_FILES = {"newsroom.db", "newsroom.db-wal", "newsroom.db-shm"}
 
 def create_rehearsal_copy(source_root: Path, target_root: Path) -> dict[str, object]:
     source = source_root.resolve()
-    target = target_root.resolve()
+    requested_target = Path(os.path.abspath(target_root))
+    if requested_target.is_symlink():
+        raise ValueError("rehearsal target must not be a symlink")
+    target = requested_target.resolve()
     source_data = source / "data"
     source_database = source_data / "newsroom.db"
 
@@ -33,8 +36,6 @@ def create_rehearsal_copy(source_root: Path, target_root: Path) -> dict[str, obj
             raise ValueError(f"missing source database: {source_database}")
         if target == source or target.is_relative_to(source) or source.is_relative_to(target):
             raise ValueError("rehearsal target must be separate from the source root")
-        if target.is_symlink():
-            raise ValueError("rehearsal target must not be a symlink")
         if target.exists() and any(target.iterdir()):
             raise ValueError("rehearsal target must be absent or empty")
         target.mkdir(parents=True, exist_ok=True)

@@ -3,6 +3,7 @@ import json
 import shutil
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -488,6 +489,67 @@ def test_init_rejects_schema_version_table_without_valid_rows(
     assert not (db_path.parent / "backups").exists()
 
 
+@pytest.mark.parametrize("versions", [[1, 1], [1, 3], [2]])
+def test_init_rejects_malformed_supported_version_history_without_mutation(
+    tmp_path: Path, versions: list[int]
+):
+    db_path = tmp_path / "data/newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE schema_version (version INTEGER, applied_at TEXT NOT NULL)")
+        connection.executemany(
+            "INSERT INTO schema_version(version, applied_at) VALUES (?, 'fixture')",
+            [(version,) for version in versions],
+        )
+        connection.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO sentinel VALUES ('preserve-me')")
+        connection.commit()
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"version history.*expected versions 1 through"):
+        Database(db_path).initialize("2026-10-07T00:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute("SELECT value FROM sentinel").fetchone()[0] == "preserve-me"
+
+
+def test_init_rejects_v4_generated_column_before_changes(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    Database(db_path).initialize("2026-10-06T02:00:00+00:00")
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            "ALTER TABLE candidates ADD COLUMN generated_extra TEXT "
+            "GENERATED ALWAYS AS (status) VIRTUAL"
+        )
+        connection.commit()
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"column mismatch.*candidates"):
+        Database(db_path).initialize("2026-10-07T00:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+
+
+def test_init_rejects_added_v4_table_check_before_changes(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    schema_with_check = SCHEMA.replace(
+        "  active INTEGER NOT NULL DEFAULT 1\n);",
+        "  active INTEGER NOT NULL DEFAULT 1,\n  CHECK (active IN (0, 1))\n);",
+        1,
+    )
+    _create_labeled_v4_database(db_path, schema_with_check)
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"check constraint mismatch.*sources"):
+        Database(db_path).initialize("2026-10-07T00:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+
+
 def test_init_rejects_corrupt_database_without_mutation(tmp_path: Path):
     db_path = tmp_path / "data/newsroom.db"
     db_path.parent.mkdir(parents=True)
@@ -698,6 +760,28 @@ def test_direct_initialize_checkpoints_v3_wal_before_complete_backup(tmp_path: P
     assert current.one("SELECT notes FROM sources WHERE source_id='wal-source'")["notes"] == "committed WAL row"
 
 
+def test_pre_upgrade_snapshot_collision_preserves_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    db_path = build_persistent_v3_wal_database(tmp_path)
+    backups = db_path.parent / "backups"
+    backups.mkdir()
+    existing = backups / "newsroom-v3-20261006T0300000000-collision.db"
+    existing.write_bytes(b"keep-existing-snapshot")
+    tokens = iter(("collision", "fresh"))
+    monkeypatch.setattr(
+        "newsroom.db.uuid.uuid4",
+        lambda: SimpleNamespace(hex=next(tokens)),
+    )
+
+    Database(db_path).initialize("2026-10-06T03:00:00+00:00")
+
+    assert existing.read_bytes() == b"keep-existing-snapshot"
+    snapshots = list(backups.glob("newsroom-v3-*.db"))
+    assert len(snapshots) == 2
+    assert (backups / "newsroom-v3-20261006T0300000000-fresh.db").is_file()
+
+
 @pytest.mark.parametrize(
     ("checkpoint", "message"),
     [((1, 2, 0), "busy or incomplete"), ((0, 2, 1), "busy or incomplete"), ((0, 2, 2), "sidecars remain")],
@@ -811,8 +895,9 @@ def build_v3_database(tmp_path: Path) -> Path:
     schema = schema.replace("  workspace_version INTEGER NOT NULL DEFAULT 0,\n", "")
     with sqlite3.connect(db_path) as connection:
         connection.executescript(schema)
-        connection.execute(
-            "INSERT INTO schema_version VALUES (3, '2026-10-04T00:00:00+00:00')"
+        connection.executemany(
+            "INSERT INTO schema_version VALUES (?, '2026-10-04T00:00:00+00:00')",
+            [(version,) for version in range(1, 4)],
         )
         connection.execute(
             "INSERT INTO batches(batch_id,source_filename,source_sha256,status,created_at,updated_at) "
