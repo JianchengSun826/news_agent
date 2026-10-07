@@ -12,7 +12,7 @@ uv run newsroom --root . batch prepare ~/Downloads/tech-newsroom-candidates.csv
 
 在 Finder 打开 `workspace/README.md`，找到批次并双击 `workspace/batches/BATCH_ID/OPEN_BATCH.command`。批次 README 显示当前任务、文章版本和相对链接；`actions/` 的八个启动器完成 Claude 交接、图片登记、整批审核、批准和发布包。启动时 Terminal 可能短暂出现，文件选择和确认由 macOS 对话框完成。Finder 操作仅支持 macOS；候选审核与重复项歧义仍在导入前后由编辑处理。
 
-`init` 初始化或升级数据库 schema，并幂等写入配置的来源种子；它不移动文章素材，也不创建旧的 `research/`、`articles/`、`images/` 或 `output/`。rehearsal copy 前先停止所有 newsroom/Finder 操作及 SQLite 写入者，在独占 operation lock 内检查 journal/WAL 状态，并用 SQLite backup API 捕获连贯数据库。production init 及其主文件 `copy2` 安全快照要求更严格：按[迁移与恢复说明](docs/WORKFLOW.md#9-旧工作区迁移与恢复)在锁内执行非 busy、完整的 `wal_checkpoint(TRUNCATE)`；关闭连接后只允许 WAL 不存在或为零字节，并要求 SHM 不存在。否则停止调查，绝不能手工删除 sidecar。schema v1-v3 才应生成一份新的升级安全快照；已是 v4 时不应生成升级快照或改变 schema；其他版本必须停止。该安全副本不能替代迁移系统的 verified backup。已有旧素材须在包含现有 `workspace/` 且保留符号链接身份的连贯副本中演练后再迁移。迁移若归档了版本库中旧 `output/.gitkeep`，Git 显示它被删除是预期的代码清理；提交该删除，成功 receipt 后不要在运行目录手工重建它。
+`init` 初始化或升级数据库 schema，并幂等写入配置的来源种子；它不移动文章素材，也不创建旧的 `research/`、`articles/`、`images/` 或 `output/`。当前可执行程序最高支持 schema v4，并在任何备份、建表、升级或来源写入前拒绝未来版本与负版本。rehearsal copy 前先停止所有 newsroom/Finder 操作及 SQLite 写入者，在独占 operation lock 内检查 journal/WAL 状态，并用 SQLite backup API 捕获连贯数据库。production init 及其主文件 `copy2` 安全快照要求更严格：按[迁移与恢复说明](docs/WORKFLOW.md#9-旧工作区迁移与恢复)在锁内执行非 busy、完整的 `wal_checkpoint(TRUNCATE)`；使用 `contextlib.closing` 明确关闭连接后，才检查 WAL 不存在或为零字节且 SHM 不存在。否则停止调查，绝不能手工删除 sidecar。schema v1-v3 才应生成一份新的升级安全快照；已是 v4 时不应生成升级快照或改变 schema；其他版本必须停止。该安全副本不能替代迁移系统的 verified backup。已有旧素材须在包含现有 `workspace/` 且保留符号链接身份的连贯副本中演练后再迁移。迁移若归档了版本库中旧 `output/.gitkeep`，Git 显示它被删除是预期的代码清理；提交该删除，成功 receipt 后不要在运行目录手工重建它。
 
 ## Workflow
 

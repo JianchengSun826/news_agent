@@ -827,7 +827,7 @@ trap - ERR
 
 - [ ] **Step 2: Run preflight and migration against the rehearsal**
 
-Inspect `MAX(schema_version)` before init and accept only 1, 2, 3, or 4. `init` initializes/upgrades schema and idempotently seeds configured sources; it does not move article artifacts. For v1-v3, require exactly one new automatic pre-upgrade `copy2` snapshot, then compare its hash, schema, row counts, and integrity result with the pre-init evidence. For v4, require no new upgrade snapshot and no schema change. Reject every other version. The copy2 snapshot is only an upgrade safety copy and never replaces the verified workspace migration backup created below.
+Inspect `MAX(schema_version)` before init and accept only 1, 2, 3, or 4. The executable supports at most v4 and rejects future or negative versions before backup, schema changes, upgrade work, or source seeding. `init` initializes/upgrades schema and idempotently seeds configured sources; it does not move article artifacts. For v1-v3, require exactly one new automatic pre-upgrade `copy2` snapshot, then compare its hash, schema, row counts, and integrity result with the pre-init evidence. For v4, require no new upgrade snapshot and no schema change. Reject every other version. The copy2 snapshot is only an upgrade safety copy and never replaces the verified workspace migration backup created below.
 
 After the init safety copy is validated, use the fail-fast sequence from `docs/WORKFLOW.md`: save preflight stdout as JSON, parse its `report_path` into `PLAN`, run `--backup-plan --plan "$PLAN"`, parse the returned JSON `backup_path` into `BACKUP`, independently call `WorkspaceMigrator.verify_backup(BACKUP)`, and only then run `--execute --plan "$PLAN" --backup "$BACKUP"`. Use `set -euo pipefail`; any failed command or JSON/path validation must stop before the next mutation. The exact CLI contract is:
 
@@ -906,6 +906,7 @@ PY
 )"
 
 uv run python - "$NEWSROOM_ROOT" <<'PY'
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import sys
@@ -918,7 +919,9 @@ database = root / "data/newsroom.db"
 wal = Path(f"{database}-wal")
 shm = Path(f"{database}-shm")
 with operation_lock(root, exclusive=True):
-    with sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True) as connection:
+    with closing(
+        sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True)
+    ) as connection:
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
         print(f"journal_mode={journal_mode}")
         if journal_mode.lower() == "wal":

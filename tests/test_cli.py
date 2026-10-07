@@ -1,5 +1,7 @@
+from contextlib import closing
 import csv
 import json
+import sqlite3
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -31,6 +33,30 @@ def test_cli_init_is_idempotent(tmp_path: Path, capsys):
     assert second.exit_code == 0
     assert (tmp_path / "data" / "newsroom.db").exists()
     assert "initialized" in second.output.lower()
+
+
+def test_cli_init_rejects_future_schema_without_backup_or_database_changes(tmp_path: Path):
+    db_path = tmp_path / "data" / "newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO schema_version VALUES (5, 'future')")
+        connection.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO sentinel VALUES ('preserve-me')")
+        connection.commit()
+    before = db_path.read_bytes()
+
+    result = runner.invoke(app, ["--root", str(tmp_path), "init"])
+
+    assert result.exit_code != 0
+    assert "schema version 5" in result.output
+    assert "supports versions 1 through 4" in result.output
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute("SELECT value FROM sentinel").fetchone()[0] == "preserve-me"
 
 
 def test_cli_candidate_add_accepts_primary_only(tmp_path: Path):

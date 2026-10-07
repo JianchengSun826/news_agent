@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import sqlite3
 from pathlib import Path
@@ -269,10 +270,11 @@ def test_database_schema_contains_audit_and_registry(newsroom: Newsroom):
 def test_init_migrates_v1_images_table_to_store_image_path(tmp_path: Path):
     db_path = tmp_path / "data" / "newsroom.db"
     db_path.parent.mkdir(parents=True)
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         connection.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
         connection.execute("INSERT INTO schema_version VALUES (1, '2026-09-29T00:00:00+00:00')")
         connection.execute("CREATE TABLE images (image_id TEXT PRIMARY KEY)")
+        connection.commit()
 
     Database(db_path).initialize("2026-09-30T00:00:00+00:00")
 
@@ -351,6 +353,65 @@ def test_version_4_init_is_idempotent_and_does_not_create_extra_backup(tmp_path:
     room.init()
 
     assert list((tmp_path / "data" / "backups").glob("*.db")) == []
+
+
+@pytest.mark.parametrize("unsupported_version", [5, -1])
+def test_init_rejects_unsupported_schema_without_mutating_database(
+    tmp_path: Path, unsupported_version: int
+):
+    db_path = tmp_path / "data" / "newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO schema_version VALUES (?, '2026-10-06T00:00:00+00:00')",
+            (unsupported_version,),
+        )
+        connection.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO sentinel VALUES ('preserve-me')")
+        connection.commit()
+
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"schema version.*supports versions 1 through 4"):
+        Database(db_path).initialize("2026-10-06T01:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+    assert not (db_path.parent / "backups").exists()
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute("SELECT value FROM sentinel").fetchone()[0] == "preserve-me"
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == unsupported_version
+
+
+def test_init_rejects_future_wal_schema_without_mutating_database_or_sidecars(tmp_path: Path):
+    db_path = tmp_path / "data" / "newsroom.db"
+    db_path.parent.mkdir(parents=True)
+    writer = sqlite3.connect(db_path)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.execute(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        writer.execute("INSERT INTO schema_version VALUES (5, 'future')")
+        writer.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+        writer.execute("INSERT INTO sentinel VALUES ('preserve-wal')")
+        writer.commit()
+        files = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")]
+        assert all(path.is_file() for path in files)
+        before = {path: path.read_bytes() for path in files}
+
+        with pytest.raises(ValueError, match=r"schema version 5.*supports versions 1 through 4"):
+            Database(db_path).initialize("2026-10-06T01:00:00+00:00")
+
+        assert {path: path.read_bytes() for path in files} == before
+        assert not (db_path.parent / "backups").exists()
+        assert writer.execute("SELECT value FROM sentinel").fetchone()[0] == "preserve-wal"
+    finally:
+        writer.close()
 
 
 def test_init_seeds_source_registry(newsroom: Newsroom):

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-import sqlite3
-import shutil
+from contextlib import closing
+import hashlib
 import re
+import shutil
+import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
 from .batch_models import candidate_fingerprint
+
+
+SUPPORTED_SCHEMA_VERSION = 4
 
 
 SCHEMA = """
@@ -187,17 +193,77 @@ class Database:
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
-    def _existing_version(self) -> int:
+    @staticmethod
+    def _digest(path: Path) -> str:
+        with path.open("rb") as handle:
+            return hashlib.file_digest(handle, "sha256").hexdigest()
+
+    def _schema_snapshot_signature(self) -> dict[str, tuple[str, int, int]]:
+        signature: dict[str, tuple[str, int, int]] = {}
+        for suffix in ("", "-wal", "-shm"):
+            source = Path(f"{self.path}{suffix}")
+            if not source.exists():
+                continue
+            metadata = source.stat()
+            signature[suffix] = (
+                self._digest(source),
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+        return signature
+
+    def _existing_versions(self) -> list[int]:
         if not self.path.exists():
-            return 0
-        with sqlite3.connect(self.path) as connection:
-            table = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
-            ).fetchone()
-            if not table:
-                return 0
-            row = connection.execute("SELECT MAX(version) FROM schema_version").fetchone()
-            return int(row[0] or 0)
+            return []
+
+        sources = {suffix: Path(f"{self.path}{suffix}") for suffix in ("", "-wal", "-shm")}
+        before = self._schema_snapshot_signature()
+        try:
+            with tempfile.TemporaryDirectory(prefix="newsroom-schema-check-") as temporary:
+                copied = Path(temporary) / "newsroom.db"
+                for suffix, (digest, _, _) in before.items():
+                    destination = Path(f"{copied}{suffix}")
+                    shutil.copyfile(sources[suffix], destination)
+                    if self._digest(destination) != digest:
+                        raise ValueError("database changed while checking schema version; stop writers and retry")
+                if self._schema_snapshot_signature() != before:
+                    raise ValueError("database changed while checking schema version; stop writers and retry")
+                with closing(sqlite3.connect(copied)) as connection:
+                    table = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+                    ).fetchone()
+                    if not table:
+                        return []
+                    rows = connection.execute(
+                        "SELECT version FROM schema_version ORDER BY version"
+                    ).fetchall()
+        except sqlite3.Error as error:
+            raise ValueError(f"cannot read database schema version safely: {error}") from error
+
+        if not rows:
+            raise ValueError(
+                f"invalid database schema version table; this newsroom supports versions 1 through "
+                f"{SUPPORTED_SCHEMA_VERSION}"
+            )
+        if any(type(row[0]) is not int for row in rows):
+            raise ValueError(
+                f"invalid database schema version value; this newsroom supports versions 1 through "
+                f"{SUPPORTED_SCHEMA_VERSION}"
+            )
+        return [row[0] for row in rows]
+
+    def _existing_version(self) -> int:
+        versions = self._existing_versions()
+        unsupported = next(
+            (version for version in versions if version < 1 or version > SUPPORTED_SCHEMA_VERSION),
+            None,
+        )
+        if unsupported is not None:
+            raise ValueError(
+                f"unsupported database schema version {unsupported}; this newsroom supports versions "
+                f"1 through {SUPPORTED_SCHEMA_VERSION}. Upgrade the application before running init."
+            )
+        return max(versions, default=0)
 
     def _backup_before_upgrade(self, version: int, applied_at: str) -> None:
         backup_dir = self.path.parent / "backups"
@@ -237,8 +303,8 @@ class Database:
             )
 
     def initialize(self, applied_at: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         existing_version = self._existing_version()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         if existing_version in {1, 2, 3}:
             self._backup_before_upgrade(existing_version, applied_at)
         with self.connect() as connection:

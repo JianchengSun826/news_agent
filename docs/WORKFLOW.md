@@ -165,6 +165,7 @@ uv run newsroom --root . batch refresh-workspace BATCH_ID
 set -euo pipefail
 NEWSROOM_ROOT="/path/to/newsroom-root"
 uv run python - "$NEWSROOM_ROOT" <<'PY'
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import sys
@@ -177,7 +178,9 @@ database = root / "data/newsroom.db"
 wal = Path(f"{database}-wal")
 shm = Path(f"{database}-shm")
 with operation_lock(root, exclusive=True):
-    with sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True) as connection:
+    with closing(
+        sqlite3.connect(database.resolve().as_uri() + "?mode=rw", uri=True)
+    ) as connection:
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
         print(f"journal_mode={journal_mode}")
         if journal_mode.lower() == "wal":
@@ -201,7 +204,7 @@ with operation_lock(root, exclusive=True):
 PY
 ```
 
-运行 `init` 前先读取 `MAX(schema_version)`，仅接受 1、2、3 或 4。v1-v3 升级时必须恰好生成一份 `data/backups/newsroom-v旧版本-时间.db`；这份 `copy2` 只是安全快照，并非迁移系统的验证备份。只读打开它，检查 `PRAGMA integrity_check`，并与升级前记录的 schema、各表行数和必要业务抽样逐项比较。v4 初始化不得生成新的升级快照或改变 schema；来源种子仍按配置幂等核对。其他版本立即停止。完整性检查单独通过不证明逻辑等价。任何差异都必须停止；无论源版本为何，执行迁移前仍必须运行 `--backup-plan` 并独立验证其 SQLite、manifest 与素材归档。启动器会保存预检报告、要求明确确认，然后创建这份验证备份。取消只留下报告，不移动素材、不改变数据库。迁移不是发布，也不推进文章状态。
+运行 `init` 前先读取 `MAX(schema_version)`，仅接受 1、2、3 或 4；当前可执行程序支持的最高版本是 v4，并会在备份、建表、迁移或来源写入前拒绝未来版本和负版本。v1-v3 升级时必须恰好生成一份 `data/backups/newsroom-v旧版本-时间.db`；这份 `copy2` 只是安全快照，并非迁移系统的验证备份。只读打开它，检查 `PRAGMA integrity_check`，并与升级前记录的 schema、各表行数和必要业务抽样逐项比较。v4 初始化不得生成新的升级快照或改变 schema；来源种子仍按配置幂等核对。其他版本立即停止。完整性检查单独通过不证明逻辑等价。任何差异都必须停止；无论源版本为何，执行迁移前仍必须运行 `--backup-plan` 并独立验证其 SQLite、manifest 与素材归档。启动器会保存预检报告、要求明确确认，然后创建这份验证备份。取消只留下报告，不移动素材、不改变数据库。迁移不是发布，也不推进文章状态。
 
 完成 init 安全快照核对后，可运行 `uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --preflight`。此命令只读取数据库与文件，并把确定性的 JSON 清单保存到 `$NEWSROOM_ROOT/data/workspace-migration-preflight.json`；它不会更新流程状态、移动素材或创建迁移暂存目录。v3 升级到 v4 时新增的 `owning_batch_id` 默认仍为 NULL；预检会读取 `batch_items` 形成明确的归属投影。NULL 文章只有恰好一条非 `REUSED_COMPLETE`、非 `EXCLUDED` 关系时归入该批次，零条时保留为 `legacy-single-articles`，两条或更多时阻塞，即使这些关系来自同一批次。已有 owner 也必须与恰好一条有效关系一致；复用和排除关系永远不能取得或转移归属。完整投影（包括 NULL）写入计划与 manifest，当前及历史 request/result 也按投影 owner 分流。预检后任何 `batch_items` 或其他数据库变化都会令执行失效；执行只在同一数据库事务中回填 NULL owner、切换路径和写入 `workspace_version=1`，不会在预检阶段修改数据库。journal 和成功 receipt 绑定投影摘要，后续准入重新验证实际 owner。
 
