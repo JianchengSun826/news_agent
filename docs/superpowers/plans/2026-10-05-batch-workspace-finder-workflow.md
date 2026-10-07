@@ -743,7 +743,7 @@ git commit -m "docs: adopt Finder-first batch workflow"
 
 **Files:**
 - Runtime only: copied rehearsal directory, `data/backups/`, `workspace/`
-- No tracked source changes expected.
+- Tracked cleanup after acceptance: `.gitignore`, operator docs, and an obsolete legacy placeholder deletion when migration archives it.
 
 **Interfaces:**
 - Consumes: verified migration commands and the current real database/artifact tree.
@@ -772,10 +772,22 @@ PY
 
 - [ ] **Step 2: Run preflight and migration against the rehearsal**
 
-Run:
+Old-schema copies must be initialized before migration preflight. `init` creates the automatic pre-upgrade database backup and upgrades schema only; it does not move artifacts. Open the newest `newsroom-vOLD-*.db` backup read-only and require `PRAGMA integrity_check` to return `ok` before continuing. Run:
 
 ```bash
 rehearsal_root="$(cat /tmp/newsroom-migration-rehearsal-path)"
+uv run newsroom --root "$rehearsal_root" init
+backup="$(ls -t "$rehearsal_root"/data/backups/newsroom-v*.db | head -n 1)"
+python3 - "$backup" <<'PY'
+from pathlib import Path
+import sqlite3
+import sys
+
+with sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True) as connection:
+    result = connection.execute("PRAGMA integrity_check").fetchone()[0]
+if result != "ok":
+    raise SystemExit(f"backup integrity check failed: {result}")
+PY
 uv run newsroom --root "$rehearsal_root" workspace migrate --preflight
 uv run newsroom --root "$rehearsal_root" workspace migrate --execute
 uv run newsroom --root "$rehearsal_root" batch status batch-17b6fd5a5e68
@@ -789,14 +801,14 @@ Regenerate dashboards, open the copied batch README, validate current Claude req
 
 - [ ] **Step 4: Run real preflight and inspect the saved report**
 
-Run the root `Migrate Newsroom.command` or equivalent `workspace migrate --preflight`. Confirm no blocking errors and that all claimed, legacy, and unclaimed files appear in the report.
+Run `uv run newsroom --root "$PWD" init` first for an old-schema production database. Confirm the newly created pre-upgrade DB backup opens read-only and passes `PRAGMA integrity_check` before running the root `Migrate Newsroom.command` or equivalent `uv run newsroom --root "$PWD" workspace migrate --preflight`. Confirm no blocking errors and that all claimed, legacy, and unclaimed files appear in the report.
 
 - [ ] **Step 5: Execute the already-authorized real migration**
 
 Execute migration, then verify:
 
 ```bash
-uv run newsroom batch status batch-17b6fd5a5e68
+uv run newsroom --root "$PWD" batch status batch-17b6fd5a5e68
 uv run pytest -q
 bash scripts/demo.sh
 ```
@@ -806,6 +818,8 @@ Open `workspace/README.md`, the current batch README, the next request, both arc
 - [ ] **Step 6: Record acceptance evidence**
 
 Save the preflight report, migration result, backup path, manifest hash, test result, demo result, and current-batch status in `workspace/migration-acceptance.md`. Do not commit runtime evidence.
+
+If migration archived a tracked legacy placeholder such as `output/.gitkeep`, keep its Git deletion and ignore the complete obsolete top-level root. Do not recreate the placeholder after the committed receipt; record the tracked cleanup in a focused code commit without changing recovery or backup data.
 
 ### Task 12: Isolated Scheme A Prototype Handoff
 

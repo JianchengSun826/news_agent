@@ -15,8 +15,7 @@ data/*.migration-restore
 articles/
 images/
 research/
-output/*/
-!output/.gitkeep
+output/
 demo-workspace/
 dist/
 

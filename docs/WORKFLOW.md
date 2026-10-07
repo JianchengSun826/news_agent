@@ -19,8 +19,8 @@ candidate_title,core_fact,event_date,company,product,topic,subtopic,event_type,k
 ```bash
 cd /Users/jianchengsun/agent/news_agent
 uv sync --locked --dev
-uv run newsroom init
-uv run newsroom batch prepare ~/Downloads/tech-newsroom-candidates.csv
+uv run newsroom --root . init
+uv run newsroom --root . batch prepare ~/Downloads/tech-newsroom-candidates.csv
 ```
 
 `init` 幂等升级 schema，升级旧数据库前备份到 `data/backups/`；全新根目录只创建 `data/` 与数据库/协调文件，不创建旧运行目录。`batch prepare` 验证整份 CSV、按指纹复用候选、自动选择确定性的 `NEW` 并创建文章及工作区。相同 CSV 字节返回原批次；以前执行过 `candidate import` 也可复用。结果包含 `batch_id`、`content_request_path`、`counts` 和 `items`。
@@ -157,17 +157,34 @@ uv run newsroom batch refresh-workspace BATCH_ID
 
 ## 9. 旧工作区迁移与恢复
 
-先复制数据库和全部素材到独立目录演练并核对恢复证据，再使用真实工作区的 `workspace/Migrate Newsroom.command`。启动器保存并打开只读预检报告，有阻塞就拒绝继续；编辑明确确认后才创建验证备份和执行。取消只留下报告，不移动素材、不改变数据库。没有生成启动器时可用以下 CLI。迁移不是发布，也不推进文章状态。
+先复制数据库和全部素材到独立目录演练并核对恢复证据，再使用真实工作区的 `workspace/Migrate Newsroom.command`。旧 schema 仓库必须在副本和真实根目录分别先运行 `uv run newsroom --root "$NEWSROOM_ROOT" init`。`init` 只升级数据库 schema，不迁移素材；升级前会在 `$NEWSROOM_ROOT/data/backups/` 自动保留 `newsroom-v旧版本-时间.db`。先用 SQLite 打开该备份并确认 `PRAGMA integrity_check` 返回 `ok`，再开始迁移预检。启动器保存并打开只读预检报告，有阻塞就拒绝继续；编辑明确确认后才创建验证备份和执行。取消只留下报告，不移动素材、不改变数据库。没有生成启动器时可用以下 CLI。迁移不是发布，也不推进文章状态。
 
-迁移旧工作区前，可运行 `uv run newsroom workspace migrate --preflight`。此命令只读取数据库与文件，并把确定性的 JSON 清单保存到 `data/workspace-migration-preflight.json`；它不会更新流程状态、移动素材或创建迁移暂存目录。v3 升级到 v4 时新增的 `owning_batch_id` 默认仍为 NULL；预检会读取 `batch_items` 形成明确的归属投影。NULL 文章只有恰好一条非 `REUSED_COMPLETE`、非 `EXCLUDED` 关系时归入该批次，零条时保留为 `legacy-single-articles`，两条或更多时阻塞，即使这些关系来自同一批次。已有 owner 也必须与恰好一条有效关系一致；复用和排除关系永远不能取得或转移归属。完整投影（包括 NULL）写入计划与 manifest，当前及历史 request/result 也按投影 owner 分流。预检后任何 `batch_items` 或其他数据库变化都会令执行失效；执行只在同一数据库事务中回填 NULL owner、切换路径和写入 `workspace_version=1`，不会在预检阶段修改数据库。journal 和成功 receipt 绑定投影摘要，后续准入重新验证实际 owner。
+```bash
+NEWSROOM_ROOT="/path/to/old-repository"
+uv run newsroom --root "$NEWSROOM_ROOT" init
+backup="$(ls -t "$NEWSROOM_ROOT"/data/backups/newsroom-v*.db | head -n 1)"
+python3 - "$backup" <<'PY'
+from pathlib import Path
+import sqlite3
+import sys
+
+with sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True) as connection:
+    result = connection.execute("PRAGMA integrity_check").fetchone()[0]
+if result != "ok":
+    raise SystemExit(f"backup integrity check failed: {result}")
+print(f"backup verified: {sys.argv[1]}")
+PY
+```
+
+完成升级备份验证后，可运行 `uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --preflight`。此命令只读取数据库与文件，并把确定性的 JSON 清单保存到 `$NEWSROOM_ROOT/data/workspace-migration-preflight.json`；它不会更新流程状态、移动素材或创建迁移暂存目录。v3 升级到 v4 时新增的 `owning_batch_id` 默认仍为 NULL；预检会读取 `batch_items` 形成明确的归属投影。NULL 文章只有恰好一条非 `REUSED_COMPLETE`、非 `EXCLUDED` 关系时归入该批次，零条时保留为 `legacy-single-articles`，两条或更多时阻塞，即使这些关系来自同一批次。已有 owner 也必须与恰好一条有效关系一致；复用和排除关系永远不能取得或转移归属。完整投影（包括 NULL）写入计划与 manifest，当前及历史 request/result 也按投影 owner 分流。预检后任何 `batch_items` 或其他数据库变化都会令执行失效；执行只在同一数据库事务中回填 NULL owner、切换路径和写入 `workspace_version=1`，不会在预检阶段修改数据库。journal 和成功 receipt 绑定投影摘要，后续准入重新验证实际 owner。
 
 缺失的数据库引用、路径逃逸、符号链接、归属歧义或目标冲突会阻塞迁移并返回非零状态。唯一自动拆分的冲突是：同一旧单篇文章归属明确、一个数据库绑定文件占用首选 archive 目标，而其他未绑定旧文件也投影到该目标。首选文件保留规范名称，额外文件分别进入该文章的 `legacy-files/原始相对目录/`，文件名附加由原始 UTF-8 相对路径生成的稳定摘要；大小写或 Unicode 规范等价的源路径仍会得到不同目标名称。名称超过目标文件系统限制时按 UTF-8 字节边界确定性截短并尽量保留扩展名；复制的原始父目录组件也必须是有效 UTF-8 并分别符合目标限制，程序不会静默改名。无法取得可用限制、连摘要都放不下或任一父目录组件超限时预检阻断。这会同时保留所有不同字节，并避免 macOS 路径碰撞。两个数据库记录即使引用完全相同的源、目标和字段也会阻塞；仅由未绑定文件组成的冲突、跨文章或不明归属、文件/祖先冲突、符号链接、路径逃逸及已有目标同样阻塞。仅同一已验证条目的源和目标完全相同时，已有目标才视为原地保留，其他计划移动走的源路径不能被复用。程序不会覆盖、删除或按内容去重。归属推断会收集路径中的全部文章和批次 ID，并按 macOS 大小写规则比较；出现多个候选或文章与批次候选不一致时，在归档分流前阻断。只有数据库绑定条目会更新 SQLite 路径，全部安全分流的条目都会进入清单和验证备份。可重复使用 `--source-csv PATH` 指定原始 CSV，只有字节级 SHA-256 与已记录批次一致时才会列为可复制输入；缺失原始 CSV 不会阻塞。
 
 迁移属于 Phase 1.1 的本地人工操作。先在复制的数据库和素材目录中演练，再操作真实工作区。预检报告审核通过后，可显式备份并执行：
 
 ```bash
-uv run newsroom workspace migrate --backup-plan --plan data/workspace-migration-preflight.json
-uv run newsroom workspace migrate --execute --plan data/workspace-migration-preflight.json --backup data/backups/WORKSPACE_MIGRATION_BACKUP
+uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --backup-plan --plan "$NEWSROOM_ROOT/data/workspace-migration-preflight.json"
+uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --execute --plan "$NEWSROOM_ROOT/data/workspace-migration-preflight.json" --backup "$NEWSROOM_ROOT/data/backups/WORKSPACE_MIGRATION_BACKUP"
 ```
 
 `--backup-plan` 仅接受仍然有效且没有阻塞问题的清单，在 `data/backups/` 创建 SQLite 备份、素材归档、报告和 manifest，并重新打开数据库、检查归档成员安全性、提取并核对所有文件哈希后才返回。失败的备份会删除或标记 `INCOMPLETE`，不得用于迁移。`--execute` 要求备份与清单、当前数据库及全部素材完全一致；复制前和数据库事务提交前均重新校验来源。完整批次与 archive 在 `workspace/.migration-staging-*` 暂存，用临时数据库重建视图并校验，随后在单个事务中切换所有路径和 `workspace_version=1`，再原子替换目录。每个暂存批次始终重新生成根目录/批次 README、batch-state.json、图片候选视图、操作启动器和 inbox 指引；源视图缺失、过时或包含旧路径不阻塞有效迁移，原视图字节仍保存在验证备份及恢复树。现有 canonical 输入和素材保留原字节并严格验证，生成视图按当前渲染结果及暂存文件哈希验证，缺失的 CSV 仅记录元数据。发布包验证使用一次性目录，不推进流程状态、不替换当前发布包。
@@ -175,6 +192,8 @@ uv run newsroom workspace migrate --execute --plan data/workspace-migration-pref
 发布验证按归属分开处理。具有 `owning_batch_id` 的当前批次文章必须与恰好一条指向 owner 的有效 `batch_items` 记录一致；同一批次的重复有效记录也会阻塞。`APPROVED`/`PUBLISHED` 文章仍须满足当前 PASS、图片、审核素材与现有发布包检查。NULL owner 只有在没有有效成员关系时才是旧单篇 archive；任何有效关系都会投影 owner，不能借 NULL 绕过闸门。`REUSED_COMPLETE` 与 `EXCLUDED` 不取得归属，也不触发复用批次的包验证。未归属的历史发布包按原字节归档，不重新生成，也不要求旧记录补写当前 `fact_check_outcome`、图片或新版 package 字段；若旧包中存在文章/图片身份或可与数据库当前引用比较的素材，二者必须一致。旧 `metadata.json` 可省略 `image_id` 和 `revision_number`；一旦存在，前者须精确匹配文章图片身份，后者须以整数类型和值精确匹配当前 revision。旧路径字段、版本化 hero 文件名和缺少新版可选成员均可保留。
 
 只有最终验证成功后，才把 research/、articles/、images/、output/ 的完整旧目录原子改名移入 journal 绑定的 data/workspace-migration-recovery/；移动后再次核对文件哈希与目录清单。旧源文件永不自动 unlink 或递归删除，原 inode 与编辑器打开句柄写入的字节持续保留，等待人工清理。移动时发现修改或新增内容则恢复原目录并记录恢复诊断。journal 位于 `data/workspace-migration-journals/`，依次记录 `BACKED_UP`、`STAGED`、`DATABASE_UPDATED`、`PROMOTED`、`VERIFIED`、`CLEANED`。数据库提交后的失败或中断会从验证备份恢复原数据库和素材；恢复本身失败时保留原错误、恢复错误、暂存和可操作 journal。发现未完成 journal 或暂存时会拒绝再次迁移，须检查 journal 指定的验证备份并完成恢复后重试，不会声称已完成。成功 receipt 位于 `data/workspace-migration-receipt.json`，同时绑定完整旧目录与 retained 恢复树。再次检查验证历史 receipt、manifest、终态标记及当前数据库身份、路径和 schema 安全，才返回 `ALREADY_MIGRATED`。迁移时的内容哈希只继续约束只读 archive，不冻结活动批次的文章、Claude 内容、图片选择草稿或重建发布包。当前 request/result 仍按 SQLite 中的身份与 result 哈希验证；发布包构建和登记继续由原有批次闸门验证。README、batch-state.json 和图片候选视图可缺失或过时，普通访问不依赖其内容，`batch refresh-workspace` 可直接重建。journal 与 receipt 的本地引用只在当前根目录下解析；记录原根目录以安全重定位旧绝对路径，旧版记录从固定 journal 布局确定原根目录。完整搬迁仓库后仍可运行 CLI 和 Finder 控制器，父目录穿越、外部引用与符号链接均拒绝。
+
+若旧 `output/` 中只有版本控制的零字节 `output/.gitkeep`，迁移仍会把它作为旧树内容归档，因此 Git 可能显示该 placeholder 被删除。这是预期的代码清理：保留并提交删除，同时让顶层 `output/` 继续由 `.gitignore` 忽略；成功 receipt 后不要在运行目录手工重建 `.gitkeep`。
 
 数据库提交前创建持久访问屏障 `data/workspace-migration-lock.json`，绑定本次 journal、manifest 与唯一 owner；提交结果尚不确定时也按可能已提交处理并验证恢复。屏障持续到目录替换、验证及清理完成，或 journal 已记录完整回滚；只有持有相同 owner 与原文件身份的执行者可删除屏障。普通 CLI 和批次 Finder 操作发现屏障后，在访问 Newsroom 路径前返回退出码 2 与恢复指引；迁移预检、备份和迁移控制器保留检查入口，执行仍拒绝未恢复的屏障。即使屏障缺失，普通访问仍只读扫描全部迁移 journal；不可读、损坏、恢复失败或收尾未完成的记录均拒绝访问。仅具有独立持久回滚 receipt、明确 `ROLLED_BACK` 终态/历史及已释放标记，且备份绑定、完整性、恢复后的数据库/schema/相对路径与原素材完整清单均再次验证通过的 `ROLLED_BACK`，或具有已释放/已提交标记且历史 receipt、备份与当前数据库身份、规范路径/schema 安全检查匹配的 `CLEANED` 允许访问。可重建视图及活动素材的迁移时哈希不属于终态准入条件。journal 阶段和历史先在副本中持久写入，成功后才更新内存；`CLEANED` 写入中断时检查实际持久记录，以决定提交收尾或回滚。崩溃、恢复失败或屏障 owner 改变时保留屏障和诊断。原目录改名为 retained 后、整体移出规范工作区前后都会复查文件哈希和目录清单；新增文件、目录或修改会中止清理。成功时 retained 暂存整体原子移入 journal 绑定的 `data/workspace-migration-recovery/`，路径同时写入 journal 和 receipt，永不自动递归删除。全部改名完成后，对 retained 与完整旧目录重复读取最终清单，记录文件类型、相对身份、权限、大小、SHA-256 与空目录，并与验证备份的原素材清单再次匹配；清单先持久写入 journal，再以其摘要绑定 receipt。每次终态准入都检查该恢复快照，缺失、修改、新增文件/目录、符号链接或非普通文件均阻止普通访问，且不删除恢复数据。活动规范素材仍按当前流程验证，不套用恢复快照的历史哈希。回滚优先整体移回 retained 原目录，保留人工新增和修改；仅缺失素材从验证归档补回。完整回滚 proof 位于对应 recovery 子目录的 rollback-receipt.json，绑定原数据库指纹、原目录/文件清单、备份 manifest、journal 与阶段历史；恢复数据不能与原快照完全验证时继续要求人工恢复，不能仅修改终态 flags 绕过。通过验证后可检查原状态并重试迁移；成功后新的 CLEANED journal/receipt 明确绑定先前回滚 proof 与相同原数据库备份，终态准入验证该继承关系，允许规范路径迁移及后续活动素材编辑。缺少新增 proof 的旧终态记录仍须恢复检查，不推断安全。无法验证原快照时保留素材、暂存和屏障，标记需要人工恢复，不记录成功清理。
 

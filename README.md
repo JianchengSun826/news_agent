@@ -12,7 +12,7 @@ uv run newsroom --root . batch prepare ~/Downloads/tech-newsroom-candidates.csv
 
 在 Finder 打开 `workspace/README.md`，找到批次并双击 `workspace/batches/BATCH_ID/OPEN_BATCH.command`。批次 README 显示当前任务、文章版本和相对链接；`actions/` 的八个启动器完成 Claude 交接、图片登记、整批审核、批准和发布包。启动时 Terminal 可能短暂出现，文件选择和确认由 macOS 对话框完成。Finder 操作仅支持 macOS；候选审核与重复项歧义仍在导入前后由编辑处理。
 
-`init` 只创建数据库与本地协调文件，不创建旧的 `research/`、`articles/`、`images/` 或 `output/`；准备批次时按需生成工作区。已有旧素材必须先阅读[迁移与恢复说明](docs/WORKFLOW.md#9-旧工作区迁移与恢复)，在副本中演练后使用 `workspace/Migrate Newsroom.command` 预检、确认、创建验证备份并迁移。旧目录完整保留在 journal 绑定的恢复树，程序不会自动删除。
+`init` 只创建或升级数据库与本地协调文件，不迁移素材，也不创建旧的 `research/`、`articles/`、`images/` 或 `output/`；准备批次时按需生成工作区。旧 schema 仓库必须先运行 `uv run newsroom --root ROOT init`，确认自动生成的升级前数据库备份能够打开且 `PRAGMA integrity_check` 返回 `ok`，再开始迁移预检。已有旧素材必须先阅读[迁移与恢复说明](docs/WORKFLOW.md#9-旧工作区迁移与恢复)，在副本中演练后使用 `workspace/Migrate Newsroom.command` 预检、确认、创建验证备份并迁移。旧目录完整保留在 journal 绑定的恢复树，程序不会自动删除。迁移若归档了版本库中旧 `output/.gitkeep`，Git 显示它被删除是预期的代码清理；提交该删除，成功 receipt 后不要在运行目录手工重建它。
 
 ## Workflow
 
