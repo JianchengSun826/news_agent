@@ -220,15 +220,34 @@ def _column_contract(
 def _normalized_sql_fragment(fragment: str) -> str:
     """Canonicalize token spacing and keyword case while preserving literals."""
     tokens = re.findall(
+        r"/\*.*?\*/|--[^\r\n]*(?:\r?\n|$)|"
         r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|"
         r"\[(?:\]\]|[^\]])*\]|[A-Za-z_][A-Za-z0-9_$]*|"
         r"\d+(?:\.\d+)?|<=|>=|<>|!=|==|[^\s]",
         fragment,
+        flags=re.DOTALL,
     )
     return " ".join(
         token if token[:1] in "'\"`[" else token.upper()
         for token in tokens
+        if not token.startswith(("/*", "--"))
     )
+
+
+def _skip_sql_layout(sql: str, index: int) -> int:
+    """Skip whitespace and SQLite comments outside quoted SQL text."""
+    while index < len(sql):
+        if sql[index].isspace():
+            index += 1
+        elif sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            return len(sql) if end < 0 else _skip_sql_layout(sql, end + 2)
+        elif sql.startswith("--", index):
+            end = sql.find("\n", index + 2)
+            return len(sql) if end < 0 else _skip_sql_layout(sql, end + 1)
+        else:
+            break
+    return index
 
 
 def _check_contract(connection: sqlite3.Connection, table: str) -> tuple[str, ...]:
@@ -239,6 +258,9 @@ def _check_contract(connection: sqlite3.Connection, table: str) -> tuple[str, ..
     clauses: list[str] = []
     index = 0
     while index < len(sql):
+        index = _skip_sql_layout(sql, index)
+        if index >= len(sql):
+            break
         if sql[index] in "'\"`[":
             opening = sql[index]
             closing = "]" if opening == "[" else opening
@@ -252,15 +274,23 @@ def _check_contract(connection: sqlite3.Connection, table: str) -> tuple[str, ..
                     break
                 index += 1
             continue
-        match = re.match(r"CHECK\s*\(", sql[index:], re.IGNORECASE)
+        match = re.match(r"CHECK\b", sql[index:], re.IGNORECASE)
         if not match or (index and (sql[index - 1].isalnum() or sql[index - 1] == "_")):
             index += 1
             continue
-        start = index + match.end()
+        opening = _skip_sql_layout(sql, index + match.end())
+        if opening >= len(sql) or sql[opening] != "(":
+            index += match.end()
+            continue
+        start = opening + 1
         depth = 1
         cursor = start
         quote: str | None = None
         while cursor < len(sql) and depth:
+            if quote is None:
+                cursor = _skip_sql_layout(sql, cursor)
+                if cursor >= len(sql):
+                    break
             character = sql[cursor]
             if quote:
                 if character == quote:

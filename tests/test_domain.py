@@ -550,6 +550,33 @@ def test_init_rejects_added_v4_table_check_before_changes(tmp_path: Path):
     assert not (db_path.parent / "backups").exists()
 
 
+@pytest.mark.parametrize(
+    ("separator", "expression_comment"),
+    [
+        ("/* comment */", "/* ) CHECK ( */"),
+        ("-- comment\n", "-- ) CHECK (\n"),
+    ],
+)
+def test_init_rejects_v4_check_with_comment_between_keyword_and_expression(
+    tmp_path: Path, separator: str, expression_comment: str
+):
+    db_path = tmp_path / "data/newsroom.db"
+    schema_with_check = SCHEMA.replace(
+        "  active INTEGER NOT NULL DEFAULT 1\n);",
+        "  active INTEGER NOT NULL DEFAULT 1,\n"
+        f"  CHECK{separator}(active {expression_comment} IN (0, 1))\n);",
+        1,
+    )
+    _create_labeled_v4_database(db_path, schema_with_check)
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"check constraint mismatch.*sources"):
+        Database(db_path).initialize("2026-10-07T00:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+
+
 def test_init_rejects_corrupt_database_without_mutation(tmp_path: Path):
     db_path = tmp_path / "data/newsroom.db"
     db_path.parent.mkdir(parents=True)
