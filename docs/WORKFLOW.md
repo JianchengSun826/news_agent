@@ -157,7 +157,7 @@ uv run newsroom --root . batch refresh-workspace BATCH_ID
 
 ## 9. 旧工作区迁移与恢复
 
-任何 rehearsal copy 或 production init 前，先关闭所有 newsroom Terminal/Finder 操作、外部素材编辑器和 SQLite 写入者。复制过程应取得 newsroom 独占 operation lock，检查 `PRAGMA journal_mode` 与 WAL/SHM 状态，用 SQLite backup API 创建连贯的 rehearsal 数据库，并在同一静默窗口复制 `data/`、现有 `workspace/` 和全部旧素材。目录复制必须使用 `symlinks=True` 保留符号链接身份，让预检拒绝它们，不能解引用。若选择 checkpoint/close/copy，必须先正常关闭写入者、完成 checkpoint，再把相关 SQLite 状态作为一个整体处理；不能先复制活动主数据库。
+任何 rehearsal copy 或 production init 前，先关闭所有 newsroom Terminal/Finder 操作、外部素材编辑器和 SQLite 写入者。复制过程应取得 newsroom 独占 operation lock，检查 `PRAGMA journal_mode` 与 WAL/SHM 状态，用 SQLite backup API 创建连贯的 rehearsal 数据库，并在同一静默窗口复制 `data/`、现有 `workspace/` 和全部旧素材。目标路径本身也必须在 `resolve()` 前检查；符号链接目标即使指向空目录也会拒绝。目录复制必须使用 `symlinks=True` 保留符号链接身份，让预检拒绝它们，不能解引用。若选择 checkpoint/close/copy，必须先正常关闭写入者、完成 checkpoint，再把相关 SQLite 状态作为一个整体处理；不能先复制活动主数据库。
 
 从代码仓库根目录执行连贯副本脚本；它在独占锁内先调用迁移准入检查，发现持久 barrier、损坏/未完成 journal 或 recovery-required 状态时，会在复制 SQLite 或素材前退出：
 

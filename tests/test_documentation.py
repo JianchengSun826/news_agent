@@ -36,8 +36,10 @@ def test_summary_docs_state_that_normal_init_owns_the_exclusive_guard() -> None:
 def test_migration_runbook_uses_checked_rehearsal_copy_script() -> None:
     path = ROOT / "docs/superpowers/plans/2026-10-05-batch-workspace-finder-workflow.md"
     text = path.read_text(encoding="utf-8")
+    english_runbook = (ROOT / "docs/WORKFLOW.md").read_text(encoding="utf-8")
 
     assert 'scripts/create_rehearsal_copy.py "$production_root" "$rehearsal_root"' in text
+    assert "目标路径本身也必须在 `resolve()` 前检查" in english_runbook
     assert "assert_migration_access(source)" in (
         ROOT / "scripts/create_rehearsal_copy.py"
     ).read_text(encoding="utf-8")
