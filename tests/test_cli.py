@@ -1,12 +1,14 @@
 from contextlib import closing
 import csv
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from newsroom.cli import app
+from newsroom.db import Database
 
 
 runner = CliRunner()
@@ -76,6 +78,34 @@ def test_cli_init_rejects_unversioned_user_database_without_changes(tmp_path: Pa
     assert "new empty database" in result.output
     assert db_path.read_bytes() == before
     assert not (db_path.parent / "backups").exists()
+
+
+def test_cli_init_checkpoints_v3_wal_and_creates_complete_upgrade_backup(tmp_path: Path):
+    source = tmp_path / "source/data/newsroom.db"
+    Database(source).initialize("2026-10-06T00:00:00+00:00")
+    writer = sqlite3.connect(source)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.execute("DELETE FROM schema_version WHERE version=4")
+        writer.execute(
+            "INSERT INTO sources(source_id,source_name,domain,source_type,reliability_level,usage_policy,notes,active) "
+            "VALUES ('wal-source','WAL Source','wal.example','PRIMARY','HIGH','LINK_ONLY','committed in WAL',1)"
+        )
+        writer.commit()
+        root = tmp_path / "target"
+        database = root / "data/newsroom.db"
+        database.parent.mkdir(parents=True)
+        for suffix in ("", "-wal", "-shm"):
+            shutil.copyfile(Path(f"{source}{suffix}"), Path(f"{database}{suffix}"))
+    finally:
+        writer.close()
+
+    result = runner.invoke(app, ["--root", str(root), "init"])
+
+    assert result.exit_code == 0, result.output
+    backup_path = next((root / "data/backups").glob("newsroom-v3-*.db"))
+    assert Database(backup_path).one("SELECT notes FROM sources WHERE source_id='wal-source'")["notes"] == "committed in WAL"
+    assert Database(database).one("SELECT MAX(version) AS version FROM schema_version")["version"] == 4
 
 
 def test_cli_candidate_add_accepts_primary_only(tmp_path: Path):

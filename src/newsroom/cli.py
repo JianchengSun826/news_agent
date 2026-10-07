@@ -46,6 +46,10 @@ def _room(ctx: typer.Context) -> Newsroom:
             _run(lambda: ctx.find_root().with_resource(operation_lock(ctx.meta['newsroom_root'])))
             ctx.meta['operation_lock_held'] = True
         _run(lambda: assert_migration_access(ctx.meta['newsroom_root']))
+    return _room_without_shared_lock(ctx)
+
+
+def _room_without_shared_lock(ctx: typer.Context) -> Newsroom:
     root_context = ctx.find_root()
     if root_context.obj is None:
         root_context.obj = Newsroom(ctx.meta['newsroom_root'])
@@ -71,7 +75,8 @@ def _with_claude_instruction(payload: dict) -> dict:
 @app.command("init")
 def initialize(ctx: typer.Context) -> None:
     """Initialize local directories and the SQLite database."""
-    room = _room(ctx)
+    _run(lambda: assert_migration_access(ctx.meta["newsroom_root"]))
+    room = _room_without_shared_lock(ctx)
     _run(room.init)
     typer.echo(f"Initialized newsroom at {room.root}")
 

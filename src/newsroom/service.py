@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import shutil
 import csv
@@ -25,11 +26,12 @@ class Newsroom:
         self.db = Database(self.db_path)
 
     def init(self) -> None:
-        from .coordination import initialize_operation_lock
-        (self.root / "data").mkdir(parents=True, exist_ok=True)
-        initialize_operation_lock(self.root)
-        self.db.initialize(utc_now())
-        self._seed_sources()
+        from .coordination import operation_lock
+        from .migration import assert_migration_access
+        with operation_lock(self.root, exclusive=True):
+            assert_migration_access(self.root)
+            self.db.initialize(utc_now())
+            self._seed_sources()
 
     @property
     def project_root(self) -> Path:
@@ -40,13 +42,14 @@ class Newsroom:
         if not config.exists():
             return
         sources = tomllib.loads(config.read_text(encoding="utf-8")).get("sources", [])
-        with self.db.connect() as connection:
-            for source in sources:
-                connection.execute(
-                    """INSERT INTO sources(source_id,source_name,domain,source_type,reliability_level,usage_policy,notes,active)
-                    VALUES (?,?,?,?,?,?,?,1) ON CONFLICT(domain) DO NOTHING""",
-                    (source["source_id"],source["source_name"],source["domain"],source["source_type"],source["reliability_level"],source["usage_policy"],source.get("notes", "")),
-                )
+        with closing(self.db.connect()) as connection:
+            with connection:
+                for source in sources:
+                    connection.execute(
+                        """INSERT INTO sources(source_id,source_name,domain,source_type,reliability_level,usage_policy,notes,active)
+                        VALUES (?,?,?,?,?,?,?,1) ON CONFLICT(domain) DO NOTHING""",
+                        (source["source_id"],source["source_name"],source["domain"],source["source_type"],source["reliability_level"],source["usage_policy"],source.get("notes", "")),
+                    )
 
     def _transition(self, connection, entity_type: str, entity_id: str, old: str | None, new: str, actor: str, reason: str) -> None:
         if not reason.strip():

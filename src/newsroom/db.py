@@ -284,6 +284,34 @@ class Database:
         stamp = re.sub(r"[^0-9A-Za-z]+", "", applied_at)
         shutil.copy2(self.path, backup_dir / f"newsroom-v{version}-{stamp}.db")
 
+    def _require_clear_sidecars(self) -> None:
+        wal = Path(f"{self.path}-wal")
+        shm = Path(f"{self.path}-shm")
+        if (wal.exists() and wal.stat().st_size != 0) or shm.exists():
+            raise ValueError(
+                "WAL/SHM sidecars remain after checkpoint and close; stop writers and retry "
+                "without deleting sidecars"
+            )
+
+    def _prepare_existing_database(self, version: int) -> None:
+        if version == 0:
+            self._require_clear_sidecars()
+            return
+        uri = self.path.resolve().as_uri() + "?mode=rw"
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+            if str(journal_mode).lower() == "wal":
+                busy, log_frames, checkpointed = connection.execute(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                ).fetchone()
+                if busy != 0 or log_frames != checkpointed:
+                    raise ValueError(
+                        "WAL checkpoint was busy or incomplete; stop external writers and retry"
+                    )
+        self._require_clear_sidecars()
+        if self.validate_existing_schema() != version:
+            raise ValueError("database schema changed during initialization; stop writers and retry")
+
     @staticmethod
     def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
         return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
@@ -317,43 +345,45 @@ class Database:
 
     def initialize(self, applied_at: str) -> None:
         existing_version = self.validate_existing_schema()
+        self._prepare_existing_database(existing_version)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if existing_version in {1, 2, 3}:
             self._backup_before_upgrade(existing_version, applied_at)
-        with self.connect() as connection:
-            connection.executescript(SCHEMA)
-            connection.execute(
-                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (1, ?)",
-                (applied_at,),
-            )
-            image_columns = {row["name"] for row in connection.execute("PRAGMA table_info(images)")}
-            if "image_path" not in image_columns:
-                connection.execute("ALTER TABLE images ADD COLUMN image_path TEXT")
-            connection.execute(
-                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (2, ?)",
-                (applied_at,),
-            )
-            self._add_column(connection, "candidates", "candidate_fingerprint TEXT")
-            self._add_column(connection, "articles", "fact_check_outcome TEXT")
-            self._add_column(connection, "articles", "revision_number INTEGER NOT NULL DEFAULT 1")
-            self._add_column(connection, "images", "image_candidate_id TEXT")
-            self._add_column(connection, "images", "rights_basis TEXT")
-            self._add_column(connection, "images", "rights_statement TEXT")
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_candidates_fingerprint ON candidates(candidate_fingerprint)"
-            )
-            self._backfill_candidate_fingerprints(connection)
-            connection.execute(
-                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (3, ?)",
-                (applied_at,),
-            )
+        with closing(self.connect()) as connection:
+            with connection:
+                connection.executescript(SCHEMA)
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (1, ?)",
+                    (applied_at,),
+                )
+                image_columns = {row["name"] for row in connection.execute("PRAGMA table_info(images)")}
+                if "image_path" not in image_columns:
+                    connection.execute("ALTER TABLE images ADD COLUMN image_path TEXT")
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (2, ?)",
+                    (applied_at,),
+                )
+                self._add_column(connection, "candidates", "candidate_fingerprint TEXT")
+                self._add_column(connection, "articles", "fact_check_outcome TEXT")
+                self._add_column(connection, "articles", "revision_number INTEGER NOT NULL DEFAULT 1")
+                self._add_column(connection, "images", "image_candidate_id TEXT")
+                self._add_column(connection, "images", "rights_basis TEXT")
+                self._add_column(connection, "images", "rights_statement TEXT")
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_candidates_fingerprint ON candidates(candidate_fingerprint)"
+                )
+                self._backfill_candidate_fingerprints(connection)
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (3, ?)",
+                    (applied_at,),
+                )
 
-            self._add_column(connection, "articles", "owning_batch_id TEXT REFERENCES batches(batch_id)")
-            self._add_column(connection, "batches", "workspace_version INTEGER NOT NULL DEFAULT 0")
-            connection.execute(
-                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (4, ?)",
-                (applied_at,),
-            )
+                self._add_column(connection, "articles", "owning_batch_id TEXT REFERENCES batches(batch_id)")
+                self._add_column(connection, "batches", "workspace_version INTEGER NOT NULL DEFAULT 0")
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (4, ?)",
+                    (applied_at,),
+                )
 
     def table_names(self) -> set[str]:
         with self.connect() as connection:

@@ -1,11 +1,13 @@
 from contextlib import closing
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
 import pytest
 
 from newsroom.db import SCHEMA, Database
+from newsroom.coordination import operation_lock
 from newsroom.dedup import classify_candidate
 from newsroom.models import CandidateInput, make_event_id
 from newsroom.service import Newsroom, WorkflowError
@@ -519,6 +521,121 @@ def test_public_schema_validation_returns_supported_version_without_mutation(tmp
 
     assert database.validate_existing_schema() == 4
     assert db_path.read_bytes() == before
+
+
+def build_persistent_v3_wal_database(tmp_path: Path) -> Path:
+    source = tmp_path / "source/data/newsroom.db"
+    Database(source).initialize("2026-10-06T00:00:00+00:00")
+    writer = sqlite3.connect(source)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.execute("DELETE FROM schema_version WHERE version=4")
+        writer.execute(
+            "INSERT INTO sources(source_id,source_name,domain,source_type,reliability_level,usage_policy,notes,active) "
+            "VALUES ('wal-source','WAL Source','wal.example','PRIMARY','HIGH','LINK_ONLY','committed WAL row',1)"
+        )
+        writer.commit()
+        target = tmp_path / "target/data/newsroom.db"
+        target.parent.mkdir(parents=True)
+        for suffix in ("", "-wal", "-shm"):
+            shutil.copyfile(Path(f"{source}{suffix}"), Path(f"{target}{suffix}"))
+    finally:
+        writer.close()
+    return target
+
+
+def test_direct_initialize_checkpoints_v3_wal_before_complete_backup(tmp_path: Path):
+    db_path = build_persistent_v3_wal_database(tmp_path)
+
+    Database(db_path).initialize("2026-10-06T03:00:00+00:00")
+
+    backup_path = next((db_path.parent / "backups").glob("newsroom-v3-*.db"))
+    backup = Database(backup_path)
+    current = Database(db_path)
+    assert not Path(f"{db_path}-shm").exists()
+    assert not Path(f"{db_path}-wal").exists() or Path(f"{db_path}-wal").stat().st_size == 0
+    assert backup.one("SELECT MAX(version) AS version FROM schema_version")["version"] == 3
+    assert backup.one("SELECT notes FROM sources WHERE source_id='wal-source'")["notes"] == "committed WAL row"
+    assert current.one("SELECT MAX(version) AS version FROM schema_version")["version"] == 4
+    assert current.one("SELECT notes FROM sources WHERE source_id='wal-source'")["notes"] == "committed WAL row"
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "message"),
+    [((1, 2, 0), "busy or incomplete"), ((0, 2, 1), "busy or incomplete"), ((0, 2, 2), "sidecars remain")],
+)
+def test_direct_initialize_checkpoint_failure_preserves_database_sidecars_and_no_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checkpoint: tuple[int, int, int], message: str
+):
+    db_path = build_persistent_v3_wal_database(tmp_path)
+    files = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")]
+    before = {path: path.read_bytes() for path in files}
+    real_connect = sqlite3.connect
+
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class CheckpointConnection:
+        def execute(self, sql):
+            if sql == "PRAGMA journal_mode":
+                return Result(("wal",))
+            if sql == "PRAGMA wal_checkpoint(TRUNCATE)":
+                return Result(checkpoint)
+            raise AssertionError(sql)
+
+        def close(self):
+            return None
+
+    def controlled_connect(path, *args, **kwargs):
+        if isinstance(path, str) and "?mode=rw" in path:
+            return CheckpointConnection()
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", controlled_connect)
+
+    with pytest.raises(ValueError, match=message):
+        Database(db_path).initialize("2026-10-06T03:00:00+00:00")
+
+    assert {path: path.read_bytes() for path in files} == before
+    assert not (db_path.parent / "backups").exists()
+
+
+def test_newsroom_init_rejects_active_shared_operation_before_database_mutation(tmp_path: Path):
+    room = Newsroom(tmp_path)
+    room.init()
+    before = room.db_path.read_bytes()
+
+    with operation_lock(room.root):
+        with pytest.raises(WorkflowError, match="active newsroom operation"):
+            room.init()
+
+    assert room.db_path.read_bytes() == before
+    assert not (room.db_path.parent / "backups").exists()
+
+
+@pytest.mark.parametrize("blocked_by", ["barrier", "journal"])
+def test_newsroom_init_rejects_unresolved_migration_before_database_mutation(
+    tmp_path: Path, blocked_by: str
+):
+    room = Newsroom(tmp_path)
+    room.init()
+    before = room.db_path.read_bytes()
+    if blocked_by == "barrier":
+        (room.root / "data/workspace-migration-lock.json").write_text("{}")
+    else:
+        directory = room.root / "data/workspace-migration-journals"
+        directory.mkdir()
+        (directory / "unresolved.json").write_text("{}")
+
+    with pytest.raises(WorkflowError, match="migration"):
+        room.init()
+
+    assert room.db_path.read_bytes() == before
+    assert not (room.db_path.parent / "backups").exists()
 
 
 def test_init_seeds_source_registry(newsroom: Newsroom):
