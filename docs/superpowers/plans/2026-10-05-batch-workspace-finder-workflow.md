@@ -751,28 +751,83 @@ git commit -m "docs: adopt Finder-first batch workflow"
 
 - [ ] **Step 1: Create a full rehearsal copy outside the repository**
 
-Use Python `shutil.copytree` to copy the repository runtime data (`data`, existing `workspace`, `research`, `articles`, `images`, `output`) into a unique `/tmp/newsroom-migration-rehearsal-*` root. Never point rehearsal commands at the production root.
+Quiesce production before copying anything: close every newsroom Terminal/Finder action and every external SQLite writer/editor touching runtime artifacts. The copy process must acquire the repository's exclusive operation lock, inspect SQLite journal mode plus WAL/SHM presence, create the rehearsal database with SQLite's backup API, and copy the other runtime trees while still holding the lock. `copytree(..., symlinks=True)` preserves nested symlinks so migration preflight can reject them instead of silently dereferencing them. Never point rehearsal migration commands at the production root.
 
 ```bash
+set -euo pipefail
+production_root="$PWD"
 rehearsal_root="$(mktemp -d /tmp/newsroom-migration-rehearsal.XXXXXX)"
-printf '%s\n' "$rehearsal_root" > /tmp/newsroom-migration-rehearsal-path
-python3 - "$PWD" "$rehearsal_root" <<'PY'
+trap 'rm -rf "$rehearsal_root"' ERR
+uv run python - "$production_root" "$rehearsal_root" <<'PY'
 from pathlib import Path
+import json
+import os
 import shutil
+import sqlite3
 import sys
 
-source = Path(sys.argv[1])
-target = Path(sys.argv[2])
-for name in ("data", "workspace", "research", "articles", "images", "output"):
-    path = source / name
-    if path.exists():
-        shutil.copytree(path, target / name)
+from newsroom.coordination import operation_lock
+
+source = Path(sys.argv[1]).resolve()
+target = Path(sys.argv[2]).resolve()
+source_data = source / "data"
+source_database = source_data / "newsroom.db"
+if source_data.is_symlink() or source_database.is_symlink():
+    raise SystemExit("production data directory and database must not be symlinks")
+if not source_database.is_file():
+    raise SystemExit(f"missing production database: {source_database}")
+
+with operation_lock(source, exclusive=True):
+    source_uri = source_database.resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(source_uri, uri=True) as source_connection:
+        journal_mode = source_connection.execute("PRAGMA journal_mode").fetchone()[0]
+        wal = Path(f"{source_database}-wal")
+        shm = Path(f"{source_database}-shm")
+        print(json.dumps({
+            "journal_mode": journal_mode,
+            "wal_exists": wal.exists(),
+            "wal_size": wal.stat().st_size if wal.exists() else 0,
+            "shm_exists": shm.exists(),
+        }, sort_keys=True))
+
+        for name in ("data", "workspace", "research", "articles", "images", "output"):
+            source_path = source / name
+            target_path = target / name
+            if not source_path.exists() and not source_path.is_symlink():
+                continue
+            if source_path.is_symlink():
+                os.symlink(os.readlink(source_path), target_path)
+                continue
+
+            def ignore_database(directory: str, names: list[str]) -> set[str]:
+                if Path(directory) == source_data:
+                    return {item for item in names if item in {
+                        "newsroom.db", "newsroom.db-wal", "newsroom.db-shm"
+                    }}
+                return set()
+
+            shutil.copytree(
+                source_path,
+                target_path,
+                symlinks=True,
+                ignore=ignore_database if name == "data" else None,
+            )
+
+        target_database = target / "data/newsroom.db"
+        target_database.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(target_database) as target_connection:
+            source_connection.backup(target_connection)
+            integrity = target_connection.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise SystemExit(f"rehearsal database backup failed integrity check: {integrity}")
 PY
+printf '%s\n' "$rehearsal_root" > /tmp/newsroom-migration-rehearsal-path
+trap - ERR
 ```
 
 - [ ] **Step 2: Run preflight and migration against the rehearsal**
 
-Old-schema copies must be initialized before migration preflight. First stop every writer and ensure the database has no unresolved WAL/SHM dependency; otherwise checkpoint after clean shutdown or create a coherent SQLite backup with the relevant state. `init` initializes/upgrades schema and idempotently seeds configured sources; it does not move article artifacts. Its automatic pre-upgrade `copy2` snapshot is only a safety copy. Record the original schema, table row counts, and required business samples, then open the snapshot read-only and compare that evidence as well as `PRAGMA integrity_check`. This snapshot never replaces the verified workspace migration backup created below.
+Inspect `MAX(schema_version)` before init and accept only 1, 2, 3, or 4. `init` initializes/upgrades schema and idempotently seeds configured sources; it does not move article artifacts. For v1-v3, require exactly one new automatic pre-upgrade `copy2` snapshot, then compare its hash, schema, row counts, and integrity result with the pre-init evidence. For v4, require no new upgrade snapshot and no schema change. Reject every other version. The copy2 snapshot is only an upgrade safety copy and never replaces the verified workspace migration backup created below.
 
 After the init safety copy is validated, use the fail-fast sequence from `docs/WORKFLOW.md`: save preflight stdout as JSON, parse its `report_path` into `PLAN`, run `--backup-plan --plan "$PLAN"`, parse the returned JSON `backup_path` into `BACKUP`, independently call `WorkspaceMigrator.verify_backup(BACKUP)`, and only then run `--execute --plan "$PLAN" --backup "$BACKUP"`. Use `set -euo pipefail`; any failed command or JSON/path validation must stop before the next mutation. The exact CLI contract is:
 
@@ -783,13 +838,15 @@ NEWSROOM_ROOT="$rehearsal_root"
 DATABASE="$NEWSROOM_ROOT/data/newsroom.db"
 INIT_BACKUPS_BEFORE="$(mktemp /tmp/newsroom-init-backups.XXXXXX)"
 INIT_EVIDENCE_BEFORE="$(mktemp /tmp/newsroom-init-before.XXXXXX)"
-INIT_EVIDENCE_AFTER="$(mktemp /tmp/newsroom-init-after.XXXXXX)"
+INIT_EVIDENCE_COPY="$(mktemp /tmp/newsroom-init-copy.XXXXXX)"
+INIT_EVIDENCE_AFTER="$(mktemp /tmp/newsroom-init-current.XXXXXX)"
+EVIDENCE_SCRIPT="$(mktemp /tmp/newsroom-db-evidence.XXXXXX.py)"
 PREFLIGHT_JSON="$(mktemp /tmp/newsroom-preflight.XXXXXX)"
 BACKUP_JSON="$(mktemp /tmp/newsroom-backup.XXXXXX)"
-trap 'rm -f "$INIT_BACKUPS_BEFORE" "$INIT_EVIDENCE_BEFORE" "$INIT_EVIDENCE_AFTER" "$PREFLIGHT_JSON" "$BACKUP_JSON"' EXIT
+trap 'rm -f "$INIT_BACKUPS_BEFORE" "$INIT_EVIDENCE_BEFORE" "$INIT_EVIDENCE_COPY" "$INIT_EVIDENCE_AFTER" "$EVIDENCE_SCRIPT" "$PREFLIGHT_JSON" "$BACKUP_JSON"' EXIT
 
 if [[ -e "${DATABASE}-wal" || -e "${DATABASE}-shm" ]]; then
-  echo "Stop: close writers and resolve the SQLite WAL/SHM state before init." >&2
+  echo "Stop: the coherent rehearsal database unexpectedly has WAL/SHM state." >&2
   exit 1
 fi
 if [[ -d "$NEWSROOM_ROOT/data/backups" ]]; then
@@ -797,7 +854,7 @@ if [[ -d "$NEWSROOM_ROOT/data/backups" ]]; then
 else
   : > "$INIT_BACKUPS_BEFORE"
 fi
-python3 - "$DATABASE" > "$INIT_EVIDENCE_BEFORE" <<'PY'
+cat > "$EVIDENCE_SCRIPT" <<'PY'
 from pathlib import Path
 import hashlib
 import json
@@ -807,6 +864,14 @@ import sys
 database = Path(sys.argv[1]).resolve()
 with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
     integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+    journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+    version_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()
+    schema_version = (
+        connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+        if version_table else None
+    )
     schema = connection.execute(
         "SELECT name, type, COALESCE(sql, '') FROM sqlite_master "
         "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
@@ -821,13 +886,27 @@ with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
 print(json.dumps({
     "sha256": hashlib.sha256(database.read_bytes()).hexdigest(),
     "integrity": integrity,
+    "journal_mode": journal_mode,
+    "schema_version": schema_version,
     "schema": schema,
     "rows": rows,
 }, ensure_ascii=False, sort_keys=True))
 PY
+python3 "$EVIDENCE_SCRIPT" "$DATABASE" > "$INIT_EVIDENCE_BEFORE"
+SOURCE_SCHEMA="$(python3 - "$INIT_EVIDENCE_BEFORE" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["schema_version"]
+if value not in {1, 2, 3, 4}:
+    raise SystemExit(f"unsupported source schema version: {value!r}")
+print(value)
+PY
+)"
 
 uv run newsroom --root "$rehearsal_root" init
-INIT_SAFETY_BACKUP="$(python3 - "$NEWSROOM_ROOT" "$INIT_BACKUPS_BEFORE" <<'PY'
+INIT_SAFETY_BACKUP="$(python3 - "$NEWSROOM_ROOT" "$INIT_BACKUPS_BEFORE" "$SOURCE_SCHEMA" <<'PY'
 from pathlib import Path
 import sys
 
@@ -835,40 +914,31 @@ root = Path(sys.argv[1]).resolve()
 before = set(Path(sys.argv[2]).read_text(encoding="utf-8").splitlines())
 current = {str(path.resolve()) for path in (root / "data/backups").glob("newsroom-v*.db")}
 created = sorted(current - before)
-if len(created) != 1:
-    raise SystemExit(f"expected exactly one new init safety copy, found {len(created)}")
-print(created[0])
+expected = 1 if int(sys.argv[3]) < 4 else 0
+if len(created) != expected:
+    raise SystemExit(f"expected {expected} new init safety copies, found {len(created)}")
+if created:
+    print(created[0])
 PY
 )"
-python3 - "$INIT_SAFETY_BACKUP" > "$INIT_EVIDENCE_AFTER" <<'PY'
+if (( SOURCE_SCHEMA < 4 )); then
+  python3 "$EVIDENCE_SCRIPT" "$INIT_SAFETY_BACKUP" > "$INIT_EVIDENCE_COPY"
+  cmp "$INIT_EVIDENCE_BEFORE" "$INIT_EVIDENCE_COPY"
+fi
+python3 "$EVIDENCE_SCRIPT" "$DATABASE" > "$INIT_EVIDENCE_AFTER"
+python3 - "$SOURCE_SCHEMA" "$INIT_EVIDENCE_BEFORE" "$INIT_EVIDENCE_AFTER" <<'PY'
 from pathlib import Path
-import hashlib
 import json
-import sqlite3
 import sys
 
-database = Path(sys.argv[1]).resolve()
-with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
-    integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-    schema = connection.execute(
-        "SELECT name, type, COALESCE(sql, '') FROM sqlite_master "
-        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-    ).fetchall()
-    tables = [row[0] for row in schema if row[1] == "table"]
-    rows = {
-        table: connection.execute(
-            'SELECT COUNT(*) FROM "' + table.replace('"', '""') + '"'
-        ).fetchone()[0]
-        for table in tables
-    }
-print(json.dumps({
-    "sha256": hashlib.sha256(database.read_bytes()).hexdigest(),
-    "integrity": integrity,
-    "schema": schema,
-    "rows": rows,
-}, ensure_ascii=False, sort_keys=True))
+source_version = int(sys.argv[1])
+before = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+after = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+if after["integrity"] != "ok" or after["schema_version"] != 4:
+    raise SystemExit("init did not produce a valid schema-v4 database")
+if source_version == 4 and before["schema"] != after["schema"]:
+    raise SystemExit("schema-v4 init unexpectedly changed database schema")
 PY
-cmp "$INIT_EVIDENCE_BEFORE" "$INIT_EVIDENCE_AFTER"
 
 uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --preflight > "$PREFLIGHT_JSON"
 PLAN="$(python3 - "$NEWSROOM_ROOT" "$PREFLIGHT_JSON" <<'PY'
@@ -925,7 +995,7 @@ Regenerate dashboards, open the copied batch README, validate current Claude req
 
 - [ ] **Step 4: Run real preflight and inspect the saved report**
 
-Run `uv run newsroom --root "$PWD" init` first for an old-schema production database after writers/WAL state are safely resolved. Compare the resulting safety snapshot with recorded pre-upgrade schema, row, and business evidence; integrity checking alone is insufficient. Then run the root `Migrate Newsroom.command` or the exact gated CLI sequence in `docs/WORKFLOW.md`. Confirm no blocking errors and that all claimed, legacy, and unclaimed files appear in the saved `PLAN`; create and independently verify the migration backup before `--execute --plan "$PLAN" --backup "$BACKUP"`.
+Before production init, close every newsroom/Finder action and external writer, acquire the exclusive operation lock, and inspect journal mode plus WAL/SHM state as in Step 1. Read the source schema version first. For v1-v3, require exactly one new safety snapshot and compare it with the pre-init evidence; for v4, require no new upgrade snapshot and no schema change; reject every other version. Then run the root `Migrate Newsroom.command` or the exact gated CLI sequence in `docs/WORKFLOW.md`. Confirm no blocking errors and that all claimed, legacy, and unclaimed files appear in the saved `PLAN`; create and independently verify the migration backup before `--execute --plan "$PLAN" --backup "$BACKUP"`.
 
 - [ ] **Step 5: Execute the already-authorized real migration**
 

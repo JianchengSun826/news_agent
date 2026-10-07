@@ -157,9 +157,11 @@ uv run newsroom --root . batch refresh-workspace BATCH_ID
 
 ## 9. 旧工作区迁移与恢复
 
-先把 `data/`、现有 `workspace/` 和全部旧素材复制到独立目录演练并核对恢复证据，再使用真实工作区的 `workspace/Migrate Newsroom.command`。旧 schema 仓库必须在副本和真实根目录分别先运行 `uv run newsroom --root "$NEWSROOM_ROOT" init`。`init` 初始化或升级 schema，并幂等写入配置的来源种子；它不移动文章素材。升级前必须停止所有 SQLite 写入者。若仍有 `newsroom.db-wal`/`newsroom.db-shm`，先正常关闭并 checkpoint，或用 SQLite backup API 创建一致副本；不能把单独复制主数据库当成完整状态。
+任何 rehearsal copy 或 production init 前，先关闭所有 newsroom Terminal/Finder 操作、外部素材编辑器和 SQLite 写入者。复制过程应取得 newsroom 独占 operation lock，检查 `PRAGMA journal_mode` 与 WAL/SHM 状态，用 SQLite backup API 创建连贯的 rehearsal 数据库，并在同一静默窗口复制 `data/`、现有 `workspace/` 和全部旧素材。目录复制必须使用 `symlinks=True` 保留符号链接身份，让预检拒绝它们，不能解引用。若选择 checkpoint/close/copy，必须先正常关闭写入者、完成 checkpoint，再把相关 SQLite 状态作为一个整体处理；不能先复制活动主数据库。
 
-`init` 在升级前生成的 `data/backups/newsroom-v旧版本-时间.db` 是 `copy2` 安全快照，并非迁移系统的验证备份。运行前记录原数据库的 schema、各表行数和必要业务抽样；运行后只读打开安全快照，检查 `PRAGMA integrity_check`，并逐项对比这些证据。完整性检查单独通过不证明逻辑等价。任何差异都必须停止；即使安全快照匹配，执行迁移前仍必须运行 `--backup-plan` 并独立验证其 SQLite、manifest 与素材归档。启动器会保存预检报告、要求明确确认，然后创建这份验证备份。取消只留下报告，不移动素材、不改变数据库。迁移不是发布，也不推进文章状态。
+在完整副本演练并核对恢复证据后，再使用真实工作区的 `workspace/Migrate Newsroom.command`。`init` 初始化或升级 schema，并幂等写入配置的来源种子；它不移动文章素材。真实 production init 同样要求上述静默条件和 WAL/SHM 检查。
+
+运行 `init` 前先读取 `MAX(schema_version)`，仅接受 1、2、3 或 4。v1-v3 升级时必须恰好生成一份 `data/backups/newsroom-v旧版本-时间.db`；这份 `copy2` 只是安全快照，并非迁移系统的验证备份。只读打开它，检查 `PRAGMA integrity_check`，并与升级前记录的 schema、各表行数和必要业务抽样逐项比较。v4 初始化不得生成新的升级快照或改变 schema；来源种子仍按配置幂等核对。其他版本立即停止。完整性检查单独通过不证明逻辑等价。任何差异都必须停止；无论源版本为何，执行迁移前仍必须运行 `--backup-plan` 并独立验证其 SQLite、manifest 与素材归档。启动器会保存预检报告、要求明确确认，然后创建这份验证备份。取消只留下报告，不移动素材、不改变数据库。迁移不是发布，也不推进文章状态。
 
 完成 init 安全快照核对后，可运行 `uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --preflight`。此命令只读取数据库与文件，并把确定性的 JSON 清单保存到 `$NEWSROOM_ROOT/data/workspace-migration-preflight.json`；它不会更新流程状态、移动素材或创建迁移暂存目录。v3 升级到 v4 时新增的 `owning_batch_id` 默认仍为 NULL；预检会读取 `batch_items` 形成明确的归属投影。NULL 文章只有恰好一条非 `REUSED_COMPLETE`、非 `EXCLUDED` 关系时归入该批次，零条时保留为 `legacy-single-articles`，两条或更多时阻塞，即使这些关系来自同一批次。已有 owner 也必须与恰好一条有效关系一致；复用和排除关系永远不能取得或转移归属。完整投影（包括 NULL）写入计划与 manifest，当前及历史 request/result 也按投影 owner 分流。预检后任何 `batch_items` 或其他数据库变化都会令执行失效；执行只在同一数据库事务中回填 NULL owner、切换路径和写入 `workspace_version=1`，不会在预检阶段修改数据库。journal 和成功 receipt 绑定投影摘要，后续准入重新验证实际 owner。
 
