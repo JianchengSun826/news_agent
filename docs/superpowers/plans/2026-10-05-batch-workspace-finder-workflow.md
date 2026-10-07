@@ -758,76 +758,14 @@ set -euo pipefail
 production_root="$PWD"
 rehearsal_root="$(mktemp -d /tmp/newsroom-migration-rehearsal.XXXXXX)"
 trap 'rm -rf "$rehearsal_root"' ERR
-uv run python - "$production_root" "$rehearsal_root" <<'PY'
-from pathlib import Path
-import json
-import os
-import shutil
-import sqlite3
-import sys
-
-from newsroom.coordination import operation_lock
-
-source = Path(sys.argv[1]).resolve()
-target = Path(sys.argv[2]).resolve()
-source_data = source / "data"
-source_database = source_data / "newsroom.db"
-if source_data.is_symlink() or source_database.is_symlink():
-    raise SystemExit("production data directory and database must not be symlinks")
-if not source_database.is_file():
-    raise SystemExit(f"missing production database: {source_database}")
-
-with operation_lock(source, exclusive=True):
-    source_uri = source_database.resolve().as_uri() + "?mode=ro"
-    with sqlite3.connect(source_uri, uri=True) as source_connection:
-        journal_mode = source_connection.execute("PRAGMA journal_mode").fetchone()[0]
-        wal = Path(f"{source_database}-wal")
-        shm = Path(f"{source_database}-shm")
-        print(json.dumps({
-            "journal_mode": journal_mode,
-            "wal_exists": wal.exists(),
-            "wal_size": wal.stat().st_size if wal.exists() else 0,
-            "shm_exists": shm.exists(),
-        }, sort_keys=True))
-
-        for name in ("data", "workspace", "research", "articles", "images", "output"):
-            source_path = source / name
-            target_path = target / name
-            if not source_path.exists() and not source_path.is_symlink():
-                continue
-            if source_path.is_symlink():
-                os.symlink(os.readlink(source_path), target_path)
-                continue
-
-            def ignore_database(directory: str, names: list[str]) -> set[str]:
-                if Path(directory) == source_data:
-                    return {item for item in names if item in {
-                        "newsroom.db", "newsroom.db-wal", "newsroom.db-shm"
-                    }}
-                return set()
-
-            shutil.copytree(
-                source_path,
-                target_path,
-                symlinks=True,
-                ignore=ignore_database if name == "data" else None,
-            )
-
-        target_database = target / "data/newsroom.db"
-        target_database.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(target_database) as target_connection:
-            source_connection.backup(target_connection)
-            integrity = target_connection.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-            raise SystemExit(f"rehearsal database backup failed integrity check: {integrity}")
-PY
+uv run python scripts/create_rehearsal_copy.py "$production_root" "$rehearsal_root"
 printf '%s\n' "$rehearsal_root" > /tmp/newsroom-migration-rehearsal-path
 trap - ERR
 ```
 
 - [ ] **Step 2: Run preflight and migration against the rehearsal**
 
-Run the executable's read-only snapshot schema guard under the exclusive operation lock before opening the canonical database for checkpoint. It returns 0 only for a missing database or an existing SQLite database with no user tables; those new databases skip `mode=rw` and checkpoint. Existing versions 1, 2, 3, or 4 may then checkpoint, while future or negative versions, empty/invalid version tables, and databases with user tables but no `schema_version` stop before mutation. `Database.initialize` independently revalidates under the same lock before backup, schema changes, upgrade work, or source seeding. `init` does not move article artifacts. For v1-v3, require exactly one new automatic pre-upgrade `copy2` snapshot, then compare its hash, schema, row counts, and integrity result with the pre-init evidence. For v4, require no new upgrade snapshot and no schema change. Reject every other version. The copy2 snapshot is only an upgrade safety copy and never replaces the verified workspace migration backup created below.
+Run the executable's read-only snapshot schema guard under the exclusive operation lock before opening the canonical database for checkpoint. It returns 0 only for a missing database or an existing SQLite database with no user tables; those new databases skip `mode=rw` and checkpoint. Existing versions 1, 2, 3, or 4 may then checkpoint, while future or negative versions, empty/invalid version tables, and databases with user tables but no `schema_version` stop before mutation. A database labeled v4 must first have a complete, compatible v4 schema: every required table, column shape, index, and foreign key must match semantically, and unexpected user objects are rejected while SQLite internal objects are ignored. `Database.initialize` independently revalidates under the same lock before backup, schema changes, upgrade work, or source seeding. `init` does not move article artifacts. For v1-v3, require exactly one new automatic pre-upgrade `copy2` snapshot, then compare its hash, schema, row counts, and integrity result with the pre-init evidence. For v4, require no new upgrade snapshot and the schema must remain unchanged. Reject every other version. The copy2 snapshot is only an upgrade safety copy and never replaces the verified workspace migration backup created below.
 
 After the init safety copy is validated, use the fail-fast sequence from `docs/WORKFLOW.md`: save preflight stdout as JSON, parse its `report_path` into `PLAN`, run `--backup-plan --plan "$PLAN"`, parse the returned JSON `backup_path` into `BACKUP`, independently call `WorkspaceMigrator.verify_backup(BACKUP)`, and only then run `--execute --plan "$PLAN" --backup "$BACKUP"`. Use `set -euo pipefail`; any failed command or JSON/path validation must stop before the next mutation. The exact CLI contract is:
 

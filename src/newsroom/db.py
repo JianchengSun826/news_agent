@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+from functools import lru_cache
 import hashlib
 import re
 import shutil
@@ -183,6 +184,152 @@ CREATE INDEX IF NOT EXISTS idx_image_candidates_article ON image_candidates(arti
 """
 
 
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _normalized_default(value: str | None) -> str | None:
+    if value is None:
+        return None
+    result = " ".join(value.strip().split())
+    while result.startswith("(") and result.endswith(")"):
+        candidate = result[1:-1].strip()
+        if candidate.count("(") != candidate.count(")"):
+            break
+        result = candidate
+    return result
+
+
+def _column_contract(connection: sqlite3.Connection, table: str) -> dict[str, tuple[str, int, str | None, int]]:
+    return {
+        row[1]: (
+            " ".join(str(row[2]).upper().split()),
+            int(row[3]),
+            _normalized_default(row[4]),
+            int(row[5]),
+        )
+        for row in connection.execute(f"PRAGMA table_info({_quote_identifier(table)})")
+    }
+
+
+def _foreign_key_contract(connection: sqlite3.Connection, table: str) -> set[tuple[str, str, str, str, str, str]]:
+    return {
+        (str(row[2]), str(row[3]), str(row[4]), str(row[5]), str(row[6]), str(row[7]))
+        for row in connection.execute(f"PRAGMA foreign_key_list({_quote_identifier(table)})")
+    }
+
+
+def _index_contract(
+    connection: sqlite3.Connection, table: str
+) -> tuple[dict[str, tuple[int, int, tuple[tuple[str | None, int, str], ...]]], list[tuple[int, str, int, tuple[tuple[str | None, int, str], ...]]]]:
+    explicit: dict[str, tuple[int, int, tuple[tuple[str | None, int, str], ...]]] = {}
+    constraints: list[tuple[int, str, int, tuple[tuple[str | None, int, str], ...]]] = []
+    for row in connection.execute(f"PRAGMA index_list({_quote_identifier(table)})"):
+        name, unique, origin, partial = str(row[1]), int(row[2]), str(row[3]), int(row[4])
+        columns = tuple(
+            (detail[2], int(detail[3]), str(detail[4]).upper())
+            for detail in connection.execute(f"PRAGMA index_xinfo({_quote_identifier(name)})")
+            if int(detail[5]) == 1
+        )
+        value = (unique, partial, columns)
+        if origin == "c":
+            explicit[name] = value
+        else:
+            constraints.append((unique, origin, partial, columns))
+    return explicit, sorted(constraints, key=repr)
+
+
+def _semantic_schema(connection: sqlite3.Connection) -> dict[str, object]:
+    objects = {
+        (str(row[0]), str(row[1]), str(row[2]))
+        for row in connection.execute(
+            "SELECT type,name,tbl_name FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','index','view','trigger')"
+        )
+    }
+    tables = {name for object_type, name, _ in objects if object_type == "table"}
+    autoincrement_tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND sql IS NOT NULL AND sql LIKE '%AUTOINCREMENT%'"
+        )
+    }
+    table_flags = {
+        str(row[1]): (
+            int(row[4]),
+            int(row[5]),
+            str(row[1]) in autoincrement_tables,
+        )
+        for row in connection.execute("PRAGMA table_list")
+        if row[2] == "table" and not str(row[1]).startswith("sqlite_")
+    }
+    return {
+        "objects": objects,
+        "tables": tables,
+        "table_flags": table_flags,
+        "columns": {table: _column_contract(connection, table) for table in tables},
+        "foreign_keys": {table: _foreign_key_contract(connection, table) for table in tables},
+        "indexes": {table: _index_contract(connection, table) for table in tables},
+    }
+
+
+@lru_cache(maxsize=1)
+def _v4_schema_contract() -> dict[str, object]:
+    with closing(sqlite3.connect(":memory:")) as connection:
+        connection.executescript(SCHEMA)
+        connection.execute(
+            "CREATE INDEX idx_candidates_fingerprint ON candidates(candidate_fingerprint)"
+        )
+        return _semantic_schema(connection)
+
+
+def _validate_v4_schema(connection: sqlite3.Connection, versions: list[int]) -> None:
+    if versions != list(range(1, SUPPORTED_SCHEMA_VERSION + 1)):
+        raise ValueError(
+            "incompatible schema v4 version history; expected versions 1, 2, 3, and 4"
+        )
+    integrity = [row[0] for row in connection.execute("PRAGMA integrity_check")]
+    if integrity != ["ok"]:
+        raise ValueError(f"incompatible schema v4 integrity check failed: {integrity}")
+
+    expected = _v4_schema_contract()
+    actual = _semantic_schema(connection)
+    expected_tables = expected["tables"]
+    actual_tables = actual["tables"]
+    missing_tables = sorted(expected_tables - actual_tables)
+    if missing_tables:
+        raise ValueError(
+            f"incompatible schema v4 missing table(s): {', '.join(missing_tables)}"
+        )
+    extra_tables = sorted(actual_tables - expected_tables)
+    if extra_tables:
+        raise ValueError(
+            f"incompatible schema v4 unexpected schema object(s): {', '.join(extra_tables)}"
+        )
+
+    expected_objects = expected["objects"]
+    actual_objects = actual["objects"]
+    unexpected_objects = sorted(actual_objects - expected_objects)
+    if unexpected_objects:
+        names = ", ".join(f"{kind}:{name}" for kind, name, _ in unexpected_objects)
+        raise ValueError(f"incompatible schema v4 unexpected schema object(s): {names}")
+    missing_objects = sorted(expected_objects - actual_objects)
+    if missing_objects:
+        names = ", ".join(f"{kind}:{name}" for kind, name, _ in missing_objects)
+        raise ValueError(f"incompatible schema v4 index mismatch or missing object(s): {names}")
+
+    for table in sorted(expected_tables):
+        if actual["table_flags"][table] != expected["table_flags"][table]:
+            raise ValueError(f"incompatible schema v4 table option mismatch: {table}")
+        if actual["columns"][table] != expected["columns"][table]:
+            raise ValueError(f"incompatible schema v4 column mismatch: {table}")
+        if actual["foreign_keys"][table] != expected["foreign_keys"][table]:
+            raise ValueError(f"incompatible schema v4 foreign key mismatch: {table}")
+        if actual["indexes"][table] != expected["indexes"][table]:
+            raise ValueError(f"incompatible schema v4 index mismatch: {table}")
+
+
 class Database:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -246,6 +393,13 @@ class Database:
                     rows = connection.execute(
                         "SELECT version FROM schema_version ORDER BY version"
                     ).fetchall()
+                    snapshot_versions = [row[0] for row in rows]
+                    if (
+                        snapshot_versions
+                        and all(type(version) is int for version in snapshot_versions)
+                        and max(snapshot_versions) == SUPPORTED_SCHEMA_VERSION
+                    ):
+                        _validate_v4_schema(connection, snapshot_versions)
         except sqlite3.Error as error:
             raise ValueError(
                 f"invalid or unreadable database schema version; this newsroom supports versions "

@@ -523,6 +523,144 @@ def test_public_schema_validation_returns_supported_version_without_mutation(tmp
     assert db_path.read_bytes() == before
 
 
+def _create_labeled_v4_database(path: Path, schema: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(schema)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_candidates_fingerprint "
+            "ON candidates(candidate_fingerprint)"
+        )
+        connection.executemany(
+            "INSERT INTO schema_version(version, applied_at) VALUES (?, 'fixture')",
+            [(version,) for version in range(1, 5)],
+        )
+        connection.commit()
+
+
+def test_init_rejects_incomplete_v4_wal_without_mutating_database_sidecars_or_backup(
+    tmp_path: Path,
+):
+    db_path = tmp_path / "data/newsroom.db"
+    Database(db_path).initialize("2026-10-06T02:00:00+00:00")
+    writer = sqlite3.connect(db_path)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.execute("DROP TABLE image_candidates")
+        writer.commit()
+        files = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")]
+        assert all(path.is_file() for path in files)
+        before = {path: path.read_bytes() for path in files}
+
+        with pytest.raises(ValueError, match=r"incompatible schema v4.*missing table.*image_candidates"):
+            Database(db_path).initialize("2026-10-07T00:00:00+00:00")
+
+        assert {path: path.read_bytes() for path in files} == before
+        assert not (db_path.parent / "backups").exists()
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize(
+    ("broken_schema", "message"),
+    [
+        (
+            SCHEMA.replace("  notes TEXT NOT NULL DEFAULT '',\n  created_at TEXT NOT NULL,", "  created_at TEXT NOT NULL,", 1),
+            r"column mismatch.*candidates",
+        ),
+        (
+            SCHEMA.replace("  version INTEGER PRIMARY KEY,", "  version INTEGER,", 1),
+            r"column mismatch.*schema_version",
+        ),
+        (
+            SCHEMA.replace(
+                "  candidate_id TEXT NOT NULL UNIQUE REFERENCES candidates(candidate_id),",
+                "  candidate_id TEXT NOT NULL UNIQUE,",
+                1,
+            ),
+            r"foreign key mismatch.*articles",
+        ),
+        (
+            SCHEMA.replace(
+                "CREATE INDEX IF NOT EXISTS idx_batch_requests_batch ON batch_requests(batch_id, created_at);",
+                "",
+                1,
+            ),
+            r"index mismatch.*idx_batch_requests_batch",
+        ),
+        (
+            SCHEMA.replace(
+                "transition_id INTEGER PRIMARY KEY AUTOINCREMENT",
+                "transition_id INTEGER PRIMARY KEY",
+                1,
+            ),
+            r"table option mismatch.*state_transitions",
+        ),
+    ],
+)
+def test_init_rejects_semantically_incompatible_v4_before_changes(
+    tmp_path: Path, broken_schema: str, message: str
+):
+    db_path = tmp_path / "data/newsroom.db"
+    _create_labeled_v4_database(db_path, broken_schema)
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=message):
+        Database(db_path).initialize("2026-10-07T00:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+    assert not (db_path.parent / "backups").exists()
+
+
+def test_init_rejects_unexpected_v4_user_objects_but_ignores_sqlite_internals(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    Database(db_path).initialize("2026-10-06T02:00:00+00:00")
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.execute("CREATE TABLE unexpected_user_table (value TEXT)")
+        connection.commit()
+    before = db_path.read_bytes()
+
+    with pytest.raises(ValueError, match=r"unexpected schema object.*unexpected_user_table"):
+        Database(db_path).initialize("2026-10-07T00:00:00+00:00")
+
+    assert db_path.read_bytes() == before
+
+
+def test_init_accepts_v4_created_by_v3_alter_upgrade_and_is_idempotent(tmp_path: Path):
+    db_path = tmp_path / "data/newsroom.db"
+    v3_schema = SCHEMA.replace(
+        "  owning_batch_id TEXT REFERENCES batches(batch_id),\n", "", 1
+    ).replace("  workspace_version INTEGER NOT NULL DEFAULT 0,\n", "", 1)
+    db_path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(db_path)) as connection:
+        connection.executescript(v3_schema)
+        connection.execute(
+            "CREATE INDEX idx_candidates_fingerprint ON candidates(candidate_fingerprint)"
+        )
+        connection.executemany(
+            "INSERT INTO schema_version(version, applied_at) VALUES (?, 'fixture')",
+            [(version,) for version in range(1, 4)],
+        )
+        connection.commit()
+
+    database = Database(db_path)
+    database.initialize("2026-10-07T00:00:00+00:00")
+    with closing(sqlite3.connect(db_path)) as connection:
+        schema_before = connection.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall()
+    backups_before = sorted((db_path.parent / "backups").iterdir())
+
+    database.initialize("2026-10-07T00:01:00+00:00")
+
+    assert database.validate_existing_schema() == 4
+    with closing(sqlite3.connect(db_path)) as connection:
+        assert connection.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall() == schema_before
+    assert sorted((db_path.parent / "backups").iterdir()) == backups_before
+
+
 def build_persistent_v3_wal_database(tmp_path: Path) -> Path:
     source = tmp_path / "source/data/newsroom.db"
     Database(source).initialize("2026-10-06T00:00:00+00:00")
