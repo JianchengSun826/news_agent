@@ -2378,6 +2378,43 @@ def test_execute_accepts_legacy_metadata_without_image_identity_for_registered_i
     assert f.room.get_article(f.single_id)['image_id'] == 'img-legacy-package'
 
 
+@pytest.mark.parametrize('recorded_revision', ['absent', 1])
+def test_execute_accepts_legacy_metadata_revision_only_when_absent_or_exact(
+    legacy_workspace, recorded_revision,
+):
+    f = legacy_workspace
+    package = prepare_legacy_publication_package(f)
+    metadata = json.loads((package / 'metadata.json').read_bytes())
+    if recorded_revision == 'absent':
+        metadata.pop('revision_number')
+    else:
+        metadata['revision_number'] = recorded_revision
+    (package / 'metadata.json').write_text(json.dumps(metadata))
+
+    service = migrator(f.room)
+    plan = service.preflight()
+    result = service.execute(plan, service.backup(plan))
+
+    assert result['status'] == 'PASS'
+    assert f.room.get_article(f.single_id)['revision_number'] == 1
+
+
+@pytest.mark.parametrize('recorded_revision', [None, '1', 2, True])
+def test_execute_rejects_present_inexact_legacy_metadata_revision(
+    legacy_workspace, recorded_revision,
+):
+    f = legacy_workspace
+    package = prepare_legacy_publication_package(f)
+    metadata = json.loads((package / 'metadata.json').read_bytes())
+    metadata['revision_number'] = recorded_revision
+    (package / 'metadata.json').write_text(json.dumps(metadata))
+    service = migrator(f.room)
+    plan = service.preflight()
+
+    with pytest.raises(WorkflowError, match='version'):
+        service.execute(plan, service.backup(plan))
+
+
 def test_execute_owned_approved_article_without_current_pass_still_blocks(approved_batch):
     f = approved_batch
     from newsroom.batch_release import BatchReleaseWorkflow

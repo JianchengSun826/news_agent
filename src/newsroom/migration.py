@@ -1260,10 +1260,12 @@ class WorkspaceMigrator:
                 if ('image_id' in metadata
                         and metadata['image_id'] != article.get('image_id')):
                     raise ValueError('historical article image identity mismatch')
-                recorded_revision = metadata.get('revision_number')
-                if (recorded_revision is not None
-                        and recorded_revision != article['revision_number']):
-                    raise ValueError('historical article version mismatch')
+                if 'revision_number' in metadata:
+                    recorded_revision = metadata['revision_number']
+                    current_revision = article['revision_number']
+                    if (type(recorded_revision) is not type(current_revision)
+                            or recorded_revision != current_revision):
+                        raise ValueError('historical article version mismatch')
 
             comparable = {
                 'article.md': article.get('draft_path'),

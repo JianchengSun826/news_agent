@@ -94,7 +94,7 @@ uv run newsroom workspace migrate --execute --plan data/workspace-migration-pref
 
 确认后创建并重新打开验证 SQLite、素材归档及 manifest，校验所有哈希。迁移暂存规范文件并重建视图，事务切换相对路径与 `workspace_version=1`，整体提升并核对引用；没有推进文章状态。未归属文件和旧单篇资料复制为 `workspace/archive/unclaimed-files/` 和 `legacy-single-articles/` 下只读参考。
 
-发布验证区分当前批次与旧 archive。具有 owner 的文章必须有恰好一条指向该 owner 的有效关系，同一批次的重复有效记录也会阻塞；`APPROVED`/`PUBLISHED` 仍执行当前 PASS、图片、审核素材和发布包检查。NULL owner 只在没有有效成员关系时成立；`REUSED_COMPLETE`/`EXCLUDED` 不转移归属。未归属旧包按原字节归档，不重新生成，也不要求补齐新版 fact-check、图片或 package 字段；已有文章、图片身份字段和可比较素材必须与数据库一致，缺少 `metadata.json.image_id` 仍兼容旧格式，旧路径、版本化 hero 名称及缺少可选成员可以保留。
+发布验证区分当前批次与旧 archive。具有 owner 的文章必须有恰好一条指向该 owner 的有效关系，同一批次的重复有效记录也会阻塞；`APPROVED`/`PUBLISHED` 仍执行当前 PASS、图片、审核素材和发布包检查。NULL owner 只在没有有效成员关系时成立；`REUSED_COMPLETE`/`EXCLUDED` 不转移归属。未归属旧包按原字节归档，不重新生成，也不要求补齐新版 fact-check、图片或 package 字段；已有文章、图片身份字段和可比较素材必须与数据库一致。缺少 `metadata.json.image_id` 或 `revision_number` 仍兼容旧格式，但存在时须分别精确匹配图片身份，以及整数类型和值都相同的 revision。旧路径、版本化 hero 名称及缺少可选成员可以保留。
 
 完整旧 `research/`、`articles/`、`images/`、`output/` 树在验证成功后原子改名保留到 journal 绑定的 `data/workspace-migration-recovery/`，包括空目录和文件身份；程序不会自动 unlink 或递归删除。改变、新增或缺失 archive/recovery 文件会阻止普通访问；活动批次素材和发布包可继续按批次规则编辑或重建。备份与 retained 树均需人工保管。
 
