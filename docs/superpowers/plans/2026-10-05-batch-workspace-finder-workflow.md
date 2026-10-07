@@ -751,7 +751,7 @@ git commit -m "docs: adopt Finder-first batch workflow"
 
 - [ ] **Step 1: Create a full rehearsal copy outside the repository**
 
-Use Python `shutil.copytree` to copy the repository runtime data (`data`, `research`, `articles`, `images`, `output`) into a unique `/tmp/newsroom-migration-rehearsal-*` root. Never point rehearsal commands at the production root.
+Use Python `shutil.copytree` to copy the repository runtime data (`data`, existing `workspace`, `research`, `articles`, `images`, `output`) into a unique `/tmp/newsroom-migration-rehearsal-*` root. Never point rehearsal commands at the production root.
 
 ```bash
 rehearsal_root="$(mktemp -d /tmp/newsroom-migration-rehearsal.XXXXXX)"
@@ -763,7 +763,7 @@ import sys
 
 source = Path(sys.argv[1])
 target = Path(sys.argv[2])
-for name in ("data", "research", "articles", "images", "output"):
+for name in ("data", "workspace", "research", "articles", "images", "output"):
     path = source / name
     if path.exists():
         shutil.copytree(path, target / name)
@@ -772,24 +772,148 @@ PY
 
 - [ ] **Step 2: Run preflight and migration against the rehearsal**
 
-Old-schema copies must be initialized before migration preflight. `init` creates the automatic pre-upgrade database backup and upgrades schema only; it does not move artifacts. Open the newest `newsroom-vOLD-*.db` backup read-only and require `PRAGMA integrity_check` to return `ok` before continuing. Run:
+Old-schema copies must be initialized before migration preflight. First stop every writer and ensure the database has no unresolved WAL/SHM dependency; otherwise checkpoint after clean shutdown or create a coherent SQLite backup with the relevant state. `init` initializes/upgrades schema and idempotently seeds configured sources; it does not move article artifacts. Its automatic pre-upgrade `copy2` snapshot is only a safety copy. Record the original schema, table row counts, and required business samples, then open the snapshot read-only and compare that evidence as well as `PRAGMA integrity_check`. This snapshot never replaces the verified workspace migration backup created below.
+
+After the init safety copy is validated, use the fail-fast sequence from `docs/WORKFLOW.md`: save preflight stdout as JSON, parse its `report_path` into `PLAN`, run `--backup-plan --plan "$PLAN"`, parse the returned JSON `backup_path` into `BACKUP`, independently call `WorkspaceMigrator.verify_backup(BACKUP)`, and only then run `--execute --plan "$PLAN" --backup "$BACKUP"`. Use `set -euo pipefail`; any failed command or JSON/path validation must stop before the next mutation. The exact CLI contract is:
 
 ```bash
+set -euo pipefail
 rehearsal_root="$(cat /tmp/newsroom-migration-rehearsal-path)"
-uv run newsroom --root "$rehearsal_root" init
-backup="$(ls -t "$rehearsal_root"/data/backups/newsroom-v*.db | head -n 1)"
-python3 - "$backup" <<'PY'
+NEWSROOM_ROOT="$rehearsal_root"
+DATABASE="$NEWSROOM_ROOT/data/newsroom.db"
+INIT_BACKUPS_BEFORE="$(mktemp /tmp/newsroom-init-backups.XXXXXX)"
+INIT_EVIDENCE_BEFORE="$(mktemp /tmp/newsroom-init-before.XXXXXX)"
+INIT_EVIDENCE_AFTER="$(mktemp /tmp/newsroom-init-after.XXXXXX)"
+PREFLIGHT_JSON="$(mktemp /tmp/newsroom-preflight.XXXXXX)"
+BACKUP_JSON="$(mktemp /tmp/newsroom-backup.XXXXXX)"
+trap 'rm -f "$INIT_BACKUPS_BEFORE" "$INIT_EVIDENCE_BEFORE" "$INIT_EVIDENCE_AFTER" "$PREFLIGHT_JSON" "$BACKUP_JSON"' EXIT
+
+if [[ -e "${DATABASE}-wal" || -e "${DATABASE}-shm" ]]; then
+  echo "Stop: close writers and resolve the SQLite WAL/SHM state before init." >&2
+  exit 1
+fi
+if [[ -d "$NEWSROOM_ROOT/data/backups" ]]; then
+  find "$NEWSROOM_ROOT/data/backups" -maxdepth 1 -type f -name 'newsroom-v*.db' -print | sort > "$INIT_BACKUPS_BEFORE"
+else
+  : > "$INIT_BACKUPS_BEFORE"
+fi
+python3 - "$DATABASE" > "$INIT_EVIDENCE_BEFORE" <<'PY'
 from pathlib import Path
+import hashlib
+import json
 import sqlite3
 import sys
 
-with sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True) as connection:
-    result = connection.execute("PRAGMA integrity_check").fetchone()[0]
-if result != "ok":
-    raise SystemExit(f"backup integrity check failed: {result}")
+database = Path(sys.argv[1]).resolve()
+with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+    integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+    schema = connection.execute(
+        "SELECT name, type, COALESCE(sql, '') FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    tables = [row[0] for row in schema if row[1] == "table"]
+    rows = {
+        table: connection.execute(
+            'SELECT COUNT(*) FROM "' + table.replace('"', '""') + '"'
+        ).fetchone()[0]
+        for table in tables
+    }
+print(json.dumps({
+    "sha256": hashlib.sha256(database.read_bytes()).hexdigest(),
+    "integrity": integrity,
+    "schema": schema,
+    "rows": rows,
+}, ensure_ascii=False, sort_keys=True))
 PY
-uv run newsroom --root "$rehearsal_root" workspace migrate --preflight
-uv run newsroom --root "$rehearsal_root" workspace migrate --execute
+
+uv run newsroom --root "$rehearsal_root" init
+INIT_SAFETY_BACKUP="$(python3 - "$NEWSROOM_ROOT" "$INIT_BACKUPS_BEFORE" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+before = set(Path(sys.argv[2]).read_text(encoding="utf-8").splitlines())
+current = {str(path.resolve()) for path in (root / "data/backups").glob("newsroom-v*.db")}
+created = sorted(current - before)
+if len(created) != 1:
+    raise SystemExit(f"expected exactly one new init safety copy, found {len(created)}")
+print(created[0])
+PY
+)"
+python3 - "$INIT_SAFETY_BACKUP" > "$INIT_EVIDENCE_AFTER" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import sqlite3
+import sys
+
+database = Path(sys.argv[1]).resolve()
+with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+    integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+    schema = connection.execute(
+        "SELECT name, type, COALESCE(sql, '') FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+    ).fetchall()
+    tables = [row[0] for row in schema if row[1] == "table"]
+    rows = {
+        table: connection.execute(
+            'SELECT COUNT(*) FROM "' + table.replace('"', '""') + '"'
+        ).fetchone()[0]
+        for table in tables
+    }
+print(json.dumps({
+    "sha256": hashlib.sha256(database.read_bytes()).hexdigest(),
+    "integrity": integrity,
+    "schema": schema,
+    "rows": rows,
+}, ensure_ascii=False, sort_keys=True))
+PY
+cmp "$INIT_EVIDENCE_BEFORE" "$INIT_EVIDENCE_AFTER"
+
+uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --preflight > "$PREFLIGHT_JSON"
+PLAN="$(python3 - "$NEWSROOM_ROOT" "$PREFLIGHT_JSON" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+root = Path(sys.argv[1]).resolve()
+payload = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+plan = (root / payload["report_path"]).resolve()
+expected = (root / "data/workspace-migration-preflight.json").resolve()
+if plan != expected or not plan.is_file():
+    raise SystemExit("preflight returned an unsafe or missing plan path")
+print(plan)
+PY
+)"
+
+uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --backup-plan --plan "$PLAN" > "$BACKUP_JSON"
+BACKUP="$(python3 - "$NEWSROOM_ROOT" "$BACKUP_JSON" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+root = Path(sys.argv[1]).resolve()
+payload = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+backup = Path(payload["backup_path"]).resolve()
+backup_root = (root / "data/backups").resolve()
+if not backup.is_relative_to(backup_root) or not backup.is_dir():
+    raise SystemExit("backup command returned an unsafe or missing directory")
+print(backup)
+PY
+)"
+
+uv run python - "$NEWSROOM_ROOT" "$BACKUP" <<'PY'
+from pathlib import Path
+import sys
+
+from newsroom.migration import WorkspaceMigrator
+from newsroom.service import Newsroom
+
+WorkspaceMigrator(Newsroom(Path(sys.argv[1]))).verify_backup(Path(sys.argv[2]))
+print(f"verified migration backup: {sys.argv[2]}")
+PY
+
+uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --execute --plan "$PLAN" --backup "$BACKUP"
 uv run newsroom --root "$rehearsal_root" batch status batch-17b6fd5a5e68
 ```
 
@@ -801,7 +925,7 @@ Regenerate dashboards, open the copied batch README, validate current Claude req
 
 - [ ] **Step 4: Run real preflight and inspect the saved report**
 
-Run `uv run newsroom --root "$PWD" init` first for an old-schema production database. Confirm the newly created pre-upgrade DB backup opens read-only and passes `PRAGMA integrity_check` before running the root `Migrate Newsroom.command` or equivalent `uv run newsroom --root "$PWD" workspace migrate --preflight`. Confirm no blocking errors and that all claimed, legacy, and unclaimed files appear in the report.
+Run `uv run newsroom --root "$PWD" init` first for an old-schema production database after writers/WAL state are safely resolved. Compare the resulting safety snapshot with recorded pre-upgrade schema, row, and business evidence; integrity checking alone is insufficient. Then run the root `Migrate Newsroom.command` or the exact gated CLI sequence in `docs/WORKFLOW.md`. Confirm no blocking errors and that all claimed, legacy, and unclaimed files appear in the saved `PLAN`; create and independently verify the migration backup before `--execute --plan "$PLAN" --backup "$BACKUP"`.
 
 - [ ] **Step 5: Execute the already-authorized real migration**
 

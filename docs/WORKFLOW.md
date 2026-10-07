@@ -23,7 +23,7 @@ uv run newsroom --root . init
 uv run newsroom --root . batch prepare ~/Downloads/tech-newsroom-candidates.csv
 ```
 
-`init` 幂等升级 schema，升级旧数据库前备份到 `data/backups/`；全新根目录只创建 `data/` 与数据库/协调文件，不创建旧运行目录。`batch prepare` 验证整份 CSV、按指纹复用候选、自动选择确定性的 `NEW` 并创建文章及工作区。相同 CSV 字节返回原批次；以前执行过 `candidate import` 也可复用。结果包含 `batch_id`、`content_request_path`、`counts` 和 `items`。
+`init` 初始化或升级 schema，并幂等写入配置的来源种子；它不移动文章素材。升级旧数据库前会把主数据库 `copy2` 到 `data/backups/` 作为升级安全快照，使用限制和验证步骤见第 9 节。全新根目录只创建 `data/` 与数据库/协调文件，不创建旧运行目录。`batch prepare` 验证整份 CSV、按指纹复用候选、自动选择确定性的 `NEW` 并创建文章及工作区。相同 CSV 字节返回原批次；以前执行过 `candidate import` 也可复用。结果包含 `batch_id`、`content_request_path`、`counts` 和 `items`。
 
 `WAITING_DUPLICATE` 需要编辑 include 或 exclude，命令见第 8 节。全部歧义解决前不会生成 content request。候选级发现、来源审核、去重覆盖和选题仍是形成完整文章批次之前的输入步骤，之后只有整批操作。旧批次若已导入内容而仍有歧义，会在修改前拒绝继续 resolve，需要恢复。
 
@@ -114,9 +114,9 @@ PASS 文章为 `FACT_CHECKED`，FAIL 为 `NEEDS_REVISION`。已通过文章保�
 `items` 必须恰好覆盖全部有效文章，每篇一个 HTTP(S) URL；占位例子需替换并补齐。缺失、额外或重复项整批拒绝。一次事务更新全部 URL、UTC 发布时间和审计，批次及文章到达 `PUBLISHED`：
 
 ```bash
-uv run newsroom batch publish-register BATCH_ID ~/Downloads/BATCH_ID-publication-result.json --actor editor
-uv run newsroom published list
-uv run newsroom batch refresh-workspace BATCH_ID
+uv run newsroom --root . batch publish-register BATCH_ID ~/Downloads/BATCH_ID-publication-result.json --actor editor
+uv run newsroom --root . published list
+uv run newsroom --root . batch refresh-workspace BATCH_ID
 ```
 
 ## 8. 候选歧义与备用批次 CLI
@@ -124,31 +124,31 @@ uv run newsroom batch refresh-workspace BATCH_ID
 排除或包含 `FOLLOW_UP`/`RELATED`：
 
 ```bash
-uv run newsroom batch resolve BATCH_ID CANDIDATE_ID --decision exclude --actor editor --reason "与已选事件重复"
-uv run newsroom batch resolve BATCH_ID CANDIDATE_ID --decision include --actor editor --reason "有独立新闻价值的后续事件"
+uv run newsroom --root . batch resolve BATCH_ID CANDIDATE_ID --decision exclude --actor editor --reason "与已选事件重复"
+uv run newsroom --root . batch resolve BATCH_ID CANDIDATE_ID --decision include --actor editor --reason "有独立新闻价值的后续事件"
 ```
 
 `POSSIBLE_DUPLICATE`/`DUPLICATE` 必须先记录人工覆盖再 include：
 
 ```bash
-uv run newsroom duplicate-check CANDIDATE_ID --override NEW --actor editor --reason "来源与日期证明为独立事件"
-uv run newsroom batch resolve BATCH_ID CANDIDATE_ID --decision include --actor editor --reason "已完成覆盖审核"
+uv run newsroom --root . duplicate-check CANDIDATE_ID --override NEW --actor editor --reason "来源与日期证明为独立事件"
+uv run newsroom --root . batch resolve BATCH_ID CANDIDATE_ID --decision include --actor editor --reason "已完成覆盖审核"
 ```
 
 选择后改变内容和发布流程状态的备用入口均为整批操作；顶层只读 `published list` 与 `stats` 仍受支持。路径以当前 `batch status`、README/request 的输出名为准：
 
 ```bash
-uv run newsroom batch status BATCH_ID
-uv run newsroom batch content-import BATCH_ID RESULT_JSON
-uv run newsroom batch fact-check-import BATCH_ID RESULT_JSON
-uv run newsroom batch revision-request BATCH_ID
-uv run newsroom batch revision-import BATCH_ID RESULT_JSON
-uv run newsroom batch image-plan BATCH_ID PLAN_JSON
-uv run newsroom batch review BATCH_ID --actor editor --reason "检查整批素材和权利"
-uv run newsroom batch approve BATCH_ID --actor editor --reason "批准整批当前版本"
-uv run newsroom batch publish-packages BATCH_ID
-uv run newsroom batch publish-register BATCH_ID URLS_JSON --actor editor
-uv run newsroom batch refresh-workspace BATCH_ID
+uv run newsroom --root . batch status BATCH_ID
+uv run newsroom --root . batch content-import BATCH_ID RESULT_JSON
+uv run newsroom --root . batch fact-check-import BATCH_ID RESULT_JSON
+uv run newsroom --root . batch revision-request BATCH_ID
+uv run newsroom --root . batch revision-import BATCH_ID RESULT_JSON
+uv run newsroom --root . batch image-plan BATCH_ID PLAN_JSON
+uv run newsroom --root . batch review BATCH_ID --actor editor --reason "检查整批素材和权利"
+uv run newsroom --root . batch approve BATCH_ID --actor editor --reason "批准整批当前版本"
+uv run newsroom --root . batch publish-packages BATCH_ID
+uv run newsroom --root . batch publish-register BATCH_ID URLS_JSON --actor editor
+uv run newsroom --root . batch refresh-workspace BATCH_ID
 ```
 
 图片计划 `PLAN_JSON` 为 `schema_version: 1`、`batch_id` 和完整 `items`，每项包含 `article_id`、所属 `image_candidate_id`、本地 `image_file` 路径及 `rights_confirmed: true`。Finder 自动准备的 `image-selections.json` 使用同一格式。
@@ -157,34 +157,67 @@ uv run newsroom batch refresh-workspace BATCH_ID
 
 ## 9. 旧工作区迁移与恢复
 
-先复制数据库和全部素材到独立目录演练并核对恢复证据，再使用真实工作区的 `workspace/Migrate Newsroom.command`。旧 schema 仓库必须在副本和真实根目录分别先运行 `uv run newsroom --root "$NEWSROOM_ROOT" init`。`init` 只升级数据库 schema，不迁移素材；升级前会在 `$NEWSROOM_ROOT/data/backups/` 自动保留 `newsroom-v旧版本-时间.db`。先用 SQLite 打开该备份并确认 `PRAGMA integrity_check` 返回 `ok`，再开始迁移预检。启动器保存并打开只读预检报告，有阻塞就拒绝继续；编辑明确确认后才创建验证备份和执行。取消只留下报告，不移动素材、不改变数据库。没有生成启动器时可用以下 CLI。迁移不是发布，也不推进文章状态。
+先把 `data/`、现有 `workspace/` 和全部旧素材复制到独立目录演练并核对恢复证据，再使用真实工作区的 `workspace/Migrate Newsroom.command`。旧 schema 仓库必须在副本和真实根目录分别先运行 `uv run newsroom --root "$NEWSROOM_ROOT" init`。`init` 初始化或升级 schema，并幂等写入配置的来源种子；它不移动文章素材。升级前必须停止所有 SQLite 写入者。若仍有 `newsroom.db-wal`/`newsroom.db-shm`，先正常关闭并 checkpoint，或用 SQLite backup API 创建一致副本；不能把单独复制主数据库当成完整状态。
 
-```bash
-NEWSROOM_ROOT="/path/to/old-repository"
-uv run newsroom --root "$NEWSROOM_ROOT" init
-backup="$(ls -t "$NEWSROOM_ROOT"/data/backups/newsroom-v*.db | head -n 1)"
-python3 - "$backup" <<'PY'
-from pathlib import Path
-import sqlite3
-import sys
+`init` 在升级前生成的 `data/backups/newsroom-v旧版本-时间.db` 是 `copy2` 安全快照，并非迁移系统的验证备份。运行前记录原数据库的 schema、各表行数和必要业务抽样；运行后只读打开安全快照，检查 `PRAGMA integrity_check`，并逐项对比这些证据。完整性检查单独通过不证明逻辑等价。任何差异都必须停止；即使安全快照匹配，执行迁移前仍必须运行 `--backup-plan` 并独立验证其 SQLite、manifest 与素材归档。启动器会保存预检报告、要求明确确认，然后创建这份验证备份。取消只留下报告，不移动素材、不改变数据库。迁移不是发布，也不推进文章状态。
 
-with sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True) as connection:
-    result = connection.execute("PRAGMA integrity_check").fetchone()[0]
-if result != "ok":
-    raise SystemExit(f"backup integrity check failed: {result}")
-print(f"backup verified: {sys.argv[1]}")
-PY
-```
-
-完成升级备份验证后，可运行 `uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --preflight`。此命令只读取数据库与文件，并把确定性的 JSON 清单保存到 `$NEWSROOM_ROOT/data/workspace-migration-preflight.json`；它不会更新流程状态、移动素材或创建迁移暂存目录。v3 升级到 v4 时新增的 `owning_batch_id` 默认仍为 NULL；预检会读取 `batch_items` 形成明确的归属投影。NULL 文章只有恰好一条非 `REUSED_COMPLETE`、非 `EXCLUDED` 关系时归入该批次，零条时保留为 `legacy-single-articles`，两条或更多时阻塞，即使这些关系来自同一批次。已有 owner 也必须与恰好一条有效关系一致；复用和排除关系永远不能取得或转移归属。完整投影（包括 NULL）写入计划与 manifest，当前及历史 request/result 也按投影 owner 分流。预检后任何 `batch_items` 或其他数据库变化都会令执行失效；执行只在同一数据库事务中回填 NULL owner、切换路径和写入 `workspace_version=1`，不会在预检阶段修改数据库。journal 和成功 receipt 绑定投影摘要，后续准入重新验证实际 owner。
+完成 init 安全快照核对后，可运行 `uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --preflight`。此命令只读取数据库与文件，并把确定性的 JSON 清单保存到 `$NEWSROOM_ROOT/data/workspace-migration-preflight.json`；它不会更新流程状态、移动素材或创建迁移暂存目录。v3 升级到 v4 时新增的 `owning_batch_id` 默认仍为 NULL；预检会读取 `batch_items` 形成明确的归属投影。NULL 文章只有恰好一条非 `REUSED_COMPLETE`、非 `EXCLUDED` 关系时归入该批次，零条时保留为 `legacy-single-articles`，两条或更多时阻塞，即使这些关系来自同一批次。已有 owner 也必须与恰好一条有效关系一致；复用和排除关系永远不能取得或转移归属。完整投影（包括 NULL）写入计划与 manifest，当前及历史 request/result 也按投影 owner 分流。预检后任何 `batch_items` 或其他数据库变化都会令执行失效；执行只在同一数据库事务中回填 NULL owner、切换路径和写入 `workspace_version=1`，不会在预检阶段修改数据库。journal 和成功 receipt 绑定投影摘要，后续准入重新验证实际 owner。
 
 缺失的数据库引用、路径逃逸、符号链接、归属歧义或目标冲突会阻塞迁移并返回非零状态。唯一自动拆分的冲突是：同一旧单篇文章归属明确、一个数据库绑定文件占用首选 archive 目标，而其他未绑定旧文件也投影到该目标。首选文件保留规范名称，额外文件分别进入该文章的 `legacy-files/原始相对目录/`，文件名附加由原始 UTF-8 相对路径生成的稳定摘要；大小写或 Unicode 规范等价的源路径仍会得到不同目标名称。名称超过目标文件系统限制时按 UTF-8 字节边界确定性截短并尽量保留扩展名；复制的原始父目录组件也必须是有效 UTF-8 并分别符合目标限制，程序不会静默改名。无法取得可用限制、连摘要都放不下或任一父目录组件超限时预检阻断。这会同时保留所有不同字节，并避免 macOS 路径碰撞。两个数据库记录即使引用完全相同的源、目标和字段也会阻塞；仅由未绑定文件组成的冲突、跨文章或不明归属、文件/祖先冲突、符号链接、路径逃逸及已有目标同样阻塞。仅同一已验证条目的源和目标完全相同时，已有目标才视为原地保留，其他计划移动走的源路径不能被复用。程序不会覆盖、删除或按内容去重。归属推断会收集路径中的全部文章和批次 ID，并按 macOS 大小写规则比较；出现多个候选或文章与批次候选不一致时，在归档分流前阻断。只有数据库绑定条目会更新 SQLite 路径，全部安全分流的条目都会进入清单和验证备份。可重复使用 `--source-csv PATH` 指定原始 CSV，只有字节级 SHA-256 与已记录批次一致时才会列为可复制输入；缺失原始 CSV 不会阻塞。
 
-迁移属于 Phase 1.1 的本地人工操作。先在复制的数据库和素材目录中演练，再操作真实工作区。预检报告审核通过后，可显式备份并执行：
+迁移属于 Phase 1.1 的本地人工操作。先在完整副本中演练，再操作真实工作区。下面的 CLI 流程启用 `set -euo pipefail`：预检失败或包含阻塞项时，不会创建迁移备份；备份创建、JSON 解析或独立验证失败时，不会执行迁移。`PLAN` 来自预检 JSON 的 `report_path`，`BACKUP` 来自 `--backup-plan` JSON 的 `backup_path`，不能手写猜测：
 
 ```bash
-uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --backup-plan --plan "$NEWSROOM_ROOT/data/workspace-migration-preflight.json"
-uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --execute --plan "$NEWSROOM_ROOT/data/workspace-migration-preflight.json" --backup "$NEWSROOM_ROOT/data/backups/WORKSPACE_MIGRATION_BACKUP"
+set -euo pipefail
+NEWSROOM_ROOT="/path/to/old-repository"
+PREFLIGHT_JSON="$(mktemp /tmp/newsroom-preflight.XXXXXX)"
+BACKUP_JSON="$(mktemp /tmp/newsroom-backup.XXXXXX)"
+trap 'rm -f "$PREFLIGHT_JSON" "$BACKUP_JSON"' EXIT
+
+uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --preflight > "$PREFLIGHT_JSON"
+PLAN="$(python3 - "$NEWSROOM_ROOT" "$PREFLIGHT_JSON" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+root = Path(sys.argv[1]).resolve()
+payload = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+plan = (root / payload["report_path"]).resolve()
+expected = (root / "data/workspace-migration-preflight.json").resolve()
+if plan != expected or not plan.is_file():
+    raise SystemExit("preflight returned an unsafe or missing plan path")
+print(plan)
+PY
+)"
+
+uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --backup-plan --plan "$PLAN" > "$BACKUP_JSON"
+BACKUP="$(python3 - "$NEWSROOM_ROOT" "$BACKUP_JSON" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+root = Path(sys.argv[1]).resolve()
+payload = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+backup = Path(payload["backup_path"]).resolve()
+backup_root = (root / "data/backups").resolve()
+if not backup.is_relative_to(backup_root) or not backup.is_dir():
+    raise SystemExit("backup command returned an unsafe or missing directory")
+print(backup)
+PY
+)"
+
+uv run python - "$NEWSROOM_ROOT" "$BACKUP" <<'PY'
+from pathlib import Path
+import sys
+
+from newsroom.migration import WorkspaceMigrator
+from newsroom.service import Newsroom
+
+WorkspaceMigrator(Newsroom(Path(sys.argv[1]))).verify_backup(Path(sys.argv[2]))
+print(f"verified migration backup: {sys.argv[2]}")
+PY
+
+uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --execute --plan "$PLAN" --backup "$BACKUP"
 ```
 
 `--backup-plan` 仅接受仍然有效且没有阻塞问题的清单，在 `data/backups/` 创建 SQLite 备份、素材归档、报告和 manifest，并重新打开数据库、检查归档成员安全性、提取并核对所有文件哈希后才返回。失败的备份会删除或标记 `INCOMPLETE`，不得用于迁移。`--execute` 要求备份与清单、当前数据库及全部素材完全一致；复制前和数据库事务提交前均重新校验来源。完整批次与 archive 在 `workspace/.migration-staging-*` 暂存，用临时数据库重建视图并校验，随后在单个事务中切换所有路径和 `workspace_version=1`，再原子替换目录。每个暂存批次始终重新生成根目录/批次 README、batch-state.json、图片候选视图、操作启动器和 inbox 指引；源视图缺失、过时或包含旧路径不阻塞有效迁移，原视图字节仍保存在验证备份及恢复树。现有 canonical 输入和素材保留原字节并严格验证，生成视图按当前渲染结果及暂存文件哈希验证，缺失的 CSV 仅记录元数据。发布包验证使用一次性目录，不推进流程状态、不替换当前发布包。
