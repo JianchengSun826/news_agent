@@ -1,11 +1,34 @@
 # Tech Newsroom Agent
 
-一个在 macOS 上通过 Finder 操作、人工把关的中文科技新闻生产工作流。当前 Phase 1.1 使用 Python 3.12、Pydantic、Typer 和 SQLite 保存状态；Gemini 只负责发现和整理审核后的 CSV，导入后由 Claude App 完成整批研究、写作、图片搜索和独立核验。无需 API key，没有网络或付费 API 集成。
+一套面向中文科技新闻的人机协作生产工具：由编辑使用 Claude 研究与写作，程序负责历史去重、任务交接、流程检查和最终文件整理。
+
+## 为什么使用这个项目？
+
+如果只是偶尔写一篇新闻，直接让 Claude 搜索要点并撰稿通常更省事。这个项目更适合持续运营、每次处理多篇新闻，并希望统一核验标准和交付方式的个人编辑或小型团队。
+
+项目的主要价值是减少重复选题、漏核验、混批和旧稿误用，让多篇新闻能够按同一套规则完成。文章质量仍取决于来源、模型表现和人工判断。
+
+| 编辑要解决的问题 | 每次临时使用 Claude | 本项目提供的支持 |
+| --- | --- | --- |
+| 这个事件是否已经写过？ | 自行翻查旧稿和聊天记录 | 保存跨批次历史事件，比较重复和相似选题，歧义交给编辑判断 |
+| 如何保持要求一致？ | 自己维护提示词和每次交接内容 | 统一任务文件包含选题、来源、写作要求和输出格式，支持整批交接 |
+| 返回结果是否齐全、属于当前任务？ | 人工核对文章、文件名和版本 | 检查文章集合、必填字段、批次与请求身份，拒绝缺项和过期结果 |
+| 是否完成了核验和修订？ | 编辑自行安排并记住进度 | 在新对话中独立核验，逐篇记录 PASS/FAIL，失败稿件修订后重新核验 |
+| 图片能否使用？ | 自行保存授权依据和署名 | 区分已核实候选与待确认线索；人工确认图片或无图，有图时登记权利记录 |
+| 最终稿件保存在哪里？ | 自己整理正文、图片和历史文件 | 每篇一个最终成果文件夹，验证后清理过程材料，SQL 去重与业务记录继续保留 |
+
+**编辑负责选题、来源判断、模型交互、图片权利、最终审核和发布；程序负责能确定检查的身份、结构、版本与状态。** 完成后获得正文和已登记图片即可交付，上传 CMS 和登记发布 URL 是可选后续操作。
+
+需要了解的边界：独立核验仍可能出错，PASS 不代表事实绝对正确；项目尚无自动搜索、自动发布或 Google Docs 转换。完成清理后不保留原始研究、完整核验报告和历史稿件。效率与质量收益需要实际使用数据支持，尚未测得节省时间或提升准确率的百分比。
+
+详细对比、8 篇批次示例、适用场景及效果衡量方法见[项目价值说明](docs/PROJECT_VALUE_ZH.md)。
 
 ## Quick start
 
+当前 Phase 1.1 采用 macOS Finder、Python 3.12、Pydantic、Typer 和 SQLite。Gemini 负责准备经审核的 CSV，导入后由人工在 Claude App 中完成研究、写作与核验。程序无需 API key、不调用付费模型 API；Claude 账户费用按实际服务计费。
+
 ```bash
-uv sync --dev
+uv sync --locked
 uv run newsroom --root . init
 uv run newsroom --root . batch prepare ~/Downloads/tech-newsroom-candidates.csv
 ```
@@ -22,16 +45,16 @@ uv run newsroom --root . batch prepare ~/Downloads/tech-newsroom-candidates.csv
 
 `REUSED_COMPLETE` 不参与本批次编辑或发布。有 `owning_batch_id` 的复用文章链接到所属批次；历史记录可能没有拥有批次，README 无法提供批次素材链接，应按数据库记录的规范/旧路径查找，或先完成迁移与归属核对。
 
-产品定位与能力见[产品介绍](docs/PRODUCT_OVERVIEW_ZH.md)。完整操作文件名和备用 CLI 见[工作流](docs/WORKFLOW.md)与[中文速查](docs/WORKFLOW_ZH.md)，字段见[数据模型](docs/DATA_MODEL.md)，Phase 边界见[路线图](docs/ROADMAP.md)。
+产品定位与能力见[产品介绍](docs/PRODUCT_OVERVIEW_ZH.md)。与临时使用 Claude 写新闻的区别见[项目价值说明](docs/PROJECT_VALUE_ZH.md)。完整操作文件名和备用 CLI 见[工作流](docs/WORKFLOW.md)与[中文速查](docs/WORKFLOW_ZH.md)，字段见[数据模型](docs/DATA_MODEL.md)，Phase 边界见[路线图](docs/ROADMAP.md)。
 
-## Offline demo and tests
+## 运行检查
 
 ```bash
-uv run pytest -q
-bash scripts/demo.sh
+uv run newsroom --help
+uv run newsroom --root . stats
 ```
 
-Demo 每次重建独立的 `demo-workspace/`，用两个候选、合成 Claude JSON 和本地 SVG 走通全部批次闸门，两篇文章均到达 `PUBLISHED`。脚本验证批次 README、整批 manifest 与无旧运行目录；它不打开原生对话框、不访问网络、不操作真实数据库、不执行迁移。合成新闻、图片权利和示例 URL 仅用于验证。
+当前仓库只保留运行所需文件；测试、示例、演示和旧开发记录已移除。
 
 ## Design principles
 
