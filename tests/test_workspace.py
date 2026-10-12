@@ -37,7 +37,7 @@ def test_workspace_generates_dashboard_and_relocatable_actions(prepared_batch, t
     assert workspace.article_root(batch_id, article_id).is_dir()
     assert state["batch_id"] == batch_id
     assert state["counts"] == {"READY_FOR_CONTENT": 1}
-    assert state["next_action"] == "open-next-request"
+    assert state["next_action"] == "upload-request"
     assert json.loads((root / "batch-state.json").read_text()) == state
     readme = (root / "README.md").read_text()
     assert "Example launches Tool" in readme
@@ -46,7 +46,7 @@ def test_workspace_generates_dashboard_and_relocatable_actions(prepared_batch, t
     assert str(tmp_path) not in readme
     assert batch_id in (tmp_path / "workspace" / "README.md").read_text()
     scripts = list(root.rglob("*.command"))
-    assert len(scripts) == 9
+    assert len(scripts) == 5
     assert not list(workspace.article_root(batch_id, article_id).rglob("*.command"))
     for script in scripts:
         assert script.stat().st_mode & stat.S_IXUSR

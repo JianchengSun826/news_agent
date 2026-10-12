@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from .batch import BatchWorkflow
 from .batch_models import (
     BatchContentResult, BatchFactCheckResult, BatchImagePlan, BatchImageSelection,
-    BatchRevisionResult,
+    BatchRevisionResult, NoImageSelection,
 )
 from .batch_release import BatchReleaseWorkflow
 from .coordination import operation_lock
@@ -22,7 +22,7 @@ from .workspace import BatchWorkspace, BatchWorkspacePaths
 
 ALLOWED_ACTIONS = {
     "open-batch", "open-next-request", "import-result", "open-review",
-    "register-images", "review", "approve", "build-packages", "refresh",
+    "register-images", "review", "approve", "build-packages", "refresh", "export",
 }
 
 
@@ -86,15 +86,17 @@ if selectedItems is false then return "NEWSROOM_CANCELLED"
 return item 1 of selectedItems''', title, prompt, *choices)
 
     def reveal_file(self, path: Path) -> None:
-        self._execute('''tell application "Finder"
-    reveal (POSIX file (item 1 of argv))
+        self._execute('''set targetFile to POSIX file (item 1 of argv) as alias
+tell application "Finder"
+    reveal targetFile
     activate
 end tell
 return ""''', str(path))
 
     def open_file(self, path: Path) -> None:
-        self._execute('''tell application "Finder"
-    open (POSIX file (item 1 of argv))
+        self._execute('''set targetFile to POSIX file (item 1 of argv) as alias
+tell application "Finder"
+    open targetFile
     activate
 end tell
 return ""''', str(path))
@@ -115,7 +117,7 @@ class MacOSBatchController:
     def run(self, batch_id: str, action: str) -> int:
         """Return zero on success/cancellation and two on expected user errors."""
         try:
-            with operation_lock(self.room.root):
+            with operation_lock(self.room.root, exclusive=action == "export"):
                 return self._run(batch_id, action)
         except (WorkflowError, ValidationError, OSError) as error:
             return self._report_error(error)
@@ -133,9 +135,6 @@ class MacOSBatchController:
                 root = self.workspace.batch_root(batch_id)
                 self.dialogs.open_file(root)
                 self.dialogs.open_file(root / "README.md")
-                request = self._pending_request(batch_id)
-                if request:
-                    self._open_request(request)
                 self._show_status(state)
             elif action == "open-next-request":
                 request = self._pending_request(batch_id)
@@ -155,7 +154,7 @@ class MacOSBatchController:
                 self._import_result(batch_id)
             elif action == "register-images":
                 self._register_images(batch_id)
-            elif action in {"review", "approve", "build-packages"}:
+            elif action in {"review", "approve", "build-packages", "export"}:
                 self._release_action(batch_id, action)
             else:
                 self._show_status(self.workspace.refresh(batch_id))
@@ -165,6 +164,7 @@ class MacOSBatchController:
 
     def _report_error(self, error: WorkflowError | ValidationError | OSError) -> int:
         message = self._error_message(error)
+        print(f"操作未完成：{message}", file=sys.stderr)
         try:
             self.dialogs.alert("操作未完成", message, error=True)
         except OSError as dialog_error:
@@ -182,18 +182,27 @@ class MacOSBatchController:
 
     def _open_request(self, request: dict) -> None:
         path = self.room.root / request["request_path"]
-        self.dialogs.reveal_file(path)
-        self.dialogs.open_file(path)
+        if not path.is_file():
+            raise WorkflowError(f'任务文件缺失：{path}。请检查批次素材并从备份恢复。')
+        fallback = ''
+        try:
+            self.dialogs.reveal_file(path)
+            self.dialogs.open_file(path)
+        except OSError as error:
+            fallback = f'Finder 定位失败：{error}。请用 ⌘⇧G 打开下面的文件夹，手动上传任务文件。\n文件夹：{path.parent}\n'
+        print(f'Claude 任务文件：{path}\n{fallback}')
         self.dialogs.alert(
             "Claude 任务",
             "请上传此 JSON 到 Claude；事实核验必须使用全新的对话。\n"
-            "严格执行文件中的 instructions，完成全部条目，并生成其中指定的 output_file。\n"
-            f"返回文件：{request['expected_result_filename']}",
+            "文件 instructions 已包含完整任务，可省略重复长指令；如需文字输入，发送“执行附件任务”。\n"
+            f"任务文件：{path}\n{fallback}返回文件：{request['expected_result_filename']}",
         )
 
     def _show_status(self, state: dict) -> None:
         counts = "，".join(f"{key}: {value}" for key, value in state["counts"].items())
-        self.dialogs.alert("批次状态", f"{state['batch_id']}\n状态：{state['status']}\n{counts}\n下一步：{state['next_action']}")
+        message = f"{state['batch_id']}\n状态：{state['status']}\n{counts}\n下一步：{state['next_action']}"
+        print(message)
+        self.dialogs.alert("批次状态", message)
 
     @staticmethod
     def _identity_matches(payload: object, request: dict) -> bool:
@@ -206,7 +215,7 @@ class MacOSBatchController:
     def _import_result(self, batch_id: str) -> None:
         request = self._pending_request(batch_id)
         if request is None:
-            raise WorkflowError("没有待导入的 Claude 任务。请先打开下一个 Claude 任务。")
+            raise WorkflowError("没有待导入的 Claude 任务。请查看批次 README 的当前任务与下一步。")
         inbox = BatchWorkspacePaths(self.workspace.batch_root(batch_id)).inbox
         matching = []
         for path in sorted(inbox.glob("*.json")):
@@ -222,6 +231,7 @@ class MacOSBatchController:
             choices = {str(path): path for path in matching}
             selected = self.dialogs.choose_list("导入 Claude 结果", "请选择属于当前任务的返回文件。", list(choices))
             if selected is None:
+                print('已取消导入；没有导入文件。')
                 return
             if selected not in choices:
                 raise WorkflowError("所选文件不在当前任务列表中。请重新选择。")
@@ -229,9 +239,11 @@ class MacOSBatchController:
         else:
             path = self.dialogs.choose_file("导入 Claude 结果", f"请选择 {request['expected_result_filename']}。")
             if path is None:
+                print('已取消导入；没有导入文件。')
                 return
         self._validate_result(Path(path), request)
         if not self.dialogs.confirm("导入 Claude 结果", f"确认导入当前批次的 {request['request_type']} 结果？\n{path}"):
+            print('已取消导入；没有导入文件。')
             return
         importer = {
             "CONTENT": self.workflow.import_content,
@@ -239,6 +251,10 @@ class MacOSBatchController:
             "REVISION": self.workflow.import_revisions,
         }[request["request_type"]]
         importer(batch_id, Path(path))
+        imported_count = len(json.loads(Path(path).read_bytes())['items'])
+        message = f"导入成功：{request['request_type']}，{imported_count} 篇。\n批次：{batch_id}"
+        print(message)
+        self.dialogs.alert('导入成功', message)
         if request["request_type"] == "FACT_CHECK":
             status = self.workflow.status(batch_id)
             revision = self.room.db.one(
@@ -276,16 +292,16 @@ class MacOSBatchController:
             "WHERE bi.batch_id=? AND bi.item_status NOT IN ('EXCLUDED','REUSED_COMPLETE') ORDER BY bi.candidate_id",
             (batch_id,),
         )
-        missing = [article for article in active if not article["image_id"]]
+        missing = [article for article in active if not article["image_id"] and not self.room.no_image_selected(article)]
         if missing and len(missing) != len(active):
             raise WorkflowError(
                 "当前批次部分有效文章已登记图片，部分尚未登记，属于不一致的旧版或部分完成状态。"
                 "请从备份恢复，或通过迁移／管理员工具修复后再登记；此操作不会修改图片选择草稿。"
             )
         if active and not missing:
-            self.dialogs.alert("图片已登记", "此批次的有效文章已有图片。请继续整批审核。")
+            self.dialogs.alert("素材选择已完成", "此批次已完成图片或明确无图选择。请继续整批审核。")
             return
-        if not self.dialogs.confirm("登记整批图片", "请逐篇检查原始落地页、权利页与本地原图，并明确确认使用权利。"):
+        if not self.dialogs.confirm("整批图片选择", "每篇可选择图片或明确选择无图。有图时需检查原始落地页、权利页与本地原图，并明确确认使用权利。"):
             return
         if not active or any(article["fact_check_outcome"] != "PASS" for article in active):
             raise WorkflowError("整批图片登记需要全部有效文章通过事实核验。请先完成核验或修订。")
@@ -303,11 +319,17 @@ class MacOSBatchController:
                 f"{candidate['image_candidate_id']} · {candidate['relevance']}": candidate
                 for candidate in candidates if candidate["review_status"] != "SELECTED"
             }
-            if not choices:
-                raise WorkflowError(f"文章 {article['article_id']} 没有可用图片候选。请补充合法图片候选后重试。")
-            selected = self.dialogs.choose_list("选择图片候选", f"{article['title_cn'] or article['article_id']}：请选择候选。", list(choices))
+            no_image = '无图发布（不使用图片）'
+            selected = self.dialogs.choose_list("选择图片或无图", f"{article['title_cn'] or article['article_id']}：请选择候选或无图。", [*choices, no_image])
             if selected is None:
                 return
+            if selected == no_image:
+                if not self.dialogs.confirm('确认无图', f"确认文章 {article['article_id']} 无图发布？此选择不代表缺失图片已获授权。"):
+                    return
+                item = NoImageSelection(article_id=article['article_id'], no_image=True, reason='编辑明确选择无图发布')
+                plan = BatchImagePlan(batch_id=batch_id, items=[*plan.items, item])
+                self.release.save_image_draft(batch_id, plan)
+                continue
             if selected not in choices:
                 raise WorkflowError("所选图片候选不在此文章列表中。请重新选择。")
             candidate = choices[selected]
@@ -339,11 +361,17 @@ class MacOSBatchController:
 
     def _release_action(self, batch_id: str, action: str) -> None:
         messages = {
+            "export": "确认已检查整批当前正文、研究简报、核验报告和图片使用权利，并批准导出？将一次完成审核、批准、导出和刷新。获得正文与已登记图片即完成本地任务；验证成功后删除本批次过程文件，保留 SQL 去重记录。",
             "review": "确认已检查整批当前文章、研究简报、事实核验报告、图片与权利页面？",
             "approve": "确认批准整个批次的当前版本与发布素材？",
             "build-packages": "确认生成整批发布包？请完成人工审核和批准；发布包仍需人工上传。",
         }
         if not self.dialogs.confirm("确认批次操作", messages[action]):
+            return
+        if action == "export":
+            path = self.release.export(batch_id, "editor", "编辑已检查整批当前版本、核验报告和图片权利，确认审核并批准导出")
+            self.dialogs.open_file(path)
+            self.dialogs.alert("导出完成", f"导出完成：正文与已登记图片已保存，过程文件已清理，本地内容任务完成。\n目录：{path}\n上传平台和 URL 登记可选。")
             return
         if action == "review":
             self.release.review(batch_id, "editor", "编辑已确认整批文章、核验报告、图片与权利页面")

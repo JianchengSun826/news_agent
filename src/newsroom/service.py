@@ -234,6 +234,10 @@ class Newsroom:
         return row
 
     def _copy_artifact(self, article_id: str, source: Path, directory: str, filename: str) -> str:
+        article = self.get_article(article_id)
+        if article['owning_batch_id']:
+            from .retention import BatchRetention
+            BatchRetention(self).require_process(article['owning_batch_id'])
         source = Path(source)
         if not source.is_file():
             raise WorkflowError(f"input file not found: {source}")
@@ -377,22 +381,47 @@ class Newsroom:
         self._write_publication_package(article, image, sources, target)
         return target
 
-    def _publication_materials(self, article: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Path]]:
+    def no_image_selected(self, article: dict[str, Any]) -> bool:
+        if article.get('image_id') or article.get('fact_check_outcome') != 'PASS':
+            return False
+        row = self.db.one("SELECT to_status FROM state_transitions WHERE entity_type='image_choice' "
+            "AND entity_id=? AND from_status=? ORDER BY transition_id DESC LIMIT 1",
+            (article['article_id'], f"v{article['revision_number']}"))
+        return row is not None and row['to_status'] == 'NO_IMAGE'
+
+    def require_image_decision(self, article: dict[str, Any]) -> None:
+        if article.get('image_id'):
+            image = self.db.one('SELECT * FROM images WHERE image_id=?', (article['image_id'],))
+            if image and image['article_id'] == article['article_id'] and image['image_path']:
+                return
+        elif self.no_image_selected(article):
+            return
+        raise WorkflowError('publication package requires a registered image file or explicit current-version no-image choice')
+
+    def batch_archived(self, batch_id: str) -> bool:
+        row = self.db.one("SELECT to_status FROM state_transitions WHERE entity_type='batch_visibility' AND entity_id=? ORDER BY transition_id DESC LIMIT 1", (batch_id,))
+        return row is not None and row['to_status'] == 'ARCHIVED'
+
+    def _publication_materials(self, article: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Path]]:
         """Validate the current canonical artifacts without creating output files."""
+        if article['owning_batch_id']:
+            from .retention import BatchRetention
+            BatchRetention(self).require_process(article['owning_batch_id'])
         if article["status"] != "APPROVED":
             raise WorkflowError("publication package requires APPROVED")
         image = self.db.one("SELECT * FROM images WHERE image_id=?", (article["image_id"],))
-        if not image or not image["image_path"]:
-            raise WorkflowError("publication package requires a registered image file")
-        if image["article_id"] != article["article_id"]:
+        if image and image["article_id"] != article["article_id"]:
             raise WorkflowError("registered image belongs to a different article")
+        self.require_image_decision(article)
         paths: dict[str, Path] = {}
-        for output, stored, label in (
+        source_specs = [
             ("article.md", article["draft_path"], "article"),
             ("research-brief.md", article["research_brief_path"], "research brief"),
             ("fact-check.md", article["fact_check_path"], "fact-check"),
-            ("hero", image["image_path"], "registered image"),
-        ):
+        ]
+        if image is not None:
+            source_specs.append(("hero", image["image_path"], "registered image"))
+        for output, stored, label in source_specs:
             relative = Path(stored) if stored else None
             if relative is not None and (relative.is_absolute() or ".." in relative.parts):
                 raise WorkflowError(f"{label} path must be repository-relative and within the newsroom")
@@ -404,16 +433,18 @@ class Newsroom:
             paths[output] = source
         return image, paths
 
-    def _write_publication_package(self, article: dict[str, Any], image: dict[str, Any], sources: dict[str, Path], target: Path) -> None:
+    def _write_publication_package(self, article: dict[str, Any], image: dict[str, Any] | None, sources: dict[str, Path], target: Path) -> None:
         """Write already validated materials into a caller-owned directory."""
         for output, source in sources.items():
             filename = "hero" + source.suffix.lower() if output == "hero" else output
             shutil.copyfile(source, target / filename)
         (target / "metadata.json").write_text(json.dumps(article, ensure_ascii=False, indent=2), encoding="utf-8")
-        (target / "image-license.json").write_text(json.dumps(image, ensure_ascii=False, indent=2), encoding="utf-8")
+        if image is not None:
+            (target / "image-license.json").write_text(json.dumps(image, ensure_ascii=False, indent=2), encoding="utf-8")
         (target / "sources.md").write_text("# Sources\n\n## Primary\n\n- " + article["primary_source"] + "\n\n## Secondary\n\n" + "\n".join(f"- {url}" for url in article["secondary_sources"]) + "\n", encoding="utf-8")
-        (target / "image-brief.md").write_text("# Image Brief\n\nSee the registered prompt and image-license.json provenance.\n", encoding="utf-8")
-        checks = ["title reviewed","event date checked","primary source present","independent source checked","numbers verified","company claims attributed","duplicate check passed","image rights recorded","final human review","approved for publication"]
+        if image is not None:
+            (target / "image-brief.md").write_text("# Image Brief\n\nSee the registered prompt and image-license.json provenance.\n", encoding="utf-8")
+        checks = ["title reviewed","event date checked","primary source present","independent source checked","numbers verified","company claims attributed","duplicate check passed", "image rights recorded" if image is not None else "no image: explicitly selected by editor", "final human review","approved for publication"]
         (target / "publication-checklist.md").write_text("# Publication Checklist\n\n" + "\n".join(f"- [x] {item}" for item in checks) + "\n", encoding="utf-8")
 
     def publish(self, article_id: str, actor: str, article_url: str | None = None) -> None:

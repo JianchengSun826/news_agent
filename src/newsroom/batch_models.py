@@ -59,6 +59,19 @@ class ImageCandidateResult(StrictModel):
         return self
 
 
+class ImageRecommendationResult(StrictModel):
+    """A search lead, never evidence of permission or a selectable candidate."""
+
+    landing_page_url: HttpUrl
+    direct_image_url: HttpUrl | None = None
+    creator: str | None = None
+    rights_url: HttpUrl | None = None
+    rights_information: str | None = None
+    verification_status: Literal["PAGE_INACCESSIBLE", "INSUFFICIENT_EVIDENCE", "RESTRICTED_USE"]
+    verification_issue: str = Field(min_length=1)
+    relevance: str = Field(min_length=1)
+
+
 class ContentRequestItem(StrictModel):
     article_id: str = Field(pattern=r"^art-[a-z0-9]+$")
     candidate_id: str = Field(pattern=r"^cand-[a-z0-9]+$")
@@ -83,6 +96,7 @@ class ContentResultItem(StrictModel):
     slug: str = Field(pattern=SLUG_PATTERN)
     article_md: str = Field(min_length=20)
     image_candidates: list[ImageCandidateResult] = Field(default_factory=list, max_length=3)
+    image_recommendations: list[ImageRecommendationResult] = Field(default_factory=list, max_length=3)
 
 
 class FactCheckRequestItem(StrictModel):
@@ -214,11 +228,40 @@ class BatchImageSelection(StrictModel):
         return value
 
 
+class NoImageSelection(StrictModel):
+    article_id: str = Field(pattern=r"^art-[a-z0-9]+$")
+    no_image: Literal[True]
+    reason: str = Field(min_length=1)
+
+    @field_validator("no_image", mode="before")
+    @classmethod
+    def literal_choice(cls, value: Any) -> bool:
+        if value is not True:
+            raise ValueError("no_image must be literal true")
+        return value
+
+
+class ImageCandidateSupplementItem(StrictModel):
+    article_id: str = Field(pattern=r"^art-[a-z0-9]+$")
+    image_candidates: list[ImageCandidateResult] = Field(min_length=1, max_length=3)
+
+
+class BatchImageCandidateSupplement(StrictModel):
+    schema_version: Literal[1] = SCHEMA_VERSION
+    batch_id: str = Field(pattern=r"^batch-[a-z0-9]+$")
+    items: list[ImageCandidateSupplementItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def unique_items(self) -> Self:
+        _reject_duplicate_article_ids(self.items)
+        return self
+
+
 class BatchImagePlan(StrictModel):
     schema_version: Literal[1] = SCHEMA_VERSION
     batch_id: str = Field(pattern=r"^batch-[a-z0-9]+$")
     # An incomplete list is a resumable draft, never an executable image plan.
-    items: list[BatchImageSelection]
+    items: list[BatchImageSelection | NoImageSelection]
 
     @model_validator(mode="after")
     def unique_items(self) -> Self:

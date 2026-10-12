@@ -11,6 +11,9 @@ from typing import Iterator
 from .service import WorkflowError
 
 
+_exclusive_roots: ContextVar[frozenset[Path]] = ContextVar('newsroom_exclusive_locks', default=frozenset())
+
+
 _shared_roots: ContextVar[frozenset[Path]] = ContextVar('newsroom_shared_locks', default=frozenset())
 
 
@@ -30,6 +33,9 @@ def initialize_operation_lock(root: Path) -> None:
 @contextmanager
 def operation_lock(root: Path | str, *, exclusive: bool = False) -> Iterator[None]:
     root = Path(root).resolve()
+    if root in _exclusive_roots.get():
+        yield
+        return
     if not exclusive:
         from .migration import assert_migration_access
         assert_migration_access(root)
@@ -53,8 +59,10 @@ def operation_lock(root: Path | str, *, exclusive: bool = False) -> Iterator[Non
             # Check under the lock as well as before creating/opening its file.
             assert_migration_access(root)
             token = _shared_roots.set(_shared_roots.get() | {root})
+        else:
+            token = _exclusive_roots.set(_exclusive_roots.get() | {root})
         yield
     finally:
         if token is not None:
-            _shared_roots.reset(token)
+            (_exclusive_roots if exclusive else _shared_roots).reset(token)
         os.close(descriptor)  # Closing releases flock even on interruption.

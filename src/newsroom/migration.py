@@ -343,14 +343,23 @@ class WorkspaceMigrator:
                 tables, plan.database_snapshot_sha256 = _database(connection)
                 plan.database_size = connection.execute("PRAGMA page_count").fetchone()[0] * connection.execute("PRAGMA page_size").fetchone()[0]
                 if not {"articles", "batches", "batch_items", "batch_requests", "images"} <= tables.keys():
-                    raise WorkflowError("database must be initialized to schema version 4")
+                    raise WorkflowError("database must be initialized to schema version 4 or 5")
                 versions = [row["version"] for row in tables.get("schema_version", [])]
-                if not versions or max(versions) != 4:
-                    raise WorkflowError("database must be initialized to schema version 4")
+                if not versions or max(versions) not in {4, 5}:
+                    raise WorkflowError("database must be initialized to schema version 4 or 5")
         except (OSError, sqlite3.Error, WorkflowError) as error:
             message = str(error).replace(self.room.root.as_posix() + "/", "")
             plan.blocking_errors.append(f"unreadable database: {message}")
             return plan
+        from .retention import BatchRetention
+        retention = {row['batch_id']: row for row in tables.get('batch_retention', [])}
+        for batch_id, record in retention.items():
+            try:
+                BatchRetention(self.room).validate(batch_id)
+                if record['state'] == 'CLEANING':
+                    raise WorkflowError('cleanup in progress; finish batch export before migration')
+            except (WorkflowError, OSError, ValueError) as error:
+                plan.blocking_errors.append(f'final retention {batch_id}: {error}')
         recorded_articles = {a["article_id"]: a for a in tables["articles"]}
         batches = {b["batch_id"]: b for b in tables["batches"]}
         for article_id, article in sorted(recorded_articles.items()):
@@ -377,10 +386,12 @@ class WorkspaceMigrator:
         expected_roots = {Path(root) for root in (*inventory_roots, "output/batches", "output/prompts", "workspace/batches", "workspace/archive", "workspace/archive/legacy-single-articles", "workspace/archive/unclaimed-files")}
         for article_id, article in articles.items():
             expected_roots.update(Path(root) / article_id for root in ("research", "articles", "images", "output", "workspace/archive/legacy-single-articles"))
-            if article["owning_batch_id"]:
+            if article["owning_batch_id"] and article["owning_batch_id"] not in retention:
                 root = Path("workspace/batches") / article["owning_batch_id"]
                 expected_roots.update((root / "articles" / article_id, root / "publish" / article_id))
         for batch_id in batches:
+            if batch_id in retention:
+                continue
             root = Path("workspace/batches") / batch_id
             expected_roots.add(Path("output/batches") / batch_id)
             expected_roots.update(root / suffix for suffix in (".", "input", "articles", "publish", "actions", "claude", "claude/requests", "claude/inbox", "claude/archive"))
@@ -483,6 +494,8 @@ class WorkspaceMigrator:
             except (OSError, WorkflowError) as error:
                 plan.blocking_errors.append(f"selected CSV {source.as_posix()}: {error}")
         for batch_id, batch in sorted(batches.items()):
+            if batch_id in retention:
+                continue
             target = self.workspace.source_csv_path(batch_id).relative_to(self.room.root)
             entries = [e for e in plan.entries if e.target == target]
             available = any(e.sha256 == batch["source_sha256"] for e in entries)
@@ -557,6 +570,10 @@ class WorkspaceMigrator:
 
     def _target(self, source: Path, article: dict | None, batch: str | None, db_field: str | None = None, request: dict | None = None) -> Path:
         _safe_relative(source)
+        if source.parts[:2] == ("workspace", "completed"):
+            if len(source.parts) < 3 or (batch and source.parts[2] != batch):
+                raise WorkflowError(f"ambiguous ownership of completed source: {source.as_posix()}")
+            return source
         if source.parts[:2] == ("workspace", "batches"):
             if len(source.parts) < 3 or (batch and source.parts[2] != batch):
                 raise WorkflowError(f"ambiguous ownership of canonical source: {source.as_posix()}")
@@ -1200,7 +1217,7 @@ class WorkspaceMigrator:
     def _validate_existing_owned_package(
         existing: Path,
         article: dict[str, Any],
-        image: dict[str, Any],
+        image: dict[str, Any] | None,
         sources: dict[str, Path],
     ) -> None:
         """Validate a current owned package against current release material."""
@@ -1217,15 +1234,19 @@ class WorkspaceMigrator:
                 filename = 'hero' + source.suffix.lower() if output == 'hero' else output
                 if (existing / filename).read_bytes() != source.read_bytes():
                     raise ValueError('content differs from current material')
-            license_metadata = json.loads((existing / 'image-license.json').read_bytes())
-            if (license_metadata.get('image_id') != image['image_id']
-                    or license_metadata.get('article_id') != article['article_id']):
-                raise ValueError('image identity mismatch')
-            if ({key: value for key, value in license_metadata.items()
-                 if key not in {'image_path', 'prompt_path'}}
-                    != {key: value for key, value in image.items()
-                        if key not in {'image_path', 'prompt_path'}}):
-                raise ValueError('image rights differ from registered provenance')
+            if image is None:
+                if metadata.get('image_id') is not None or list(existing.glob('hero*')) or (existing / 'image-license.json').exists() or (existing / 'image-brief.md').exists():
+                    raise ValueError('no-image package contains image material')
+            else:
+                license_metadata = json.loads((existing / 'image-license.json').read_bytes())
+                if (license_metadata.get('image_id') != image['image_id']
+                        or license_metadata.get('article_id') != article['article_id']):
+                    raise ValueError('image identity mismatch')
+                if ({key: value for key, value in license_metadata.items()
+                     if key not in {'image_path', 'prompt_path'}}
+                        != {key: value for key, value in image.items()
+                            if key not in {'image_path', 'prompt_path'}}):
+                    raise ValueError('image rights differ from registered provenance')
             for filename in ('sources.md', 'publication-checklist.md'):
                 if not (existing / filename).read_text().strip():
                     raise ValueError('missing required material')
@@ -1338,6 +1359,10 @@ class WorkspaceMigrator:
                         raise WorkflowError('unsafe canonical filesystem object')
         with closing(room.db.connect()) as connection:
             tables, _ = _database(connection)
+        from .retention import BatchRetention
+        retention = {row['batch_id']: row for row in tables.get('batch_retention', [])}
+        for batch_id in retention:
+            BatchRetention(room).validate(batch_id, strict=not terminal)
         articles = {row['article_id']: row for row in tables['articles']}
         batches = {row['batch_id'] for row in tables['batches']}
         active_memberships: dict[str, list[str]] = {}
@@ -1352,8 +1377,8 @@ class WorkspaceMigrator:
                     raise WorkflowError('active batch article is missing projected ownership')
             elif owner not in batches or memberships != [owner]:
                 raise WorkflowError('article ownership does not match current batch membership')
-        if max((row['version'] for row in tables['schema_version']), default=0) != 4:
-            raise WorkflowError('migration requires database schema version 4')
+        if max((row['version'] for row in tables['schema_version']), default=0) not in {4, 5}:
+            raise WorkflowError('migration requires database schema version 4 or 5')
         for table, rows in tables.items():
             for row in rows:
                 for column, value in row.items():
@@ -1361,17 +1386,27 @@ class WorkspaceMigrator:
                         continue
                     relative = Path(value)
                     _safe_relative(relative)
-                    if relative.parts[:2] not in {('workspace', 'batches'), ('workspace', 'archive')}:
+                    article = articles.get(row.get('article_id'))
+                    final_reference = bool(article and article['owning_batch_id'] in retention and (
+                        (table == 'articles' and column == 'draft_path') or
+                        (table == 'images' and column == 'image_path' and row['image_id'] == article['image_id'])))
+                    allowed = {('workspace', 'batches'), ('workspace', 'archive')}
+                    if final_reference:
+                        allowed.add(('workspace', 'completed'))
+                    if relative.parts[:2] not in allowed:
                         raise WorkflowError(f'noncanonical database reference: {table}.{column}')
                     path = room.root / relative
                     _no_symlinks(path)
                     if not path.resolve().is_relative_to(room.root) or not path.is_file():
-                        raise WorkflowError(f'missing database reference: {table}.{column}')
+                        raise WorkflowError(f'missing database reference: {table}.{column}: {relative}; '
+                            'restore the deleted batch/files to their original paths from Trash or a verified backup; '
+                            'do not delete database rows or migration journals. '
+                            '请从废纸篓或验证备份恢复此批次／文件到原路径；正常整理请使用 batch archive。')
                     _digest(path)  # Reopen every path, including prompts and images.
                     article = articles.get(row.get('article_id'))
                     batch = article['owning_batch_id'] if article else row.get('batch_id')
                     kind = {'draft_path': 'article', 'research_brief_path': 'research-brief', 'fact_check_path': 'fact-check'}.get(column)
-                    if article and kind:
+                    if article and kind and not final_reference:
                         match = re.fullmatch(kind + r'-v([1-9][0-9]*)\.md', relative.name)
                         version = int(match[1]) if match else 0
                         prior_check = column == 'fact_check_path' and article['fact_check_outcome'] is None and 1 <= version <= article['revision_number']
@@ -1403,6 +1438,8 @@ class WorkspaceMigrator:
         except (OSError, ValueError) as error:
             raise WorkflowError('missing or invalid migration launcher') from error
         for batch in tables['batches']:
+            if batch['batch_id'] in retention:
+                continue
             workspace = BatchWorkspace(room)
             root = workspace.batch_root(batch['batch_id'])
             for filename, action in (('OPEN_BATCH.command', 'open-batch'), *BATCH_ACTIONS):
@@ -1434,6 +1471,8 @@ class WorkspaceMigrator:
                 if json.loads(candidate_view.read_bytes()) != room.list_image_candidates(article['article_id']):
                     raise WorkflowError('migrated image candidate view differs from current database')
         for request in tables['batch_requests']:
+            if not request['request_path'] and request['batch_id'] not in retention:
+                raise WorkflowError('missing request path without authorized retention record')
             kind = {'CONTENT': 'Content', 'FACT_CHECK': 'FactCheck', 'REVISION': 'Revision'}.get(request['request_type'])
             if kind is None:
                 raise WorkflowError('unknown migrated request type')
@@ -1481,6 +1520,10 @@ class WorkspaceMigrator:
             shutil.copytree(room.root / 'workspace', clone.root / 'workspace', ignore=shutil.ignore_patterns('.migration-staging-*'))
             for batch in tables['batches']:
                 state = BatchWorkspace(clone).refresh(batch['batch_id'])
+                if batch['batch_id'] in retention:
+                    if BatchWorkspace(clone).batch_root(batch['batch_id']).exists() and retention[batch['batch_id']]['state'] == 'FINAL_ONLY':
+                        raise WorkflowError('refresh recreated final-only process directory')
+                    continue
                 root = BatchWorkspace(clone).batch_root(batch['batch_id'])
                 if json.loads((root / 'batch-state.json').read_bytes()) != state or not (root / 'README.md').read_text().strip():
                     raise WorkflowError('migrated dashboard validation failed')
@@ -1494,6 +1537,8 @@ class WorkspaceMigrator:
             for original in tables['articles']:
                 article = room.get_article(original['article_id'])
                 owner = article['owning_batch_id']
+                if owner in retention:
+                    continue
                 if owner is None:
                     existing = (room.root / 'workspace/archive/legacy-single-articles'
                                 / article['article_id'] / 'publish')
@@ -1882,7 +1927,7 @@ class WorkspaceMigrator:
             return
         with self._connect_readonly() as connection:
             tables, fingerprint = _database(connection)
-            if fingerprint != plan.database_snapshot_sha256 or max(row['version'] for row in tables['schema_version']) != 4:
+            if fingerprint != plan.database_snapshot_sha256 or max(row['version'] for row in tables['schema_version']) not in {4, 5}:
                 raise WorkflowError('rollback restored database identity/schema mismatch')
             for rows in tables.values():
                 for row in rows:

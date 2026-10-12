@@ -114,6 +114,8 @@ class BatchWorkflow:
         return self._summary(batch_id)
 
     def import_content(self, batch_id: str, result_path: Path) -> dict[str, Any]:
+        from .retention import BatchRetention
+        BatchRetention(self.room).require_process(batch_id)
         source = Path(result_path)
         raw = source.read_bytes()
         result_sha256 = hashlib.sha256(raw).hexdigest()
@@ -300,6 +302,8 @@ class BatchWorkflow:
         }
 
     def import_fact_checks(self, batch_id: str, result_path: Path) -> dict[str, Any]:
+        from .retention import BatchRetention
+        BatchRetention(self.room).require_process(batch_id)
         source = Path(result_path)
         raw = source.read_bytes()
         result_sha256 = hashlib.sha256(raw).hexdigest()
@@ -442,6 +446,8 @@ class BatchWorkflow:
         return self._fact_check_import_summary(batch_id, request_id)
 
     def create_revision_request(self, batch_id: str) -> Path:
+        from .retention import BatchRetention
+        BatchRetention(self.room).require_process(batch_id)
         batch = self.room.db.one("SELECT * FROM batches WHERE batch_id=?", (batch_id,))
         if not batch:
             raise WorkflowError(f"batch not found: {batch_id}")
@@ -536,6 +542,8 @@ class BatchWorkflow:
         return path
 
     def import_revisions(self, batch_id: str, result_path: Path) -> dict[str, Any]:
+        from .retention import BatchRetention
+        BatchRetention(self.room).require_process(batch_id)
         source = Path(result_path)
         raw = source.read_bytes()
         result_sha256 = hashlib.sha256(raw).hexdigest()
@@ -1146,11 +1154,11 @@ class BatchWorkflow:
             "counts": counts,
             "action_required": actions,
             "content_request_path": (
-                str(self.room.root / request["request_path"]) if request else None
+                str(self.room.root / request["request_path"]) if request and request["request_path"] else None
             ),
             "fact_check_request_path": (
                 str(self.room.root / fact_check_request["request_path"])
-                if fact_check_request
+                if fact_check_request and fact_check_request["request_path"]
                 else None
             ),
             "items": items,

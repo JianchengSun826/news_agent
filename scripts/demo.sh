@@ -104,7 +104,7 @@ PY
 
 run batch fact-check-import "$batch_id" "$fact_result" >/dev/null
 image_plan="$batch_root/image-selections.json"
-publication_result="$batch_root/publication-result.json"
+publication_result="$demo_root/publication-result.json"
 python3 - "$content_request" "$batch_root" "$repo_root/examples/hero.svg" "$image_plan" "$publication_result" <<'PY'
 import json
 import sys
@@ -130,13 +130,14 @@ for path, items in ((sys.argv[4], images), (sys.argv[5], publications)):
 PY
 
 run batch image-plan "$batch_id" "$image_plan" >/dev/null
-run batch review "$batch_id" --actor demo-editor --reason "Checked all articles, fact-checks, image files, and original rights metadata" >/dev/null
-run batch approve "$batch_id" --actor demo-editor --reason "Approved whole synthetic offline demo batch" >/dev/null
-run batch publish-packages "$batch_id" >/dev/null
+run batch export "$batch_id" --actor demo-editor --reason "Checked and approved all synthetic content and image rights for export" >/dev/null
 run batch publish-register "$batch_id" "$publication_result" --actor demo-editor >/dev/null
 
-test -f "$demo_root/workspace/batches/$batch_id/README.md"
-test -f "$demo_root/workspace/batches/$batch_id/publish/batch-manifest.json"
+test ! -e "$demo_root/workspace/batches/$batch_id"
+
+test -f "$demo_root/workspace/completed/$batch_id/.newsroom-export.json"
+test ! -f "$content_result"
+test ! -f "$fact_result"
 test ! -e "$demo_root/research"
 test ! -e "$demo_root/articles"
 test ! -e "$demo_root/images"
@@ -147,9 +148,11 @@ import sys
 from pathlib import Path
 with sqlite3.connect(Path(sys.argv[1]) / "data/newsroom.db") as connection:
     articles = connection.execute("SELECT article_id,status FROM articles").fetchall()
+    retention = connection.execute("SELECT state FROM batch_retention WHERE batch_id=?", (sys.argv[2],)).fetchone()[0]
     batch_status = connection.execute("SELECT status FROM batches WHERE batch_id=?", (sys.argv[2],)).fetchone()[0]
 assert len(articles) == 2 and all(status == "PUBLISHED" for _, status in articles), articles
 assert batch_status == "PUBLISHED", batch_status
+assert retention == "FINAL_ONLY", retention
 print("Selected and published articles:", ", ".join(article_id for article_id, _ in articles))
 PY
 

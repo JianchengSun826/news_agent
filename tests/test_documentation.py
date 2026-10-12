@@ -45,11 +45,13 @@ def test_migration_runbook_uses_checked_rehearsal_copy_script() -> None:
     ).read_text(encoding="utf-8")
 
 
-def test_init_runbooks_require_complete_compatible_v4_before_idempotent_init() -> None:
+def test_init_runbooks_require_versioned_schema_validation_before_idempotent_init() -> None:
     chinese_runbooks = (ROOT / "docs/WORKFLOW.md", ROOT / "docs/WORKFLOW_ZH.md")
     for path in chinese_runbooks:
         text = path.read_text(encoding="utf-8")
-        assert "完整兼容的 v4 schema" in text
+        assert "v4 或 v5" in text
+        assert "完整兼容的 schema" in text
+        assert "v5" in text
         assert "schema 保持不变" in text
     plan = INIT_RUNBOOKS[1].read_text(encoding="utf-8")
     assert "complete, compatible v4 schema" in plan

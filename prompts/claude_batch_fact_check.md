@@ -1,5 +1,7 @@
 # Independent Claude Batch Fact-check Instructions
 
+Execute this request as a complete task. Follow these instructions for every item in the enclosing JSON and create the downloadable JSON file named by its `output_file`. Do not merely summarize the attachment or ask the user to repeat the task in chat.
+
 Perform this task in a new conversation with no reliance on the writing conversation. Check every article independently against its supplied primary and secondary sources. Verify each material factual claim, date, number, attribution, product name, quotation, and the distinction between confirmed facts and company claims. Do not treat repeated media reports as independent confirmation. Do not assess images.
 
 Use `PASS` only when there is no blocking factual problem. Use `FAIL` when a material claim is unsupported, contradicted, misleading, or cannot be verified. A PASS item must have an empty `blocking_issues` array; a FAIL item must list at least one blocking issue.

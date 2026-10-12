@@ -177,7 +177,7 @@ def test_image_plan_registers_provenance_and_refreshes_views(all_pass_batch, tmp
         assert all_pass_batch.room.audit(item["article_id"])[-1]["to_status"] == "IMAGE_READY"
     state = json.loads((tmp_path / "workspace/batches" / all_pass_batch.batch_id / "batch-state.json").read_text())
     assert all(item["image_state"] == "REGISTERED" for item in state["items"])
-    assert state["next_action"] == "review"
+    assert state["next_action"] == "export"
     assert not list((tmp_path / "workspace").rglob(".staging-images-*"))
 
 
@@ -355,7 +355,7 @@ def test_review_and_approval_ignore_inactive_and_audit_all_active(ready_batch, t
     assert ready_batch.room.get_article(ignored) == ignored_before
     assert ready_batch.room.audit(ignored) == ignored_audit
     state = json.loads((tmp_path / "workspace/batches" / ready_batch.batch_id / "batch-state.json").read_text())
-    assert state["next_action"] == "build-packages"
+    assert state["next_action"] == "export"
 
 
 @pytest.mark.parametrize("gate", ["review", "approve"])
@@ -422,7 +422,7 @@ def test_packages_contain_current_material_for_exact_active_set(approved_batch, 
     assert article["status"] == "APPROVED"
     assert approved_batch.room.db.one("SELECT status FROM batches WHERE batch_id=?", (approved_batch.batch_id,))["status"] == "PACKAGED"
     state = json.loads((target.parent / "batch-state.json").read_text())
-    assert state["next_action"] == "open-review"
+    assert state["next_action"] == "complete"
     assert next(item for item in state["items"] if item["article_id"] == article["article_id"])["package_path"] == f"publish/{article['article_id']}"
     assert approved_batch.room.get_article(ignored) == ignored_before
     assert approved_batch.room.audit(ignored) == ignored_audit
@@ -803,7 +803,7 @@ def test_package_post_commit_backup_cleanup_failure_returns_committed_success(ap
     assert {table: rows for table, rows in after.items() if table != "batches"} == {table: rows for table, rows in before.items() if table != "batches"}
     state = json.loads((publish.parent / "batch-state.json").read_text())
     assert state["status"] == "PACKAGED"
-    assert state["next_action"] == "open-review"
+    assert state["next_action"] == "complete"
     backups = list(publish.parent.glob(".previous-publish-*"))
     assert len(backups) == 1
     retained = backups[0] / "publish/recovery.txt"

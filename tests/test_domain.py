@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from newsroom.db import SCHEMA, Database
+from newsroom.db import V4_SCHEMA as SCHEMA, Database
 from newsroom.coordination import operation_lock
 from newsroom.dedup import classify_candidate
 from newsroom.models import CandidateInput, make_event_id
@@ -285,7 +285,7 @@ def test_init_migrates_v1_images_table_to_store_image_path(tmp_path: Path):
         columns = {row[1] for row in connection.execute("PRAGMA table_info(images)")}
         versions = [row[0] for row in connection.execute("SELECT version FROM schema_version ORDER BY version")]
     assert "image_path" in columns
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
 
 
 def build_v2_database(tmp_path: Path, *, duplicate_candidates: bool = False) -> Path:
@@ -335,7 +335,7 @@ def test_init_migrates_v2_to_v4_and_creates_backup(tmp_path: Path):
     assert "candidate_fingerprint" in candidate_columns
     assert {"fact_check_outcome", "revision_number"} <= article_columns
     assert {"image_candidate_id", "rights_basis", "rights_statement"} <= image_columns
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
     assert fingerprint
     assert len(list((tmp_path / "data" / "backups").glob("newsroom-v2-*.db"))) == 1
 
@@ -358,7 +358,7 @@ def test_version_4_init_is_idempotent_and_does_not_create_extra_backup(tmp_path:
     assert list((tmp_path / "data" / "backups").glob("*.db")) == []
 
 
-@pytest.mark.parametrize("unsupported_version", [5, -1])
+@pytest.mark.parametrize("unsupported_version", [6, -1])
 def test_init_rejects_unsupported_schema_without_mutating_database(
     tmp_path: Path, unsupported_version: int
 ):
@@ -378,7 +378,7 @@ def test_init_rejects_unsupported_schema_without_mutating_database(
 
     before = db_path.read_bytes()
 
-    with pytest.raises(ValueError, match=r"schema version.*supports versions 1 through 4"):
+    with pytest.raises(ValueError, match=r"schema version.*supports versions 1 through 5"):
         Database(db_path).initialize("2026-10-06T01:00:00+00:00")
 
     assert db_path.read_bytes() == before
@@ -399,7 +399,7 @@ def test_init_rejects_future_wal_schema_without_mutating_database_or_sidecars(tm
         writer.execute(
             "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
-        writer.execute("INSERT INTO schema_version VALUES (5, 'future')")
+        writer.execute("INSERT INTO schema_version VALUES (6, 'future')")
         writer.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
         writer.execute("INSERT INTO sentinel VALUES ('preserve-wal')")
         writer.commit()
@@ -407,7 +407,7 @@ def test_init_rejects_future_wal_schema_without_mutating_database_or_sidecars(tm
         assert all(path.is_file() for path in files)
         before = {path: path.read_bytes() for path in files}
 
-        with pytest.raises(ValueError, match=r"schema version 5.*supports versions 1 through 4"):
+        with pytest.raises(ValueError, match=r"schema version 6.*supports versions 1 through 5"):
             Database(db_path).initialize("2026-10-06T01:00:00+00:00")
 
         assert {path: path.read_bytes() for path in files} == before
@@ -616,7 +616,7 @@ def test_init_allows_existing_empty_sqlite_file(tmp_path: Path):
 
     Database(db_path).initialize("2026-10-06T02:00:00+00:00")
 
-    assert Database(db_path).one("SELECT MAX(version) AS version FROM schema_version")["version"] == 4
+    assert Database(db_path).one("SELECT MAX(version) AS version FROM schema_version")["version"] == 5
     assert not (db_path.parent / "backups").exists()
 
 
@@ -626,7 +626,7 @@ def test_public_schema_validation_returns_supported_version_without_mutation(tmp
     database.initialize("2026-10-06T02:00:00+00:00")
     before = db_path.read_bytes()
 
-    assert database.validate_existing_schema() == 4
+    assert database.validate_existing_schema() == 5
     assert db_path.read_bytes() == before
 
 
@@ -659,7 +659,7 @@ def test_init_rejects_incomplete_v4_wal_without_mutating_database_sidecars_or_ba
         assert all(path.is_file() for path in files)
         before = {path: path.read_bytes() for path in files}
 
-        with pytest.raises(ValueError, match=r"incompatible schema v4.*missing table.*image_candidates"):
+        with pytest.raises(ValueError, match=r"incompatible schema v5.*missing table.*image_candidates"):
             Database(db_path).initialize("2026-10-07T00:00:00+00:00")
 
         assert {path: path.read_bytes() for path in files} == before
@@ -760,7 +760,7 @@ def test_v4_validation_ignores_genuine_sqlite_internal_objects(tmp_path: Path):
         }
 
     assert "sqlite_sequence" in internal_tables
-    assert Database(db_path).validate_existing_schema() == 4
+    assert Database(db_path).validate_existing_schema() == 5
 
 
 def test_init_accepts_v4_created_by_v3_alter_upgrade_and_is_idempotent(tmp_path: Path):
@@ -790,7 +790,7 @@ def test_init_accepts_v4_created_by_v3_alter_upgrade_and_is_idempotent(tmp_path:
 
     database.initialize("2026-10-07T00:01:00+00:00")
 
-    assert database.validate_existing_schema() == 4
+    assert database.validate_existing_schema() == 5
     with closing(sqlite3.connect(db_path)) as connection:
         assert connection.execute(
             "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
@@ -804,7 +804,7 @@ def build_persistent_v3_wal_database(tmp_path: Path) -> Path:
     writer = sqlite3.connect(source)
     try:
         assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
-        writer.execute("DELETE FROM schema_version WHERE version=4")
+        writer.execute("DELETE FROM schema_version WHERE version>=4")
         writer.execute(
             "INSERT INTO sources(source_id,source_name,domain,source_type,reliability_level,usage_policy,notes,active) "
             "VALUES ('wal-source','WAL Source','wal.example','PRIMARY','HIGH','LINK_ONLY','committed WAL row',1)"
@@ -831,7 +831,7 @@ def test_direct_initialize_checkpoints_v3_wal_before_complete_backup(tmp_path: P
     assert not Path(f"{db_path}-wal").exists() or Path(f"{db_path}-wal").stat().st_size == 0
     assert backup.one("SELECT MAX(version) AS version FROM schema_version")["version"] == 3
     assert backup.one("SELECT notes FROM sources WHERE source_id='wal-source'")["notes"] == "committed WAL row"
-    assert current.one("SELECT MAX(version) AS version FROM schema_version")["version"] == 4
+    assert current.one("SELECT MAX(version) AS version FROM schema_version")["version"] == 5
     assert current.one("SELECT notes FROM sources WHERE source_id='wal-source'")["notes"] == "committed WAL row"
 
 
@@ -1005,7 +1005,7 @@ def test_v3_upgrade_adds_workspace_columns_and_backup(tmp_path: Path):
     assert legacy_article["owning_batch_id"] is None
     assert legacy_article["candidate_id"] == candidate["candidate_id"]
     assert legacy_article["core_fact"] == "OpenAI released Codex Desktop on 2026-09-28."
-    assert database.one("SELECT MAX(version) AS version FROM schema_version")["version"] == 4
+    assert database.one("SELECT MAX(version) AS version FROM schema_version")["version"] == 5
     backups = list((db_path.parent / "backups").glob("newsroom-v3-*.db"))
     assert len(backups) == 1
     backup = Database(backups[0])

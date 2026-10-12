@@ -1,12 +1,18 @@
 # Claude Batch Content Instructions
 
+Execute this request as a complete task. Follow these instructions for every item in the enclosing JSON and create the downloadable JSON file named by its `output_file`. Do not merely summarize the attachment or ask the user to repeat the task in chat.
+
 Process every input item. Use the supplied sources as the starting point, verify claims against accessible original sources, and do not invent facts, quotations, dates, URLs, or image rights.
 
 For each item, produce a detailed Research Brief with these headings: Event, Core Fact, Why It Matters, Confirmed Facts, Company Claims, Independent Reporting, Important Numbers, Technical Background, Timeline, Primary Sources, Secondary Sources, Conflicting Information, Unknown / Unconfirmed, Potential Errors To Avoid, and Suggested Angle. Label evidence as FACT, COMPANY_CLAIM, MEDIA_REPORT, ANALYSIS, RUMOR, or ESTIMATE where useful, and keep direct source URLs in the brief.
 
 Then write a professional Chinese Markdown news article of roughly 600–1000 Chinese characters. Cover what happened, important details, why it matters, necessary background, and what to watch; end with a Sources list. The article must use Markdown headings and paragraphs, contain no internal citation placeholders such as `[cite: 1]`, distinguish verified facts from company claims, avoid hype, and add no unsupported facts. Use a unique lowercase ASCII slug with hyphens.
 
-Search for zero to three relevant image candidates. Include an image only when its original landing page and original rights page establish `PUBLIC_DOMAIN`, `OPEN_LICENSE`, `OFFICIAL_PRESS_LICENSE`, or `OWNED`. Exclude search thumbnails, ordinary editorial photos with unclear reuse rights, fair-use assumptions, and records without an original rights page. Do not generate or download images.
+Search for zero to three verified image candidates and separately zero to three useful image recommendations awaiting human judgment. Do not generate or download images.
+
+For `image_candidates`, establish `PUBLIC_DOMAIN`, `OPEN_LICENSE`, `OFFICIAL_PRESS_LICENSE`, or `OWNED` through verifiable permission applicable to the particular image and intended editorial use. The `rights_url` may be the original image page, an applicable site-wide media policy, an open license, or a documented authorization; a separate per-image permission page is not required. Record scope, eligibility, credit requirements and relevant third-party limitations accurately. An official source, a download button, or a copyright notice alone proves neither permission nor prohibition. Require creator and license name for OPEN_LICENSE; do not invent a personal author where an organization is the credited creator. CC0 does not require attribution. An inaccessible page means verification is incomplete, not that reuse is prohibited.
+
+For `image_recommendations`, preserve relevant original-source leads that did not pass verification. Explain the known rights information and the specific missing evidence or restriction. Use PAGE_INACCESSIBLE for unreadable evidence, INSUFFICIENT_EVIDENCE for missing or unclear permission, and RESTRICTED_USE for an explicit limitation inconsistent with the intended use. These are not approved candidates: never manufacture a rights basis, permission statement or clearance. Exclude search thumbnails and untraceable images; do not recommend fair-use assumptions as permission. Label archive photos and product differences accurately. An empty list for either category is acceptable; do not pad the lists.
 
 Create exactly this JSON shape. Copy the top-level identity values from the request. Include exactly one item for every requested `article_id` and no extra fields:
 
@@ -35,6 +41,18 @@ Create exactly this JSON shape. Copy the top-level identity values from the requ
           "attribution_required": true,
           "attribution_text": "Required attribution",
           "relevance": "Why this image matches this article"
+        }
+      ],
+      "image_recommendations": [
+        {
+          "landing_page_url": "https://original.example/photo",
+          "direct_image_url": null,
+          "creator": null,
+          "rights_url": null,
+          "rights_information": "Known rights information, or null if unknown",
+          "verification_status": "PAGE_INACCESSIBLE | INSUFFICIENT_EVIDENCE | RESTRICTED_USE",
+          "verification_issue": "Specific missing evidence or usage restriction",
+          "relevance": "Recommendation reason and accurate archive-photo caption"
         }
       ]
     }

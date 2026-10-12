@@ -73,21 +73,23 @@ def test_offline_demo_publishes_complete_batch_without_legacy_roots(tmp_path: Pa
         batches = connection.execute("SELECT batch_id,status FROM batches").fetchall()
         articles = connection.execute("SELECT article_id,status,image_id FROM articles").fetchall()
         requests = connection.execute("SELECT request_type,status,result_path FROM batch_requests").fetchall()
+        drafts = dict(connection.execute("SELECT article_id,draft_path FROM articles"))
+        images = dict(connection.execute("SELECT image_id,image_path FROM images"))
+        retention = connection.execute("SELECT state FROM batch_retention").fetchone()[0]
     assert len(batches) == 1
     batch_id, batch_status = batches[0]
     assert batch_status == "PUBLISHED"
     assert len(articles) == 2
     assert all(status == "PUBLISHED" and image_id for _, status, image_id in articles)
     batch_root = root / "workspace/batches" / batch_id
-    assert (batch_root / "README.md").is_file()
-    manifest = json.loads((batch_root / "publish/batch-manifest.json").read_text())
-    assert {item["article_id"] for item in manifest["items"]} == {row[0] for row in articles}
-    for article_id, _, _ in articles:
-        assert (batch_root / "articles" / article_id / "hero.svg").is_file()
-        assert (batch_root / "publish" / article_id / "article.md").is_file()
-        assert (batch_root / "publish" / article_id / "hero.svg").is_file()
+    assert not batch_root.exists()
+    assert retention == 'FINAL_ONLY'
+    for article_id, _, image_id in articles:
+        assert (root / drafts[article_id]).is_file()
+        assert (root / images[image_id]).is_file()
+        assert (root / drafts[article_id]).parent.parent == root / 'workspace/completed' / batch_id
     assert {kind for kind, _, _ in requests} == {"CONTENT", "FACT_CHECK"}
-    assert all(status == "COMPLETED" and (root / path).is_file() for _, status, path in requests)
+    assert all(status == "COMPLETED" and path is None for _, status, path in requests)
     assert all(not (root / name).exists() for name in ("research", "articles", "images", "output"))
 
 

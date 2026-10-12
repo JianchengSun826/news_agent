@@ -128,7 +128,7 @@ def test_import_selects_by_identity_and_archives_success(prepared_batch, tmp_pat
     assert (BatchWorkspacePaths(root).archive / 'content-result.json').is_file()
     assert len(dialogs.pickers) == (1 if count == 0 else 0)
     assert len(dialogs.lists) == (1 if count == 2 else 0)
-    assert json.loads((root / 'batch-state.json').read_text())['next_action'] == 'open-next-request'
+    assert json.loads((root / 'batch-state.json').read_text())['next_action'] == 'upload-request'
 
 
 def test_import_single_match_declined_is_noop(prepared_batch):
@@ -220,13 +220,13 @@ def test_service_gate_error_is_actionable_chinese(prepared_batch):
     assert '请' in dialogs.errors[-1]
 
 
-def test_open_batch_reports_status_and_opens_current_request(prepared_batch):
+def test_open_batch_reports_status_and_opens_readme(prepared_batch):
     dialogs = FakeDialogs()
     assert MacOSBatchController(prepared_batch.room, dialogs).run(prepared_batch.batch_id, 'open-batch') == 0
     root = BatchWorkspace(prepared_batch.room).batch_root(prepared_batch.batch_id)
     assert root in dialogs.opened
     assert root / 'README.md' in dialogs.opened
-    assert prepared_batch.request_path in dialogs.opened
+    assert prepared_batch.request_path not in dialogs.opened
     assert any('READY_FOR_CONTENT' in message and '下一步' in message for _, message in dialogs.alerts)
 
 

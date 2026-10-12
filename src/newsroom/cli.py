@@ -40,10 +40,10 @@ def root_callback(
     ctx.meta['newsroom_root'] = root
 
 
-def _room(ctx: typer.Context) -> Newsroom:
+def _room(ctx: typer.Context, *, exclusive: bool = False) -> Newsroom:
     if not ctx.meta.get("migration_access_bypass"):
         if not ctx.meta.get('operation_lock_held'):
-            _run(lambda: ctx.find_root().with_resource(operation_lock(ctx.meta['newsroom_root'])))
+            _run(lambda: ctx.find_root().with_resource(operation_lock(ctx.meta['newsroom_root'], exclusive=exclusive)))
             ctx.meta['operation_lock_held'] = True
         _run(lambda: assert_migration_access(ctx.meta['newsroom_root']))
     return _room_without_shared_lock(ctx)
@@ -234,6 +234,40 @@ def batch_image_plan(
     _json(_run(lambda: BatchReleaseWorkflow(_room(ctx)).apply_image_plan(batch_id, plan_json)))
 
 
+@batch_app.command("image-candidates-import")
+def batch_image_candidates_import(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    result_json: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
+    actor: Annotated[str, typer.Option()],
+    reason: Annotated[str, typer.Option()],
+) -> None:
+    """Append image candidates without changing content or fact-check results."""
+    _json(_run(lambda: BatchReleaseWorkflow(_room(ctx)).import_image_candidates(batch_id, result_json, actor, reason)))
+
+
+@batch_app.command("archive")
+def batch_archive(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    actor: Annotated[str, typer.Option()],
+    reason: Annotated[str, typer.Option()],
+) -> None:
+    """Archive index visibility; retain all files and database references."""
+    _json(_run(lambda: BatchReleaseWorkflow(_room(ctx)).set_archived(batch_id, True, actor, reason)))
+
+
+@batch_app.command("unarchive")
+def batch_unarchive(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    actor: Annotated[str, typer.Option()],
+    reason: Annotated[str, typer.Option()],
+) -> None:
+    """Restore an archived batch to the active index."""
+    _json(_run(lambda: BatchReleaseWorkflow(_room(ctx)).set_archived(batch_id, False, actor, reason)))
+
+
 @batch_app.command("review")
 def batch_review(
     ctx: typer.Context,
@@ -254,6 +288,18 @@ def batch_approve(
 ) -> None:
     """Record final human approval for every active article in the batch."""
     _json(_run(lambda: BatchReleaseWorkflow(_room(ctx)).approve(batch_id, actor, reason)))
+
+
+@batch_app.command("export")
+def batch_export(
+    ctx: typer.Context,
+    batch_id: Annotated[str, typer.Argument(metavar="BATCH_ID")],
+    actor: Annotated[str, typer.Option()],
+    reason: Annotated[str, typer.Option()],
+) -> None:
+    """Confirm human review and approval, export content, and refresh views."""
+    path = _run(lambda: BatchReleaseWorkflow(_room(ctx, exclusive=True)).export(batch_id, actor, reason))
+    _json({"batch_id": batch_id, "status": _room(ctx).db.one("SELECT status FROM batches WHERE batch_id=?", (batch_id,))["status"], "path": str(path)})
 
 
 @batch_app.command("publish-packages")
@@ -355,7 +401,7 @@ def macos_action(
     action: Annotated[str, typer.Argument(metavar="ACTION")],
 ) -> None:
     """Dispatch the fixed local Finder actions."""
-    code = MacOSBatchController(_room(ctx), OsaScriptDialogs()).run(batch_id, action)
+    code = MacOSBatchController(_room(ctx, exclusive=action == "export"), OsaScriptDialogs()).run(batch_id, action)
     raise typer.Exit(code=code)
 
 

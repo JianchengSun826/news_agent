@@ -15,10 +15,10 @@ from typing import Any, Iterable
 from .batch_models import candidate_fingerprint
 
 
-SUPPORTED_SCHEMA_VERSION = 4
+SUPPORTED_SCHEMA_VERSION = 5
 
 
-SCHEMA = """
+V4_SCHEMA = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER PRIMARY KEY,
@@ -184,6 +184,21 @@ CREATE INDEX IF NOT EXISTS idx_batch_items_status ON batch_items(batch_id, item_
 CREATE INDEX IF NOT EXISTS idx_batch_requests_batch ON batch_requests(batch_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_image_candidates_article ON image_candidates(article_id, review_status);
 """
+
+
+RETENTION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS batch_retention (
+  batch_id TEXT PRIMARY KEY REFERENCES batches(batch_id),
+  state TEXT NOT NULL CHECK(state IN ('CLEANING','FINAL_ONLY')),
+  delivery_directory TEXT NOT NULL,
+  cleanup_manifest TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+"""
+SCHEMA = V4_SCHEMA + RETENTION_SCHEMA
 
 
 def _quote_identifier(value: str) -> str:
@@ -379,38 +394,39 @@ def _semantic_schema(connection: sqlite3.Connection) -> dict[str, object]:
     }
 
 
-@lru_cache(maxsize=1)
-def _v4_schema_contract() -> dict[str, object]:
+@lru_cache(maxsize=2)
+def _schema_contract(version: int) -> dict[str, object]:
     with closing(sqlite3.connect(":memory:")) as connection:
-        connection.executescript(SCHEMA)
+        connection.executescript(V4_SCHEMA if version == 4 else SCHEMA)
         connection.execute(
             "CREATE INDEX idx_candidates_fingerprint ON candidates(candidate_fingerprint)"
         )
         return _semantic_schema(connection)
 
 
-def _validate_v4_schema(connection: sqlite3.Connection, versions: list[int]) -> None:
-    if versions != list(range(1, SUPPORTED_SCHEMA_VERSION + 1)):
+def _validate_schema(connection: sqlite3.Connection, versions: list[int]) -> None:
+    version = max(versions)
+    if versions != list(range(1, version + 1)):
         raise ValueError(
-            "incompatible schema v4 version history; expected versions 1, 2, 3, and 4"
+            f"incompatible schema v{version} version history; expected versions 1 through {version}"
         )
     integrity = [row[0] for row in connection.execute("PRAGMA integrity_check")]
     if integrity != ["ok"]:
-        raise ValueError(f"incompatible schema v4 integrity check failed: {integrity}")
+        raise ValueError(f"incompatible schema v{version} integrity check failed: {integrity}")
 
-    expected = _v4_schema_contract()
+    expected = _schema_contract(version)
     actual = _semantic_schema(connection)
     expected_tables = expected["tables"]
     actual_tables = actual["tables"]
     missing_tables = sorted(expected_tables - actual_tables)
     if missing_tables:
         raise ValueError(
-            f"incompatible schema v4 missing table(s): {', '.join(missing_tables)}"
+            f"incompatible schema v{version} missing table(s): {', '.join(missing_tables)}"
         )
     extra_tables = sorted(actual_tables - expected_tables)
     if extra_tables:
         raise ValueError(
-            f"incompatible schema v4 unexpected schema object(s): {', '.join(extra_tables)}"
+            f"incompatible schema v{version} unexpected schema object(s): {', '.join(extra_tables)}"
         )
 
     expected_objects = expected["objects"]
@@ -418,23 +434,23 @@ def _validate_v4_schema(connection: sqlite3.Connection, versions: list[int]) -> 
     unexpected_objects = sorted(actual_objects - expected_objects)
     if unexpected_objects:
         names = ", ".join(f"{kind}:{name}" for kind, name, _ in unexpected_objects)
-        raise ValueError(f"incompatible schema v4 unexpected schema object(s): {names}")
+        raise ValueError(f"incompatible schema v{version} unexpected schema object(s): {names}")
     missing_objects = sorted(expected_objects - actual_objects)
     if missing_objects:
         names = ", ".join(f"{kind}:{name}" for kind, name, _ in missing_objects)
-        raise ValueError(f"incompatible schema v4 index mismatch or missing object(s): {names}")
+        raise ValueError(f"incompatible schema v{version} index mismatch or missing object(s): {names}")
 
     for table in sorted(expected_tables):
         if actual["table_flags"][table] != expected["table_flags"][table]:
-            raise ValueError(f"incompatible schema v4 table option mismatch: {table}")
+            raise ValueError(f"incompatible schema v{version} table option mismatch: {table}")
         if actual["columns"][table] != expected["columns"][table]:
-            raise ValueError(f"incompatible schema v4 column mismatch: {table}")
+            raise ValueError(f"incompatible schema v{version} column mismatch: {table}")
         if actual["checks"][table] != expected["checks"][table]:
-            raise ValueError(f"incompatible schema v4 check constraint mismatch: {table}")
+            raise ValueError(f"incompatible schema v{version} check constraint mismatch: {table}")
         if actual["foreign_keys"][table] != expected["foreign_keys"][table]:
-            raise ValueError(f"incompatible schema v4 foreign key mismatch: {table}")
+            raise ValueError(f"incompatible schema v{version} foreign key mismatch: {table}")
         if actual["indexes"][table] != expected["indexes"][table]:
-            raise ValueError(f"incompatible schema v4 index mismatch: {table}")
+            raise ValueError(f"incompatible schema v{version} index mismatch: {table}")
 
 
 class Database:
@@ -494,7 +510,7 @@ class Database:
                         if user_tables:
                             raise ValueError(
                                 "existing database contains user tables but no schema_version; "
-                                "restore a supported v1-v4 database or use a new empty database"
+                                "restore a supported v1-v5 database or use a new empty database"
                             )
                         return []
                     rows = connection.execute(
@@ -504,9 +520,9 @@ class Database:
                     if (
                         snapshot_versions
                         and all(type(version) is int for version in snapshot_versions)
-                        and max(snapshot_versions) == SUPPORTED_SCHEMA_VERSION
+                        and max(snapshot_versions) in {4, 5}
                     ):
-                        _validate_v4_schema(connection, snapshot_versions)
+                        _validate_schema(connection, snapshot_versions)
         except sqlite3.Error as error:
             raise ValueError(
                 f"invalid or unreadable database schema version; this newsroom supports versions "
@@ -526,7 +542,7 @@ class Database:
         return [row[0] for row in rows]
 
     def validate_existing_schema(self) -> int:
-        """Return schema version 0-4 after a read-only snapshot validation."""
+        """Return schema version 0-5 after a read-only snapshot validation."""
         versions = self._existing_versions()
         unsupported = next(
             (version for version in versions if version < 1 or version > SUPPORTED_SCHEMA_VERSION),
@@ -630,7 +646,7 @@ class Database:
         existing_version = self.validate_existing_schema()
         self._prepare_existing_database(existing_version)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if existing_version in {1, 2, 3}:
+        if existing_version in {1, 2, 3, 4}:
             self._backup_before_upgrade(existing_version, applied_at)
         with closing(self.connect()) as connection:
             with connection:
@@ -665,6 +681,10 @@ class Database:
                 self._add_column(connection, "batches", "workspace_version INTEGER NOT NULL DEFAULT 0")
                 connection.execute(
                     "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (4, ?)",
+                    (applied_at,),
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (5, ?)",
                     (applied_at,),
                 )
 

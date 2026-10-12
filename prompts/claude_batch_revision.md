@@ -1,5 +1,7 @@
 # Claude Batch Revision Instructions
 
+Execute this request as a complete task. Follow these instructions for every item in the enclosing JSON and create the downloadable JSON file named by its `output_file`. Do not merely summarize the attachment or ask the user to repeat the task in chat.
+
 Revise every requested article using its fact-check report and all listed blocking issues. Correct the Research Brief first, then revise the Chinese Markdown article so every material statement is supported by the supplied sources. Preserve accurate content, remove unsupported claims, keep company claims clearly attributed, and do not invent replacement facts, quotations, dates, numbers, or URLs.
 
 Create exactly this JSON shape. Copy the top-level identity values from the request, include exactly one complete revision for every requested `article_id`, and add no extra fields:
