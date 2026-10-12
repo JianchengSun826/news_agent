@@ -18,7 +18,7 @@ candidate_title,core_fact,event_date,company,product,topic,subtopic,event_type,k
 
 ```bash
 cd /Users/jianchengsun/agent/news_agent
-uv sync --locked --dev
+uv sync --locked
 uv run newsroom --root . init
 uv run newsroom --root . batch prepare ~/Downloads/tech-newsroom-candidates.csv
 ```
@@ -321,17 +321,12 @@ uv run newsroom --root "$NEWSROOM_ROOT" workspace migrate --execute --plan "$PLA
 
 刷新批次工作区会在 `workspace/README.md` 旁安装可执行、可搬迁的 `workspace/Migrate Newsroom.command`。Finder 启动器仅分派隐藏 CLI 控制器；控制器先预检、保存并打开报告，存在阻塞时拒绝继续，再要求编辑明确确认，之后才创建验证备份并执行迁移。取消只保留报告，不移动文件、不更改数据库。
 
-## 10. 验证与离线 Demo
+## 10. 运行检查
 
 ```bash
-uv run pytest -q
-bash scripts/demo.sh
+uv run newsroom --help
+uv run newsroom --root . stats
+uv run newsroom --root . batch status BATCH_ID
 ```
 
-Demo 重建独立 `demo-workspace/`，准备两个候选，按当前 request 生成并导入合成 content 和独立 fact-check JSON，用一个完整图片计划，再用 batch export 完成整批审核、批准和导出，随后验证可选 publish-register。脚本断言两篇及批次均为 `PUBLISHED`、批次 README 和 publish manifest 存在，且没有顶层 `research/`、`articles/`、`images/` 或 `output/`。发布包位于 `demo-workspace/workspace/batches/BATCH_ID/publish/`。整个 demo 使用本地 SVG、合成权利记录和示例 URL，不访问网络或模型、不打开原生对话框、不迁移真实数据。
-
-### 人工判断推荐图片
-
-操作 03 打开的批次 README 链接到各篇 `image-recommendations.md`，其中列出待判断图片的来源、相关性、权利线索和核验问题。已核实的图片继续位于 `image-candidates.json`；推荐不会自动出现在操作 04 中。
-
-想手动加入推荐时，复制文章目录中的 `manual-image-candidates.json` 到你自己的文件，删除不采用项，填写 rights_basis、rights_url、rights_statement、attribution_required 及必要作者、许可名称和署名。初始 null 字段会阻止未完成的草稿被导入。使用第 6 节 `batch image-candidates-import` 命令，actor 标明操作者，reason 记录人工判断依据。成功后用操作 04 选择本地图片并确认权利。不采用推荐时，直接选择无图即可。已有人工草稿不会被刷新覆盖；推荐视图可从原始归档重建。
+当前仓库只保留运行文件，测试、示例、演示及旧开发记录已移除。运行检查不导入文章、不推进发布状态，也不清理素材。

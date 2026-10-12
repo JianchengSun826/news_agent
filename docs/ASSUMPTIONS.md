@@ -7,4 +7,3 @@
 - CLI 的人工 actor/reason 字段是 Phase 1 的身份与审批证据，不包含账号认证。
 - 自动 checklist 只能确认结构性证据；内容准确性、独立性和图片实际视觉内容由 review/approve 的人负责。
 - 发布包生成不等于公开发布；`publish` 仅在人工完成外部发布后记录结果。
-- Demo 使用虚构示例 URL 和内容，只验证 workflow，不作为真实新闻或来源。

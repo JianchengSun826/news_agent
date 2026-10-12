@@ -16,12 +16,5 @@ dependencies = [
 [project.scripts]
 newsroom = "newsroom.cli:app"
 
-[dependency-groups]
-dev = ["pytest>=8.0"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-q"
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/newsroom"]

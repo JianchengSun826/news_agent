@@ -16,7 +16,7 @@ candidate_title,core_fact,event_date,company,product,topic,subtopic,event_type,k
 
 ```bash
 cd /Users/jianchengsun/agent/news_agent
-uv sync --locked --dev
+uv sync --locked
 uv run newsroom --root . init
 uv run newsroom --root . batch prepare ~/Downloads/tech-newsroom-candidates.csv
 ```
@@ -128,14 +128,6 @@ uv run newsroom --root "$NEWSROOM_ROOT" init
 
 `data/workspace-migration-journals/`、成功 receipt、验证回滚 proof 和持久 `workspace-migration-lock.json` 记录恢复证据。迁移用独占 `flock`，普通 CLI/Finder 操作持共享锁到对话和写入结束，帮助命令不创建锁。未完成、损坏或恢复失败的 journal/屏障会拒绝普通访问，不能删 flags 或反复执行来绕过。失败保留备份、暂存、隔离内容与诊断，验证恢复完成才允许重试；最终已提交后的收尾中断只继续恢复收尾。终态准入继续验证不可变 archive 与 retained recovery proof，同时允许活动包按正常闸门变化。详细阶段、终态准入和恢复树规则见[主流程第 9 节](WORKFLOW.md#9-旧工作区迁移与恢复)。
 
-## 六、离线验收
-
-```bash
-uv run pytest -q
-bash scripts/demo.sh
-```
-
-Demo 每次重建独立 `demo-workspace/`，用两个合成候选、本地 SVG 和合成 Claude JSON 走完所有批次操作。两篇均到达 `PUBLISHED`，验证批次 README 与 manifest 存在且没有 `research/`、`articles/`、`images/` 或 `output/` 四个旧 artifact 根目录。它不打开原生窗口、不访问网络、不迁移真实工作区；示例新闻、权利及 URL 仅用于验证。原 Phase 1 手册保存在 `docs/archive/WORKFLOW_PHASE1_ORIGINAL.md`，不是受支持操作路径。
 
 ## 六、补充候选、归档和操作反馈
 

@@ -7,22 +7,19 @@ Read `docs/WORKFLOW.md` and `docs/ROADMAP.md` before changing behavior. Identify
 ## Project Structure
 
 - `src/newsroom/`: CLI, SQLite persistence, workflow rules, deduplication, and package generation.
-- `tests/`: pytest tests mirroring user-visible workflow behavior.
 - `docs/`: business rules, architecture, policies, data model, assumptions, and roadmap.
 - `prompts/`: versioned, provider-neutral prompt templates; never embed prompts in Python.
 - `config/`: local newsroom, taxonomy, and source-registry defaults.
-- `research/`, `articles/`, `images/`, `output/`: human-edited and generated workflow artifacts.
-- `examples/`: safe sample inputs and demo materials.
+- `workspace/`: active batch materials and final articles/images.
+- `data/`: SQLite state, backups, and migration recovery records.
 
 ## Development Commands
 
 Use `uv` for the local environment:
 
-- `uv sync --dev`: create the environment and install test tooling.
+- `uv sync --locked`: install runtime dependencies.
 - `uv run newsroom --help`: inspect CLI commands.
-- `uv run pytest`: run the complete suite.
 - `uv run newsroom --root . init`: initialize the SQLite database.
-- `bash scripts/demo.sh`: rebuild and execute the isolated demo workspace.
 
 ## Engineering Conventions
 
@@ -30,9 +27,9 @@ Target Python 3.12 or newer. Use Pydantic v2 models at input boundaries and Type
 
 Prefer small standard-library modules and explicit data flow. Do not add network calls, model SDKs, schedulers, background workers, or web frameworks during Phase 1.
 
-## Tests and Data Changes
+## Verification and Data Changes
 
-Write a failing test before changing executable behavior. Test state transitions, approval gates, deduplication, validation, and generated artifacts using temporary directories and real SQLite databases. Any schema change must update `docs/DATA_MODEL.md`, initialization SQL, and tests. Any workflow or phase change must update `docs/WORKFLOW.md` or `docs/ROADMAP.md`.
+The user explicitly requested a runtime-only repository without test files, fixtures, demos, or test dependencies. Verify changes with CLI smoke checks and non-mutating state/material validation; do not reintroduce test artifacts without a new request. Any schema change must update `docs/DATA_MODEL.md` and initialization SQL. Any workflow or phase change must update `docs/WORKFLOW.md` or `docs/ROADMAP.md`.
 
 ## Git and Review
 
