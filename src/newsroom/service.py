@@ -396,7 +396,15 @@ class Newsroom:
                 return
         elif self.no_image_selected(article):
             return
+        elif self.external_images(article):
+            return
         raise WorkflowError('publication package requires a registered image file or explicit current-version no-image choice')
+
+    def external_images(self, article: dict[str, Any]) -> bool:
+        """Batch editors download and upload images after local content export."""
+        return bool(article.get('owning_batch_id') and not article.get('image_id')
+                    and article.get('fact_check_outcome') == 'PASS'
+                    and not self.no_image_selected(article))
 
     def batch_archived(self, batch_id: str) -> bool:
         row = self.db.one("SELECT to_status FROM state_transitions WHERE entity_type='batch_visibility' AND entity_id=? ORDER BY transition_id DESC LIMIT 1", (batch_id,))
@@ -413,6 +421,9 @@ class Newsroom:
         if image and image["article_id"] != article["article_id"]:
             raise WorkflowError("registered image belongs to a different article")
         self.require_image_decision(article)
+        if article['owning_batch_id']:
+            from .image_guide import render_image_guide
+            render_image_guide(self, article)
         paths: dict[str, Path] = {}
         source_specs = [
             ("article.md", article["draft_path"], "article"),
@@ -435,6 +446,9 @@ class Newsroom:
 
     def _write_publication_package(self, article: dict[str, Any], image: dict[str, Any] | None, sources: dict[str, Path], target: Path) -> None:
         """Write already validated materials into a caller-owned directory."""
+        if article['owning_batch_id']:
+            from .image_guide import render_image_guide
+            (target / 'image-guide.md').write_text(render_image_guide(self, article), encoding='utf-8')
         for output, source in sources.items():
             filename = "hero" + source.suffix.lower() if output == "hero" else output
             shutil.copyfile(source, target / filename)
@@ -444,7 +458,7 @@ class Newsroom:
         (target / "sources.md").write_text("# Sources\n\n## Primary\n\n- " + article["primary_source"] + "\n\n## Secondary\n\n" + "\n".join(f"- {url}" for url in article["secondary_sources"]) + "\n", encoding="utf-8")
         if image is not None:
             (target / "image-brief.md").write_text("# Image Brief\n\nSee the registered prompt and image-license.json provenance.\n", encoding="utf-8")
-        checks = ["title reviewed","event date checked","primary source present","independent source checked","numbers verified","company claims attributed","duplicate check passed", "image rights recorded" if image is not None else "no image: explicitly selected by editor", "final human review","approved for publication"]
+        checks = ["title reviewed","event date checked","primary source present","independent source checked","numbers verified","company claims attributed","duplicate check passed", "image rights recorded" if image is not None else ("images handled externally after export; see image-guide.md" if self.external_images(article) else "no image: explicitly selected by editor"), "final human review","approved for publication"]
         (target / "publication-checklist.md").write_text("# Publication Checklist\n\n" + "\n".join(f"- [x] {item}" for item in checks) + "\n", encoding="utf-8")
 
     def publish(self, article_id: str, actor: str, article_url: str | None = None) -> None:

@@ -40,7 +40,7 @@ class CleanupManifest(BaseModel):
             if value != prefix.as_posix() and Path(value).parent.as_posix() not in directories:
                 raise ValueError('cleanup inventory missing parent')
         for value in self.delivery_files:
-            if value != RECEIPT and not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*/(?:article\.md|hero\.[a-z0-9]+|image-license\.json)', value):
+            if value != RECEIPT and not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*/(?:article\.md|image-guide\.md|hero\.[a-z0-9]+|image-license\.json)', value):
                 raise ValueError('invalid retained file')
         if RECEIPT not in self.delivery_files or any(not re.fullmatch(r'[a-f0-9]{64}', h) for h in (*self.files.values(), *self.delivery_files.values())):
             raise ValueError('invalid cleanup digest inventory')
@@ -123,6 +123,16 @@ class BatchRetention:
             slug = _identifier(article['slug'])
             draft = self.workspace.completed_root(batch_id) / slug / 'article.md'
             expected.add(f'{slug}/article.md')
+            guide = draft.parent / 'image-guide.md'
+            if guide.is_file():
+                expected.add(f'{slug}/image-guide.md')
+                if not switched:
+                    source_guide = self.workspace.batch_root(batch_id) / 'publish' / article['article_id'] / 'image-guide.md'
+                    self.delivery._safe_path(source_guide)
+                    if not source_guide.is_file() or source_guide.read_bytes() != guide.read_bytes():
+                        raise WorkflowError('final image guide differs from publication package')
+            elif self.room.external_images(article):
+                raise WorkflowError('external image workflow requires a retained image guide')
             if switched:
                 if article['draft_path'] != draft.relative_to(self.room.root).as_posix() or article['research_brief_path'] or article['fact_check_path']:
                     raise WorkflowError('retained article references do not match final delivery')
@@ -147,7 +157,7 @@ class BatchRetention:
                 license_record = json.loads((draft.parent / 'image-license.json').read_bytes())
                 if not isinstance(license_record, dict) or license_record.get('image_id') != article['image_id']:
                     raise WorkflowError('retained license belongs to a different image')
-            elif not self.room.no_image_selected(article):
+            elif not self.room.no_image_selected(article) and not self.room.external_images(article):
                 raise WorkflowError('cleanup requires an explicit image or no-image decision')
         return expected
 

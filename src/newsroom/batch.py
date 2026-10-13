@@ -431,7 +431,7 @@ class BatchWorkflow:
                     ),
                 )
                 failed = sum(item.outcome == "FAIL" for item in payload.items)
-                batch_status = "NEEDS_REVISION" if failed else "READY_FOR_IMAGE"
+                batch_status = "NEEDS_REVISION" if failed else "READY_FOR_REVIEW"
                 connection.execute(
                     "UPDATE batches SET status=?,updated_at=? WHERE batch_id=?",
                     (batch_status, completed_at, batch_id),
@@ -1128,11 +1128,7 @@ class BatchWorkflow:
                 for item in items
                 if item["item_status"] == "NEEDS_REVISION"
             ],
-            "image_pending_article_ids": [
-                item["article_id"]
-                for item in items
-                if item["article_status"] == "FACT_CHECKED"
-            ],
+            "image_pending_article_ids": [],
         }
         request = None
         if batch["content_request_id"]:

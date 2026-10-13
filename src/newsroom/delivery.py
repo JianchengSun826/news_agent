@@ -34,7 +34,7 @@ class DeliveryReceipt(BaseModel):
     def valid_files(cls, values: dict[str, str]) -> dict[str, str]:
         import re
         if not values or any(
-            not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*/(?:article\.md|hero\.[a-z0-9]+|image-license\.json)', name)
+            not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*/(?:article\.md|image-guide\.md|hero\.[a-z0-9]+|image-license\.json)', name)
             or not re.fullmatch(r'[a-f0-9]{64}', digest)
             for name, digest in values.items()
         ):
@@ -103,6 +103,10 @@ class CompletedDelivery:
             slug = _identifier(article['slug'])
             package = publish / _identifier(article['article_id'])
             names = ['article.md']
+            if (package / 'image-guide.md').is_file():
+                names.append('image-guide.md')
+            elif article['owning_batch_id']:
+                raise WorkflowError('delivery source is missing image-guide.md')
             if article['image_id']:
                 image = self.room.db.one('SELECT image_path FROM images WHERE image_id=?', (article['image_id'],))
                 if image is None:

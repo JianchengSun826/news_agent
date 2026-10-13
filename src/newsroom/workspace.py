@@ -21,11 +21,11 @@ if TYPE_CHECKING:
 BATCH_ACTIONS = (
     ("02-导入Claude返回文件.command", "import-result"),
     ("03-打开整批审核材料.command", "open-review"),
-    ("04-登记整批图片.command", "register-images"),
     ("05-确认并导出.command", "export"),
 )
 
 LEGACY_RELEASE_ACTIONS = (
+    "04-登记整批图片.command",
     "01-打开下一个Claude任务.command",
     "05-完成整批审核.command", "06-批准整个批次.command",
     "07-生成全部发布包.command", "08-刷新批次视图.command",
@@ -232,7 +232,7 @@ class BatchWorkspace:
                 item['article_path'] = self._relative(root, str(Path(item['draft_path']).parent))
             for key in ("draft_path", "research_brief_path", "fact_check_path"):
                 item[key] = self._relative(root, item[key])
-            item["image_state"] = "REGISTERED" if item["image_id"] else ('NO_IMAGE' if article_id and self.room.no_image_selected(item) else ("PROPOSED" if any(image["article_id"] == article_id for image in images) else "MISSING"))
+            item["image_state"] = "REGISTERED" if item["image_id"] else ('NO_IMAGE' if article_id and self.room.no_image_selected(item) else ('EXTERNAL' if article_id and self.room.external_images(item) else ("PROPOSED" if any(image["article_id"] == article_id for image in images) else "MISSING")))
             item["approval_state"] = item["article_status"] if item["article_status"] in {"REVIEWED", "APPROVED", "PUBLISHED"} else "PENDING"
             package = BatchWorkspacePaths(self.batch_root(owner)).publish / article_id if owner and article_id else None
             current_package = BatchWorkspacePaths(root).publish / article_id if article_id else None
@@ -247,8 +247,6 @@ class BatchWorkspace:
             next_action = "resolve-duplicates"
         elif pending or any(item["item_status"] == "NEEDS_REVISION" for item in active):
             next_action = "upload-request"
-        elif any(item["image_state"] not in {"REGISTERED", "NO_IMAGE"} for item in active):
-            next_action = "register-images"
         elif any(item["approval_state"] == "PENDING" for item in active):
             next_action = "export"
         elif any(item["approval_state"] == "REVIEWED" for item in active):
@@ -283,6 +281,9 @@ class BatchWorkspace:
 
     def _refresh_image_recommendations(self, batch_id: str) -> None:
         """Rebuild search leads from the canonical archived content result."""
+        from .image_guide import render_image_guide
+        for article in self.room.db.all('SELECT * FROM articles WHERE owning_batch_id=?', (batch_id,)):
+            _atomic_write(self.article_root(batch_id, article['article_id']) / 'image-guide.md', render_image_guide(self.room, article))
         requests = self.room.db.all(
             "SELECT DISTINCT br.result_path FROM batch_requests br "
             "JOIN batch_items bi ON bi.batch_id=br.batch_id "
@@ -303,7 +304,7 @@ class BatchWorkspace:
             root = self.article_root(batch_id, item.article_id)
             recommendations = [r.model_dump(mode='json') for r in item.image_recommendations]
             _atomic_write(root / 'image-recommendations.json', json.dumps(recommendations, ensure_ascii=False, indent=2) + '\n')
-            lines = ['# 图片推荐：待人工判断', '', '以下推荐没有完成授权核验，不能直接在 04 中选择。可忽略或选择无图。',
+            lines = ['# 图片推荐：待人工判断', '', '以下推荐没有完成授权核验。完整分类和使用条件见 image-guide.md；导出后自行下载并上传 Google Drive。',
                 '如决定加入，请核对适用授权、使用范围与署名；复制 manual-image-candidates.json 到另一个文件，删除不采用项，填写完整权利字段后导入。',
                 '导入命令：', '', '```bash', f'uv run newsroom --root . batch image-candidates-import {batch_id} /完整路径/补充图片.json --actor editor --reason "人工核对适用授权及署名"', '```', '']
             for index, r in enumerate(recommendations, 1):
@@ -327,9 +328,9 @@ class BatchWorkspace:
     def _dashboard(self, state: dict[str, Any]) -> str:
         lines = [f"# {_cell(state['batch_id'])}", "", "此视图由 SQLite 生成，可删除后重新生成。", "", f"状态：{_cell(state['status'])}", f"来源 CSV：{_cell(state['source_filename'])}", f"创建：{_cell(state['created_at'])} · 更新：{_cell(state['updated_at'])}", f"下一步：{_cell(state['next_action'])}", "", "## 条目状态", "", " | ".join(f"{_cell(key)}: {value}" for key, value in state["counts"].items()), "", "## 文章", "", "| 标题 | 文章 ID | 条目状态 | 版本 | 核验 | 图片 | 审批 | 发布包 |", "| --- | --- | --- | --- | --- | --- | --- | --- |"]
         if state["status"] == "PACKAGED":
-            lines += ["", "## 导出完成", "", "正文与已登记图片已导出，本地内容任务完成。" + _link("打开导出目录", "publish/") + "。上传平台和 URL 登记可选。", ""]
+            lines += ["", "## 导出完成", "", "正文与图片指南已导出，本地内容任务完成。" + _link("打开导出目录", "publish/") + "。图片由编辑自行下载并上传 Google Drive。", ""]
             if self.completed_root(state["batch_id"]).is_dir():
-                lines += ["完成文章：" + _link("正文与图片", "../../completed/" + state["batch_id"] + "/") + "。研究、核验与历史素材保留在本批次作为追溯记录。", ""]
+                lines += ["完成文章：" + _link("正文与图片指南", "../../completed/" + state["batch_id"] + "/") + "。最终成果验证后清理本批次过程材料。", ""]
         available = self.source_csv_path(state["batch_id"]).is_file()
         lines.insert(7, "来源 CSV 副本：" + ("可用" if available else "未提供；原始文件名与 SHA-256 保存在 input/source-metadata.json。"))
         for item in state["items"]:
@@ -348,10 +349,10 @@ class BatchWorkspace:
             lines.append(f"需要修订但尚无任务；先运行 newsroom batch revision-request {_cell(state['batch_id'])} 创建任务，再查看此处的上传文件。")
         else:
             lines.append("当前没有待上传的 Claude 任务。按下一步提示继续。")
-        lines += ["", "## 待人工判断的图片推荐", "", "推荐未完成授权核验。查看原因后，可忽略、选择无图，或填写使用依据并通过候选补充命令手动加入。", ""]
+        lines += ["", "## 图片指南", "", "区分已核实可用图片与授权待确认的推荐。05 会随正文导出指南；导出后自行下载图片并上传 Google Drive。", ""]
         for item in state['items']:
             if item['article_id'] and item['owning_batch_id']:
-                path = self.article_root(item['owning_batch_id'], item['article_id']) / 'image-recommendations.md'
+                path = self.article_root(item['owning_batch_id'], item['article_id']) / 'image-guide.md'
                 if path.is_file():
                     relative = os.path.relpath(path, self.batch_root(state['batch_id']))
                     lines.append(f"- {_link(item['article_id'], relative)}")
@@ -362,8 +363,8 @@ class BatchWorkspace:
         for item in state["items"]:
             if item["item_status"] in {"WAITING_DUPLICATE", "NEEDS_REVISION"} or item["error_message"]:
                 lines.append(f"- {_cell(item['candidate_id'])}: {_cell(item['item_status'])} · {_cell(item['error_message'])}")
-            elif item["article_status"] == "FACT_CHECKED" and item["image_state"] != "REGISTERED":
-                lines.append(f"- {_cell(item['article_id'])}: 人工选择图片并确认权利，或明确选择无图发布。")
+            elif item["article_status"] == "FACT_CHECKED":
+                lines.append(f"- {_cell(item['article_id'])}: 检查正文和图片指南后，使用 05 确认并导出。")
         lines += ["", "## Finder 操作", "", "双击 OPEN_BATCH.command 打开此批次。操作仍保留人工核验、图片权利、审核与批准步骤。", ""]
         for filename, action in BATCH_ACTIONS:
             lines.append(f"- {_link(filename, 'actions/' + filename)}: {action}")
@@ -381,7 +382,7 @@ class BatchWorkspace:
             lines.append(f"| {_link(batch['batch_id'], 'batches/' + _identifier(batch['batch_id']) + '/README.md')} | {_cell(batch['status'])} | {batch['completed'] or 0}/{batch['total']} | {_cell(batch['updated_at'])} |")
         completed = [batch for batch in batches if batch['status'] in {'PACKAGED', 'PUBLISHED'} and not self.room.batch_archived(batch['batch_id'])]
         if completed:
-            lines += ['', '## 已完成', '', '正文与已登记图片集中在 completed/；已清理批次的去重及审计记录保留在 SQLite。', '']
+            lines += ['', '## 已完成', '', '最终成果集中在 completed/；新版包含正文和图片指南，旧版已登记图片仍保留。已清理批次的去重及审计记录保留在 SQLite。', '']
             for batch in completed:
                 batch_id = batch['batch_id']
                 output = 'completed/' + batch_id + '/' if self.completed_root(batch_id).is_dir() else 'batches/' + batch_id + '/publish/'

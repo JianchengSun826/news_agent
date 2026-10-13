@@ -25,3 +25,5 @@ Create exactly this JSON shape. Copy the top-level identity values from the requ
 ```
 
 Return complete files rather than patches or suggested edits. Save only the JSON document as the requested `output_file` and provide it as a downloadable file. Keep the complete revisions in that file rather than expanding them in chat.
+
+Image handoff remains external after export. Revise only the requested text fields using the exact revision JSON schema; do not add image fields or request image registration. Existing verified image candidates and original recommendations are retained separately for the final image guide.

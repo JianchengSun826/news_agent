@@ -51,7 +51,11 @@ class BatchReleaseWorkflow:
         return plan
 
     def review(self, batch_id: str, actor: str, reason: str) -> dict[str, Any]:
-        return self._advance_batch_articles(batch_id, "IMAGE_READY", "REVIEWED", actor, reason, "reviewed")
+        articles = self._active_articles(batch_id)
+        statuses = {article['status'] for article in articles}
+        if len(statuses) != 1 or not statuses <= {'FACT_CHECKED', 'IMAGE_READY'}:
+            raise WorkflowError('review requires every active article to be FACT_CHECKED or IMAGE_READY at the same stage')
+        return self._advance_batch_articles(batch_id, next(iter(statuses)), "REVIEWED", actor, reason, "reviewed")
 
     def approve(self, batch_id: str, actor: str, reason: str) -> dict[str, Any]:
         return self._advance_batch_articles(batch_id, "REVIEWED", "APPROVED", actor, reason, "approved")
@@ -85,8 +89,8 @@ class BatchReleaseWorkflow:
         delivery.validate_target(batch_id)
         articles = self._active_articles(batch_id)
         statuses = {article["status"] for article in articles}
-        if len(statuses) != 1 or not statuses <= {"IMAGE_READY", "REVIEWED", "APPROVED"}:
-            raise WorkflowError("export requires every active article to be IMAGE_READY, REVIEWED or APPROVED at the same stage")
+        if len(statuses) != 1 or not statuses <= {"FACT_CHECKED", "IMAGE_READY", "REVIEWED", "APPROVED"}:
+            raise WorkflowError("export requires every active article to be FACT_CHECKED, IMAGE_READY, REVIEWED or APPROVED at the same stage")
         root = self.workspace.batch_root(batch_id)
         publish = root / "publish"
         if not root.resolve().is_relative_to(self.room.root) or publish.is_symlink():
@@ -100,9 +104,9 @@ class BatchReleaseWorkflow:
             canonical = self.room.get_article(article["article_id"])
             self.room._publication_materials({**canonical, "status": "APPROVED"})
         stage = next(iter(statuses))
-        if stage == "IMAGE_READY":
+        if stage in {"FACT_CHECKED", "IMAGE_READY"}:
             self.review(batch_id, actor, reason)
-        if stage in {"IMAGE_READY", "REVIEWED"}:
+        if stage in {"FACT_CHECKED", "IMAGE_READY", "REVIEWED"}:
             self.approve(batch_id, actor, reason)
         publish = self.build_packages(batch_id)
         target = delivery.build(batch_id, [self.room.get_article(article['article_id']) for article in articles], publish)
@@ -241,6 +245,10 @@ class BatchReleaseWorkflow:
             path = package / filename
             if not path.is_file() or not path.read_text(encoding="utf-8").strip():
                 raise WorkflowError(f"staged publication file is incomplete: {filename}")
+        if article['owning_batch_id']:
+            guide = package / 'image-guide.md'
+            if not guide.is_file() or not guide.read_text(encoding='utf-8').strip():
+                raise WorkflowError('staged publication image guide is incomplete')
 
     def register_publications(self, batch_id: str, result_path: Path, actor: str) -> dict[str, Any]:
         articles = self._active_articles(batch_id)

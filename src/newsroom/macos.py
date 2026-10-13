@@ -361,7 +361,7 @@ class MacOSBatchController:
 
     def _release_action(self, batch_id: str, action: str) -> None:
         messages = {
-            "export": "确认已检查整批当前正文、研究简报、核验报告和图片使用权利，并批准导出？将一次完成审核、批准、导出和刷新。获得正文与已登记图片即完成本地任务；验证成功后删除本批次过程文件，保留 SQL 去重记录。",
+            "export": "确认已检查整批当前正文、研究简报、核验报告和图片指南，并批准导出？将导出正文和图片指南；图片由你之后自行下载并上传 Google Drive。旧批次已登记图片仍会导出。验证成功后删除本批次过程文件，保留 SQL 去重记录。",
             "review": "确认已检查整批当前文章、研究简报、事实核验报告、图片与权利页面？",
             "approve": "确认批准整个批次的当前版本与发布素材？",
             "build-packages": "确认生成整批发布包？请完成人工审核和批准；发布包仍需人工上传。",
@@ -371,7 +371,7 @@ class MacOSBatchController:
         if action == "export":
             path = self.release.export(batch_id, "editor", "编辑已检查整批当前版本、核验报告和图片权利，确认审核并批准导出")
             self.dialogs.open_file(path)
-            self.dialogs.alert("导出完成", f"导出完成：正文与已登记图片已保存，过程文件已清理，本地内容任务完成。\n目录：{path}\n上传平台和 URL 登记可选。")
+            self.dialogs.alert("导出完成", f"导出完成：正文与图片指南已保存，过程文件已清理。\n目录：{path}\n请自行下载所选图片并上传 Google Drive。")
             return
         if action == "review":
             self.release.review(batch_id, "editor", "编辑已确认整批文章、核验报告、图片与权利页面")

@@ -61,3 +61,7 @@ Create exactly this JSON shape. Copy the top-level identity values from the requ
 ```
 
 For `OPEN_LICENSE`, `creator` and `license_name` cannot be null. When `attribution_required` is true, `attribution_text` cannot be null. Use JSON `null`, never the text `"null"`. Save only the JSON document as the requested `output_file` and provide it as a downloadable file. Keep the full deliverables in the file rather than printing articles in chat.
+
+Image handoff: images are selected, downloaded and uploaded to Google Drive by the editor after content export. Provide usable candidates only with verified applicable permission; explain usage conditions, required credit and why the image fits. Provide useful recommendations separately with specific missing evidence or restrictions and recommendation reasons. Do not assert unconditional guaranteed permission, invent clearance, require local downloads or request image registration. Empty lists are valid when evidence is unavailable.
+
+Write rights_statement, rights_information, verification_issue and relevance in Chinese for the editor-facing image guide. Preserve actual license names, creator names and source URLs accurately; include specific recommendation reasons and appropriate archive/product-photo captions.

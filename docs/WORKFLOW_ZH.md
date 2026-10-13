@@ -27,14 +27,13 @@ uv run newsroom --root . batch prepare ~/Downloads/tech-newsroom-candidates.csv
 
 打开 `workspace/README.md`，进入 `workspace/batches/BATCH_ID/`，双击 `OPEN_BATCH.command` 打开批次目录、README 并定位当前待处理 request。每次以 README 的下一步与当前路径为准。README 和 `batch-state.json` 由 SQLite 生成，删除/过期后可以刷新，不要手改它们来推进状态。
 
-`actions/` 包含四个启动器（保留 02–05 编号）：
+`actions/` 包含三个启动器（保留 02、03、05 编号）：
 
 | 文件名 | 使用时机 |
 | --- | --- |
 | `02-导入Claude返回文件.command` | 下载结果后，选择当前 JSON 并确认整批导入。 |
 | `03-打开整批审核材料.command` | 检查全部当前文章与 README，不改变状态。 |
-| `04-登记整批图片.command` | 全部 PASS 后，每篇选择图片或明确无图，有图时确认候选、权利与本地原图，完整计划一起登记。 |
-| `05-确认并导出.command` | 一次确认整批审核与批准，生成正文和已登记图片，自动整理完成文章、清理本批次过程文件，刷新并打开交付目录。 |
+| `05-确认并导出.command` | 一次确认整批审核与批准，生成正文和图片指南（旧批次已登记图片仍导出），自动整理完成文章、清理本批次过程文件，刷新并打开交付目录。 |
 
 `workspace/Migrate Newsroom.command` 是根目录迁移启动器，先预检并打开报告、再明确确认、验证备份并执行。尚未生成启动器的旧仓库可用迁移 CLI。整个仓库可以搬迁，启动器向上寻找 `pyproject.toml`；不要单独移动操作文件。文章文件夹没有单篇操作启动器。
 
@@ -46,26 +45,28 @@ Claude 返回全部 Research Brief、Markdown 稿件和每篇最多三个图片�
 
 JSON 的 `batch_id`、`request_id` 和 `output_file` 必须属于当前任务，schema 和文章集合必须完整。改本地文件名不能修复旧任务身份。错误文件、缺少/额外/重复文章或不完整权利信息均先拒绝，不部分写入。成功导入保存原始字节到 `claude/archive/`，写入各篇版本文件并生成下一任务；取消不导入。
 
-内容导入后，从 README 的“当前 Claude 任务”找到当前 `fact-check-request-v1.json` 并手动上传。必须用第二个全新 Claude 对话独立一次核验整批，再把返回 JSON 放 inbox，用操作 02 导入。每篇获得 PASS/FAIL 和 claim-level 报告。通过项保留，但任何 FAIL 都阻塞整批图片、审核和批准。
+内容导入后，从 README 的“当前 Claude 任务”找到当前 `fact-check-request-v1.json` 并手动上传。必须用第二个全新 Claude 对话独立一次核验整批，再把返回 JSON 放 inbox，用操作 02 导入。每篇获得 PASS/FAIL 和 claim-level 报告。通过项保留，但任何 FAIL 都阻塞整批审核和批准。
 
 只有 FAIL 才修订：Finder 核验导入生成仅含失败文章的 `revision-request-vN.json`，从 README 的“当前 Claude 任务”找到它并手动上传，Claude 修订后操作 02 导入，保留历史版本，再交给全新窗口核验新的 request。CLI 核验导入后需显式运行 `batch revision-request BATCH_ID`；打开操作不会创建任务。没有 FAIL 时只需要一次独立批次核验。
 
 ## 四、图片与整批发布闸门
 
-全部有效文章 PASS 后，操作 04 逐篇列出 `articles/ARTICLE_ID/image-candidates.json` 的候选。每篇可明确选择无图，或选一张图片，打开原始 `landing_page_url` 与 `rights_url`，确认作者、许可、权利声明和署名；人工下载并检查原图画面、格式、分辨率，选择本地文件，明确确认权利。不要采用搜索缩略图、未知版权媒体图或仅 fair use 的图片。详见 [IMAGE_POLICY.md](IMAGE_POLICY.md)。
+全部有效文章 PASS 后，不再执行 04，也无需下载图片或逐篇选择无图。操作 03 查看每篇 image-guide.md，05 随正文导出指南，之后自行选择、下载图片并手动上传 Google Drive。
 
-选择草稿保存在批次 `image-selections.json`，中途取消可继续；不会部分登记图片。完整计划要求每篇恰好一项：有图项候选归属正确、文件可读、`rights_confirmed: true`；无图项 `no_image: true` 并提供非空 reason，验证全部后才暂存文件并一次事务登记。原图位于所属批次 `articles/ARTICLE_ID/hero.EXT`。旧状态混合已登记与未登记时要恢复/修复，不能继续部分登记。
+指南分为“已核实可用（须遵守所列条件）”和“推荐使用，授权待确认”。前者提供图片来源、授权页面、使用条件、署名及配图理由；后者提供来源、推荐理由和使用前须解决的授权缺口。没有可靠授权时可用列表为空；官方身份或下载按钮单独不证明授权。可自行选用多张图片，程序不登记外部实际选用。详见 [IMAGE_POLICY.md](IMAGE_POLICY.md)。
 
-检查操作 03 的全部当前素材后，双击 05，一次确认后完成审核、批准、导出和刷新。获得新闻正文和已登记图片即完成本地内容任务。审核要求全部 `IMAGE_READY`（已登记图片或已确认无图），批准要求全部 `REVIEWED`，发布包要求全部 `APPROVED`；任何一篇不满足就整批拒绝。`EXCLUDED` 与 `REUSED_COMPLETE` 不参与这些闸门，有非空 `owning_batch_id` 的复用文章仍由原批次拥有，本批次只提供链接。历史复用文章可能为 NULL，没有批次素材链接；应根据数据库记录的规范/旧路径查找，或先完成迁移与归属核对，不能假定它属于某个旧批次。
+旧批次已登记原图及许可仍继续验证和导出；旧图片计划 CLI 保留兼容，但不属于默认操作。
 
-无图发布包不含 hero、image-license 或 image-brief 文件，checklist 明确记录无图。完整发布包位于 `publish/ARTICLE_ID/`，整批索引是 `publish/batch-manifest.json`。先暂存验证全部包再整体替换，失败保留旧包并恢复数据库。成功后批次为 `PACKAGED`，文章仍为 `APPROVED`。 此时下一步为 `complete`，README 显示“导出完成”。
+检查操作 03 的全部当前素材后，双击 05，一次确认后完成审核、批准、导出和刷新。获得新闻正文和图片指南即完成本地内容任务。审核要求全部 `FACT_CHECKED`（兼容旧批次统一 `IMAGE_READY`），批准要求全部 `REVIEWED`，发布包要求全部 `APPROVED`；任何一篇不满足就整批拒绝。`EXCLUDED` 与 `REUSED_COMPLETE` 不参与这些闸门，有非空 `owning_batch_id` 的复用文章仍由原批次拥有，本批次只提供链接。历史复用文章可能为 NULL，没有批次素材链接；应根据数据库记录的规范/旧路径查找，或先完成迁移与归属核对，不能假定它属于某个旧批次。
 
-操作 05 在推进审核前验证全部素材和 PASS 结果；已审核或已批准的旧批次可继续导出。审核与批准分别保留审计记录。打包失败保留已有发布包及已完成的审核/批准，重试操作 05 从当前阶段继续，不重复记录已完成的审批。刷新会移除旧 01 与 05–08 启动器并安装 02–05，其他自定义文件保留。单独重建视图仍可使用 `batch refresh-workspace`。
+未登记图片的发布包不含 hero、image-license 或 image-brief 文件，checklist 区分外部图片处理与旧版明确无图选择。完整发布包位于 `publish/ARTICLE_ID/`，整批索引是 `publish/batch-manifest.json`。先暂存验证全部包再整体替换，失败保留旧包并恢复数据库。成功后批次为 `PACKAGED`，文章仍为 `APPROVED`。 此时下一步为 `complete`，README 显示“导出完成”。
+
+操作 05 在推进审核前验证全部素材和 PASS 结果；已审核或已批准的旧批次可继续导出。审核与批准分别保留审计记录。打包失败保留已有发布包及已完成的审核/批准，重试操作 05 从当前阶段继续，不重复记录已完成的审批。刷新会移除旧 01 与 05–08 启动器并安装 02、03、05，其他自定义文件保留。单独重建视图仍可使用 `batch refresh-workspace`。
 
 备用 CLI（执行命令即确认审核与批准）：
 
 ```bash
-uv run newsroom --root . batch export BATCH_ID --actor editor --reason "检查整批内容和图片权利，确认并导出"
+uv run newsroom --root . batch export BATCH_ID --actor editor --reason "检查整批正文和图片指南，确认并导出"
 ```
 
 
@@ -77,12 +78,13 @@ uv run newsroom --root . batch export BATCH_ID --actor editor --reason "检查�
 workspace/completed/BATCH_ID/
   article-slug/
     article.md                 最终新闻正文
+    image-guide.md             可用图片、待确认推荐及依据与原因
     hero.EXT                   有图文章的原图
     image-license.json         有图文章的版权及署名记录
   .newsroom-export.json        隐藏的导出完整性记录
 ```
 
-无图文章只含 `article.md`。最终成果完整导出并验证后，操作 05 自动删除 `workspace/batches/BATCH_ID/`：CSV 副本、Claude 请求和返回 JSON、inbox、研究简报、核查报告、全部修订版本、图片推荐和选择草稿、过程原图、旧发布包、批次 README/状态视图及启动器都不再保留。该目录内自定义过程文件也会清理。
+新版每篇包含 `article.md` 和 `image-guide.md`。历史已清理批次保留原交付，不重建被清理的推荐。最终成果完整导出并验证后，操作 05 自动删除 `workspace/batches/BATCH_ID/`：CSV 副本、Claude 请求和返回 JSON、inbox、研究简报、核查报告、全部修订版本、图片推荐和选择草稿、过程原图、旧发布包、批次 README/状态视图及启动器都不再保留。该目录内自定义过程文件也会清理。
 
 SQLite 保留候选和文章事件字段、指纹、来源、核验结论、审批、图片权利、请求身份和 SHA-256、审计及可选发布 URL。去重不依赖已删除文件；当前正文与选图路径改为最终目录。首页“已完成”只链接最终成果，刷新不会重建过程目录。未完成批次、下载目录的外部原文件、项目源码/配置、数据库及其备份、迁移恢复树和其他批次不清理。
 
@@ -90,7 +92,7 @@ SQLite 保留候选和文章事件字段、指纹、来源、核验结论、审�
 
 完成后可以手动编辑最终正文或添加发布笔记；状态查询、首页刷新和登记发布地址只校验路径安全及成果身份，不要求正文保持原始哈希。再次导出、继续删除或完整迁移验证仍严格核对原始清单，遇到修改会保留文件并停止。已清理批次重复导出只检查并返回已有最终目录，不重新打包或覆盖。人工编辑或无效清单会明确报错并保留原文件；不要通过移走最终目录来要求重建，因为研究和核查材料已删除。最终稿可供人工发布，但不能依靠旧过程材料重新修订或生成完整历史包。旧批次只有显式执行操作 05 / `batch export` 才应用新策略，`init`、状态查询和刷新不触发删除。
 
-可选：人工上传 CMS 后，用一个 JSON 登记全部真实 HTTP(S) URL；这不是本地内容任务完成的要求。四个 Finder 操作没有发布登记启动器，使用：
+可选：人工上传 CMS 后，用一个 JSON 登记全部真实 HTTP(S) URL；这不是本地内容任务完成的要求。三个 Finder 操作没有发布登记启动器，使用：
 
 ```bash
 uv run newsroom --root . batch publish-register BATCH_ID ~/Downloads/BATCH_ID-publication-result.json --actor editor
@@ -131,10 +133,10 @@ uv run newsroom --root "$NEWSROOM_ROOT" init
 
 ## 六、补充候选、归档和操作反馈
 
-补充候选使用 `batch image-candidates-import BATCH_ID SUPPLEMENT_JSON --actor editor --reason "核对后补充"`，不重新导入已完成的整批内容结果。支持的 JSON 格式见主流程第 6 节。
+补充候选使用 `batch image-candidates-import BATCH_ID SUPPLEMENT_JSON --actor editor --reason "核对后补充"`，不重新导入已完成的整批内容结果。使用对应文章 manual-image-candidates.json 草稿补全权利字段；这是兼容 CLI，新默认流程无需把推荐转为候选。
 
 整理旧批次用 `batch archive BATCH_ID --actor editor --reason "整理旧批次"`；恢复索引可用 `batch unarchive`。这些命令保留原素材及去重记录，不释放空间。不要手动删除批次文件夹；文件丢失会使数据库引用失效，须从废纸篓或验证备份恢复。
 
 01 启动器已移除；在批次 README 的“当前 Claude 任务”链接定位 JSON，手动打开 Claude 并上传。02 在成功、取消和失败时都有 Terminal 提示；成功显示篇数和下一步。Terminal 退出本身不代表导入成功，用 `batch status BATCH_ID` 核实。
 
-图片核验补充（Phase 1.1）：内容返回可选 `image_recommendations`（每篇最多 3 条），独立于已核实 `image_candidates`。推荐包含来源 URL、可空直接链接/作者/权利线索、verification_status（PAGE_INACCESSIBLE / INSUFFICIENT_EVIDENCE / RESTRICTED_USE）、非空 verification_issue 和 relevance。原始结果归档为推荐事实来源；不新增 SQLite 表或改变 schema。工作区生成 image-recommendations.json/md 审核视图及一次性 manual-image-candidates.json 可编辑草稿。人工补全适用授权后通过现有候选补充命令加入，记录 actor/reason；04 才确认实际图片使用。适用全站媒体政策可作为 rights_url，不要求独立逐图许可页。详见 IMAGE_POLICY.md。
+图片核验补充（Phase 1.1）：内容返回可选 `image_recommendations`（每篇最多 3 条），独立于已核实 `image_candidates`。推荐包含来源 URL、可空直接链接/作者/权利线索、verification_status（PAGE_INACCESSIBLE / INSUFFICIENT_EVIDENCE / RESTRICTED_USE）、非空 verification_issue 和 relevance。原始结果归档为推荐事实来源；不新增 SQLite 表或改变 schema。工作区生成 image-recommendations.json/md 审核视图及一次性 manual-image-candidates.json 可编辑草稿。人工补全适用授权后通过现有候选补充命令加入，记录 actor/reason；默认不再执行 04；图片指南随正文保留，之后编辑自行下载和上传 Google Drive。适用全站媒体政策可作为 rights_url，不要求独立逐图许可页。详见 IMAGE_POLICY.md。
